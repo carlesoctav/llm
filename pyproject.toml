@@ -10,6 +10,10 @@ dependencies = [
     "transformers>=4.57.6",
 ]
 
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [tool.ruff.lint]
 fixable = ["I001", "F401", "UP"]
 ignore = ["E402", "E721", "E731", "E741", "F722", "UP038", "E501", "UP035"]
@@ -19,3 +23,25 @@ select = ["E", "F", "I001", "UP"]
 combine-as-imports = true
 lines-after-imports = 2
 order-by-type = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[dependency-groups]
+dev = [
+    "flax>=0.12.2",
+    "pytest>=9.0.2",
+    "torch>=2.10.0",
+    "torchax>=0.0.11",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,3 +1,5 @@
+from dill.tests.test_classdef import o
+from jaxformers.distributed.parallel import ParallelDims
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -7,20 +9,59 @@ from typing import Any, Callable, TypedDict, TypeVar
 
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
 import numpy as np
 from huggingface_hub import snapshot_download
 from jax import P
-from jax.debug import log
 from jax.sharding import AxisType, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
 from transformers import AddedToken, PreTrainedTokenizerFast
 
 from jaxformers.attention_utils import eager_dot_product_attention
+from jaxformers.masking_utils import AttentionMaskInterface
+
+from ..attention_utils import AttentionInterface
 
 
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
+
+
+AxisName = str | tuple[str, ...] | None
+
+BATCH = ("dp_replicate", "dp_shard")
+FSDP = ("dp_shard", "cp")
+MODEL = ("tp",)
+SEQ = ("cp",)
+
+SHARDING_RULES = {
+    "none": None,
+    "batch": BATCH,
+    "fsdp": FSDP,
+    "model": MODEL,
+    "sequence": SEQ,
+    "qkv_embed": FSDP,
+    "q_heads": MODEL,
+    "kv_heads": MODEL,
+    "o_heads": MODEL,
+    "mlp_up_embed": FSDP,
+    "mlp_up_ffw": None,
+    "mlp_down_ffw": FSDP,
+    "mlp_down_embed": MODEL,
+    "vocab_in": None,
+    "vocab_out": MODEL,
+}
+
+def logical_to_physical(logical, rules):
+    spec = [getattr(rules, lo) for lo in logical]
+    flat_leaves = jtu.tree_leaves(spec)
+    if len(flat_leaves) != len(set(flat_leaves)):
+        raise ValueError(
+            f"Colliding physical axes from translating logical spec {logical} -> {spec}"
+        )
+
+    return P(*spec)
 
 
 class Config(TypedDict):
@@ -47,7 +88,10 @@ class Config(TypedDict):
     use_cache: bool
     use_sliding_window: bool
     vocab_size: int
+
     gradient_checkpointing: bool = False
+    sharding_rules: dict[str, AxisName]
+    parallel_dims: ParallelDims
 
 
 @dataclass
@@ -104,7 +148,6 @@ def forward_layer(
 
     x_norm = rms_norm(x, w["input_layernorm"], cfg["rms_norm_eps"])
 
-    # self.attn
     q = jnp.einsum(
         "btd,nhd->btnh",
         x_norm,
@@ -133,13 +176,12 @@ def forward_layer(
     q = apply_rope(q, cfg["rope_theta"], pos)
     k = apply_rope(k, cfg["rope_theta"], pos)
 
-    if kv is None:
-        mask = jnp.tri(T, dtype = jnp.bool)
-    else:
-        raise NotImplementedError
+    attn_impl = cfg.get("attn_implementation", "sdpa")
 
-    attention_interface = jax.nn.dot_product_attention
-    attn_output = attention_interface(q, k, v, mask=mask)  # (B, T, N, H)
+    attention_interface = AttentionInterface[attn_impl]
+    attn_output = attention_interface(
+        q, k, v, mask=inputs["attention_mask"]
+    )  # (B, T, N, H)
 
     o = jnp.einsum(
         "btnh,dnh->btd",
@@ -169,6 +211,7 @@ def forward_layer(
         preferred_element_type=x.dtype,
         out_sharding=P("data", None, "model"),
     )
+
     x += jnp.einsum(
         "btf,df->btd",
         gate * up,
@@ -194,7 +237,8 @@ def forward(
     input_ids = (
         weights["embed_tokens"]
         .at[input_ids, :]
-        .get(out_sharding=P("data", None, None)) .astype(dtype)
+        .get(out_sharding=P("data", None, None))
+        .astype(dtype)
     )  # (B, T, D) # think more about this mixed precision training
 
     return_kv = kv is not None
@@ -211,7 +255,9 @@ def forward(
             forward = jax.remat(partial(forward_layer, cfg, layer_idx))
         else:
             forward = partial(forward_layer, cfg, layer_idx)
-        input_ids, kv[layer_idx] = forward(input_ids, layer_weights, kv[layer_idx], pos, **inputs)
+        input_ids, kv[layer_idx] = forward(
+            input_ids, layer_weights, kv[layer_idx], pos, **inputs
+        )
 
     out_embed = (
         weights["embed_tokens"] if cfg["tie_word_embeddings"] else weights["lm_head"]
@@ -228,14 +274,18 @@ def forward(
     return (logits, kv) if return_kv else logits
 
 
+def save_safetensors(weights: PyTree[ModelWeights], path: epath):
+    pass
+
+
 def load(
-    model_id="Qwen/Qwen3-0.6B-Base",
-    tp_devices=1,
+    model_id: str,
+    parallel_dims: ParallelDims,
     devices: list | None = None,
     hf_ckpt_dir="~/weights/huggingface",
     multihost=False,
     config_kwargs={},
-    sharding_plan: Callable | None = None,
+    sharding_rules: dict[str, AxisName] = SHARDING_RULES,
     param_dtype: jnp.dtype = jnp.float32,
 ) -> Model:
     model_ckpt_dir = Path(hf_ckpt_dir).expanduser() / model_id
@@ -250,13 +300,14 @@ def load(
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_file=tokenizer_file,
         added_tokens_decoder={
-            int(k): AddedToken(**v) for k, v in tokenizer_config["added_tokens_decoder"].items()
+            int(k): AddedToken(**v)
+            for k, v in tokenizer_config["added_tokens_decoder"].items()
         },
     )
 
     cfg_path = model_ckpt_dir / "config.json"
     cfg = json.loads(cfg_path.read_text())
-    cfg = Config(**cfg, **config_kwargs)
+    cfg = Config(**cfg, **config_kwargs, parallel_dims = parallel_dims, sharding_rules = sharding_rules)
     L, N, K, H, D = (
         cfg["num_hidden_layers"],
         cfg["num_attention_heads"],
@@ -268,38 +319,40 @@ def load(
     if multihost:
         jax.distributed.initialize()
 
-    if devices:
-        fsdp_devices = len(devices) // tp_devices
-    else:
-        fsdp_devices = jax.device_count() // tp_devices
-
     mesh = jax.make_mesh(
-        (fsdp_devices, tp_devices),
-        ("data", "model"),
+        tuple(parallel_dims.values()),
+        tuple(parallel_dims.keys()),
         devices=devices,
-        axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
     jax.set_mesh(mesh)
+    def get_sharding(key):
+        if "q_proj" in key:
+            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+        elif "k_proj" in key:
+            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+        elif "v_proj" in key:
+            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+        elif "gate_proj" in key:
+            return logical_to_physical(("mlp_up_ffw", "ml_up_embed"), sharding_rules)
+        elif "up_proj" in key:
+            return logical_to_physical(("mlp_up_ffw", "ml_up_embed"), sharding_rules)
+        elif "o_proj" in key:
+            return logical_to_physical(("qkv_embed", "o_heads"), sharding_rules)
+        elif "down_proj" in key:
+            return logical_to_physical(("mlp_down_embed", "mlp_down_ffw"), sharding_rules)
+        elif "embed_tokens" in key:
+            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+        elif "lm_head" in key:
+            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+        else:
+            return P()
 
-    def default_get_sharding(key):
-        if any(
-            k in key for k in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
-        ):
-            return P("model", "data")
-        if any(k in key for k in ("o_proj", "down_proj")):
-            return P("data", "model")
-        if any(k in key for k in ("embed_tokens", "lm_head")):
-            return P("model", "data")
-        return P()
-
-    get_sharding = sharding_plan or default_get_sharding
     weights = {}
-
     for file in model_ckpt_dir.glob("*.safetensors"):
         with safe_open(file, framework="numpy") as f:
             for key in f.keys():
                 weights[key] = jax.device_put(
-                    f.get_tensor(key).astype(np.float32), get_sharding(key)
+                    f.get_tensor(key).astype(param_dtype), get_sharding(key)
                 )
 
     substrings = ["model.", "self_attn.", "mlp.", ".weight"]
@@ -318,4 +371,6 @@ def load(
         if "o_proj" in key:
             weights[key] = weights[key].reshape([D, N, H])
 
-    return Model(cfg, weights, partial(forward, cfg), partial(init_kv, L, K, H), tokenizer)
+    return Model(
+        cfg, weights, partial(forward, cfg), partial(init_kv, L, K, H), tokenizer
+    )

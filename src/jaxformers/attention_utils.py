@@ -1,9 +1,28 @@
+from jaxformers.utils import GeneralInterface
 from absl.logging import log
 import jax
 import jax.numpy as jnp
 from jax import P
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
+import tokamax
+from typing import Protocol
+from functools import partial
 
+
+class AttentionImpl(Protocol):
+    def __call__(
+        query: Float[Array, "B T N H"],
+        key: Float[Array, "B S K H"],
+        value: Float[Array, "B S K H"],
+        bias: Array | None = None,
+        mask: Bool[Array, "T S"]
+        | Bool[Array, "N T S"]
+        | Bool[Array, "B N T S"]
+        | Array
+        | None = None,
+        **kwargs,
+    ):
+        ...
 
 def _normalize_mask(
     mask: Array,
@@ -115,3 +134,10 @@ def eager_dot_product_attention(
 
     attn = jnp.einsum("bnts, bsnh -> btnh", weights, value, preferred_element_type=query.dtype, out_sharding = P("data", None, "model", None))
     return attn
+
+class AttentionInterface(GeneralInterface[str, AttentionImpl]):
+    _global_mapping = {
+        "eager": eager_dot_product_attention,
+        "sdpa": jax.nn.dot_product_attention,
+        "xla_chunked": partial(tokamax.dot_product_attention(), implementation = "xla_chunked", precision = jax.lax.Precision.HIGHEST)
+    }

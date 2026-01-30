@@ -1,8 +1,6 @@
 from jaxformers.utils import GeneralInterface
-from absl.logging import log
 import jax
 import jax.numpy as jnp
-from jax import P
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
 import tokamax
 from typing import Protocol
@@ -91,15 +89,17 @@ def eager_dot_product_attention(
                 "Number of query heads must be a positive multiple of key/value heads"
             )
         repeat_factor = N // K
-        key = jnp.repeat(
-            key, repeat_factor, axis=-2, out_sharding=P("data", None, "model", None)
-        )
-        value = jnp.repeat(
-            value, repeat_factor, axis=-2, out_sharding=P("data", None, "model", None)
-        )
+        key = jnp.repeat(key, repeat_factor, axis=-2)
+        value = jnp.repeat(value, repeat_factor, axis=-2)
         K = N
 
-    scores = jnp.einsum("btnh, bsnh -> bnts", query, key, preferred_element_type= query.dtype, precision= jax.lax.Precision.HIGHEST, out_sharding = P("data", "model", None, None))
+    scores = jnp.einsum(
+        "btnh, bsnh -> bnts",
+        query,
+        key,
+        preferred_element_type=query.dtype,
+        precision=jax.lax.Precision.HIGHEST,
+    )
 
     if bias is not None:
         scores = scores + bias
@@ -132,12 +132,18 @@ def eager_dot_product_attention(
         multiplier = keep.astype(weights.dtype) / keep_prob
         weights = weights * multiplier
 
-    attn = jnp.einsum("bnts, bsnh -> btnh", weights, value, preferred_element_type=query.dtype, out_sharding = P("data", None, "model", None))
+    attn = jnp.einsum("bnts, bsnh -> btnh", weights, value, preferred_element_type=query.dtype)
     return attn
 
 class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
         "sdpa": jax.nn.dot_product_attention,
-        "xla_chunked": partial(tokamax.dot_product_attention(), implementation = "xla_chunked", precision = jax.lax.Precision.HIGHEST)
+        "xla_chunked": partial(
+            tokamax.dot_product_attention,
+            implementation="xla_chunked",
+            precision=jax.lax.Precision.HIGHEST,
+        ),
     }
+
+ATTENTION_INTERFACE = AttentionInterface()

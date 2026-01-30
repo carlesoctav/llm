@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 from jaxtyping import Array, Bool, Float, Int
+from jaxformers.utils import GeneralInterface
 
 BlockMask = Array
 MaskImpl = tp.Callable

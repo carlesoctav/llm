@@ -1,9 +1,8 @@
-from dill.tests.test_classdef import o
 from jaxformers.distributed.parallel import ParallelDims
 import json
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import partial, reduce
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, TypedDict, TypeVar
 
@@ -11,9 +10,9 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
+from einops import rearrange
 from huggingface_hub import snapshot_download
-from jax import P
-from jax.sharding import AxisType, reshard
+from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
 from transformers import AddedToken, PreTrainedTokenizerFast
@@ -53,8 +52,9 @@ SHARDING_RULES = {
     "vocab_out": MODEL,
 }
 
+
 def logical_to_physical(logical, rules):
-    spec = [getattr(rules, lo) for lo in logical]
+    spec = [rules[lo] for lo in logical]
     flat_leaves = jtu.tree_leaves(spec)
     if len(flat_leaves) != len(set(flat_leaves)):
         raise ValueError(
@@ -104,9 +104,8 @@ class Model:
 
 
 def init_kv(L, K, H, B, T):
-    sharding = P(None, "data", None, "model", None)
     kv = [
-        jnp.zeros((2, B, T, K, H), dtype=jnp.bfloat16, out_sharding=sharding)
+        jnp.zeros((2, B, T, K, H), dtype=jnp.bfloat16)
         for _ in range(L)
     ]
     return kv
@@ -145,29 +144,50 @@ def forward_layer(
     **inputs,
 ):
     B, T, D = x.shape
+    rules = cfg.get("sharding_rules", SHARDING_RULES)
 
     x_norm = rms_norm(x, w["input_layernorm"], cfg["rms_norm_eps"])
 
     q = jnp.einsum(
-        "btd,nhd->btnh",
+        "btd,md->btm",
         x_norm,
         w["q_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, "model", None),
+        out_sharding=logical_to_physical(("batch", "none", "q_heads"), rules),
     )
     k = jnp.einsum(
-        "bsd,khd->bskh",
+        "btd,md->btm",
         x_norm,
         w["k_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, "model", None),
+        out_sharding=logical_to_physical(("batch", "none", "kv_heads"), rules),
     )
     v = jnp.einsum(
-        "bsd,khd->bskh",
+        "btd,md->btm",
         x_norm,
         w["v_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, "model", None),
+        out_sharding=logical_to_physical(("batch", "none", "kv_heads"), rules),
+    )
+
+    q = rearrange(
+        q,
+        "b t (n h) -> b t n h",
+        n=cfg["num_attention_heads"],
+        h=cfg["head_dim"],
+    )
+
+    k = rearrange(
+        k,
+        "b t (k h) -> b t k h",
+        k=cfg["num_key_value_heads"],
+        h=cfg["head_dim"],
+    )
+    v = rearrange(
+        v,
+        "b t (k h) -> b t k h",
+        k=cfg["num_key_value_heads"],
+        h=cfg["head_dim"],
     )
 
     q = rms_norm(q, w["q_norm"], cfg["rms_norm_eps"])
@@ -176,19 +196,39 @@ def forward_layer(
     q = apply_rope(q, cfg["rope_theta"], pos)
     k = apply_rope(k, cfg["rope_theta"], pos)
 
+    # KV cache: kv is expected to be (2, B, max_T, K, H).
+    if kv is not None:
+        kv = jax.lax.dynamic_update_slice(kv, jnp.stack([k, v]), (0, 0, pos, 0, 0))
+        k, v = kv
+
     attn_impl = cfg.get("attn_implementation", "sdpa")
+    attention_fn = AttentionInterface()[attn_impl]
 
-    attention_interface = AttentionInterface[attn_impl]
-    attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"]
-    )  # (B, T, N, H)
+    # Build a causal mask (optionally AND'ed with a padding mask from the tokenizer).
+    S = k.shape[1]
+    q_pos = pos + jnp.arange(T, dtype=jnp.int32)
+    kv_pos = jnp.arange(S, dtype=jnp.int32)
+    causal = (q_pos[:, None] >= kv_pos[None, :])  # (T, S)
+    padding = inputs.get("attention_mask", None)
+    if padding is not None:
+        # padding is typically (B, S) with 1 for tokens, 0 for padding
+        pad = padding.astype(bool)
+        attn_mask = causal[None, None, :, :] & pad[:, None, None, :]
+        attn_mask = jnp.broadcast_to(
+            attn_mask, (B, cfg["num_attention_heads"], T, S)
+        )
+    else:
+        attn_mask = causal  # (T, S) broadcasted by the attention implementation
 
+    attn_output = attention_fn(q, k, v, mask=attn_mask)  # (B, T, N, H)
+
+    attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
     o = jnp.einsum(
-        "btnh,dnh->btd",
+        "btd,ed->bte",
         attn_output,
         w["o_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, None),
+        out_sharding=logical_to_physical(("batch", "none", "none"), rules),
     )
     x += o
     x_norm = rms_norm(x, w["post_attention_layernorm"], cfg["rms_norm_eps"])
@@ -201,7 +241,7 @@ def forward_layer(
             x_norm,
             w["gate_proj"],
             preferred_element_type=jnp.float32,
-            out_sharding=P("data", None, "model"),
+            out_sharding=logical_to_physical(("batch", "none", "mlp_up_ffw"), rules),
         )
     )
     up = jnp.einsum(
@@ -209,7 +249,7 @@ def forward_layer(
         x_norm,
         w["up_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, "model"),
+        out_sharding=logical_to_physical(("batch", "none", "mlp_up_ffw"), rules),
     )
 
     x += jnp.einsum(
@@ -217,7 +257,7 @@ def forward_layer(
         gate * up,
         w["down_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=P("data", None, None),
+        out_sharding=logical_to_physical(("batch", "none", "none"), rules),
     )
 
     return x, kv
@@ -233,11 +273,12 @@ def forward(
     **inputs,
 ):
     B, T = input_ids.shape
-    input_ids = reshard(input_ids, P("data", None))
+    rules = cfg.get("sharding_rules", SHARDING_RULES)
+    input_ids = reshard(input_ids, logical_to_physical(("batch", "none"), rules))
     input_ids = (
-        weights["embed_tokens"]
+        weights["model.embed_tokens.weight"]
         .at[input_ids, :]
-        .get(out_sharding=P("data", None, None))
+        .get(out_sharding=logical_to_physical(("batch", "none", "none"), rules))
         .astype(dtype)
     )  # (B, T, D) # think more about this mixed precision training
 
@@ -246,10 +287,19 @@ def forward(
         kv = defaultdict(lambda: None)
 
     for layer_idx in range(cfg["num_hidden_layers"]):
+        prefix = f"model.layers.{layer_idx}."
         layer_weights = {
-            k.replace(prefix, ""): v
-            for k, v in weights.items()
-            if (prefix := f"layers.{layer_idx}.") in k
+            "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
+            "post_attention_layernorm": weights[f"{prefix}post_attention_layernorm.weight"],
+            "q_proj": weights[f"{prefix}self_attn.q_proj.weight"],
+            "k_proj": weights[f"{prefix}self_attn.k_proj.weight"],
+            "v_proj": weights[f"{prefix}self_attn.v_proj.weight"],
+            "o_proj": weights[f"{prefix}self_attn.o_proj.weight"],
+            "q_norm": weights[f"{prefix}self_attn.q_norm.weight"],
+            "k_norm": weights[f"{prefix}self_attn.k_norm.weight"],
+            "gate_proj": weights[f"{prefix}mlp.gate_proj.weight"],
+            "up_proj": weights[f"{prefix}mlp.up_proj.weight"],
+            "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
         }
         if cfg.get("gradient_checkpointing", None):
             forward = jax.remat(partial(forward_layer, cfg, layer_idx))
@@ -259,22 +309,20 @@ def forward(
             input_ids, layer_weights, kv[layer_idx], pos, **inputs
         )
 
-    out_embed = (
-        weights["embed_tokens"] if cfg["tie_word_embeddings"] else weights["lm_head"]
-    )
-    input_ids = rms_norm(input_ids, weights["norm"], cfg["rms_norm_eps"])
+    out_embed = weights["model.embed_tokens.weight"] if cfg["tie_word_embeddings"] else weights["lm_head.weight"]
+    input_ids = rms_norm(input_ids, weights["model.norm.weight"], cfg["rms_norm_eps"])
     logits = jnp.einsum(
         "btd,vd-> btv",
         input_ids,
         out_embed,
-        out_sharding=P("data", None, "model"),
+        out_sharding=logical_to_physical(("batch", "none", "vocab_out"), rules),
         preferred_element_type=input_ids.dtype,
     )
 
     return (logits, kv) if return_kv else logits
 
 
-def save_safetensors(weights: PyTree[ModelWeights], path: epath):
+def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
     pass
 
 
@@ -307,7 +355,12 @@ def load(
 
     cfg_path = model_ckpt_dir / "config.json"
     cfg = json.loads(cfg_path.read_text())
-    cfg = Config(**cfg, **config_kwargs, parallel_dims = parallel_dims, sharding_rules = sharding_rules)
+    cfg = Config(
+        **cfg,
+        **config_kwargs,
+        parallel_dims=parallel_dims,
+        sharding_rules=sharding_rules,
+    )
     L, N, K, H, D = (
         cfg["num_hidden_layers"],
         cfg["num_attention_heads"],
@@ -319,33 +372,33 @@ def load(
     if multihost:
         jax.distributed.initialize()
 
-    mesh = jax.make_mesh(
-        tuple(parallel_dims.values()),
-        tuple(parallel_dims.keys()),
-        devices=devices,
-    )
+    axis_shapes = tuple(parallel_dims.values())
+    axis_names = tuple(parallel_dims.keys())
+    axis_types = tuple(AxisType.Explicit for _ in axis_names)
+    mesh = jax.make_mesh(axis_shapes, axis_names, axis_types=axis_types, devices=devices)
     jax.set_mesh(mesh)
+
     def get_sharding(key):
-        if "q_proj" in key:
+        # Use user-provided sharding rules to map logical axis names -> physical mesh axes.
+        if "self_attn.q_proj" in key:
             return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
-        elif "k_proj" in key:
+        if "self_attn.k_proj" in key:
             return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
-        elif "v_proj" in key:
+        if "self_attn.v_proj" in key:
             return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
-        elif "gate_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "ml_up_embed"), sharding_rules)
-        elif "up_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "ml_up_embed"), sharding_rules)
-        elif "o_proj" in key:
+        if "mlp.gate_proj" in key:
+            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+        if "mlp.up_proj" in key:
+            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+        if "self_attn.o_proj" in key:
             return logical_to_physical(("qkv_embed", "o_heads"), sharding_rules)
-        elif "down_proj" in key:
+        if "mlp.down_proj" in key:
             return logical_to_physical(("mlp_down_embed", "mlp_down_ffw"), sharding_rules)
-        elif "embed_tokens" in key:
+        if "embed_tokens" in key:
             return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
-        elif "lm_head" in key:
+        if "lm_head" in key:
             return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
-        else:
-            return P()
+        return P()
 
     weights = {}
     for file in model_ckpt_dir.glob("*.safetensors"):
@@ -354,22 +407,6 @@ def load(
                 weights[key] = jax.device_put(
                     f.get_tensor(key).astype(param_dtype), get_sharding(key)
                 )
-
-    substrings = ["model.", "self_attn.", "mlp.", ".weight"]
-    weights = {
-        reduce(lambda k, s: k.replace(s, ""), substrings, k): v
-        for k, v in weights.items()
-    }
-
-    for key in weights.keys():
-        if "q_proj" in key:
-            weights[key] = weights[key].reshape([N, H, D])
-        if "k_proj" in key:
-            weights[key] = weights[key].reshape([K, H, D])
-        if "v_proj" in key:
-            weights[key] = weights[key].reshape([K, H, D])
-        if "o_proj" in key:
-            weights[key] = weights[key].reshape([D, N, H])
 
     return Model(
         cfg, weights, partial(forward, cfg), partial(init_kv, L, K, H), tokenizer

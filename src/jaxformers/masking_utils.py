@@ -106,7 +106,7 @@ class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
     }
 
 
-ALL_MASK_ATTENTION_FUNCTIONS = AttentionMaskInterface()
+ATTENTION_MASK_INTERFACE = AttentionMaskInterface()
 
 
 def make_causal_mask(
@@ -137,7 +137,7 @@ def make_causal_mask(
     #Need to think more about maskign for inference but whatever
     B, T, H = input_embeds.shape
 
-    mask_interface = ALL_MASK_ATTENTION_FUNCTIONS[mask_impl]
+    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = causal_mask_function
 
     padding_mask = None
@@ -185,7 +185,7 @@ def make_bidirectional_mask(
 
     B, T, H = input_embeds.shape
 
-    mask_interface = ALL_MASK_ATTENTION_FUNCTIONS[mask_impl]
+    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = dummy_mask_function
 
     padding_mask = None
@@ -236,7 +236,7 @@ def slliding_window_full_mask(
     """
     B, T, H = input_embeds.shape
 
-    mask_interface = ALL_MASK_ATTENTION_FUNCTIONS[mask_impl]
+    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = and_masks(
         sliding_window_mask_overlay(window_size), dummy_mask_function
     )

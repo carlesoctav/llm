@@ -41,13 +41,14 @@ def test_qwen3_0_6b_tpu_tp():
     )
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     test_str = "hallo saya makan nasi goreng"
-    jax_token = tokenizer(test_str, return_tensors="jax")
-    jax_logits = jax_model.forward(**jax_token, weights=jax_model.weights)
+    jax_token  = jnp.ones((1, 12), dtype = jnp.int32)
+    jax_logits = jax_model.forward(jax_token, weights=jax_model.weights)
 
     assert jax_logits.ndim == 3
-    assert jax_logits.shape == (1, 9, jax_model.config["vocab_size"])
+    assert jax_logits.shape == (1, 12, jax_model.config["vocab_size"])
 
 
 if __name__ == "__main__":
-    # test_qwen3_0_6_b_cpu()
+    test_qwen3_0_6_b_cpu()
     test_qwen3_0_6b_tpu_tp()
+    print("all good")

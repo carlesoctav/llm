@@ -14,6 +14,7 @@ class ParallelDims(TypedDict):
     dp_replicate: int
     dp_shard: int
     cp: int
+    tp: int
 
 @dataclass
 class SparseParallelDims(TypedDict):
@@ -26,9 +27,17 @@ class SparseParallelDims(TypedDict):
     ep: int
     etp: int
 
-def change_sharding_rule_parallel_dims(rules: dict[str, AxisName], parallel_dims: ParallelDims):
+def mutate_sharding_rule_parallel_dims(rules: dict[str, AxisName], parallel_dims: ParallelDims):
     if parallel_dims["cp"] == 1:
         rules["context"] = None
         # rules["sequence"] = ("tp",)
         # rules["fsdp"] = ("dp_shard", )
+
     return rules
+
+
+def check_mesh_axis_for_inference(parallel_dims: ParallelDims):
+    # if parallel_dims["dp_shard"] > 1:
+    #     raise ValueError("not recommended to shard across dp_shard for inference")
+    if parallel_dims["cp"] > 1:
+        raise ValueError("context parallelism not supported for inference")

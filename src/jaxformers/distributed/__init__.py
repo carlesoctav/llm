@@ -1,6 +1,6 @@
 from .parallel import (
     BATCH,
-    change_sharding_rule_parallel_dims,
+    mutate_sharding_rule_parallel_dims,
     CONTEXT,
     FSDP,
     MODEL,

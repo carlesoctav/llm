@@ -2,8 +2,8 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from functools import partial
 from jaxtyping import Array, Bool, Float, Int
+
 from jaxformers.utils import GeneralInterface
 
 BlockMask = Array
@@ -13,7 +13,7 @@ MaskFn = tp.Any
 
 def and_masks(*mask_fns):
     def mask(b, h, q, kv):
-        result = jnp.ones((), dtype=jnp.bool)
+        result = jnp.ones((), dtype=jnp.bool_)
         for mask_fn in mask_fns:
             result = mask_fn(b, h, q, kv) & result
         return result
@@ -23,7 +23,7 @@ def and_masks(*mask_fns):
 
 def or_masks(*mask_fns):
     def mask(b, h, q, kv):
-        result = jnp.zeros((), dtype=jnp.bool)
+        result = jnp.zeros((), dtype=jnp.bool_)
         for mask_fn in mask_fns:
             result = mask_fn(b, h, q, kv) | result
         return result
@@ -38,6 +38,9 @@ def vmap_bhqkv(mask_fn, with_head=False):
 
     if with_head:
         fn = jax.vmap(fn, in_axes = (None, 0, None, None)) # h arange
+
+    # batch arange
+    fn = jax.vmap(fn, in_axes=(0, None, None, None))
 
     return fn
 
@@ -78,6 +81,9 @@ def make_bool_mask(
     nheads: int | None = None,
 ) -> Bool[Array, "B T S"] | Bool[Array, "B N T S"] | Bool[Array, "T S"]:
 
+    if batch_size is None:
+        raise ValueError("`batch_size` must be provided when creating bool masks.")
+
     batch_arange = jnp.arange(batch_size, dtype=jnp.int32)
     q_arange = jnp.arange(q_length, dtype=jnp.int32)
     kv_arange = jnp.arange(kv_length, dtype=jnp.int32)
@@ -93,11 +99,11 @@ def make_bool_mask(
     mask_ndim = mask_output.ndim
     if padding_mask is not None:
         if mask_ndim == 3: # (B, T, S), (B, T)
-            return mask_output & padding_mask[:, :, None]
+            # Mask KV positions (last axis), not queries.
+            return mask_output & padding_mask[:, None, :]
         elif mask_ndim == 4: #(B, N, T, S), (B, T) -> (B, N, T, S)
-            return (mask_output & padding_mask[:, None, :, None])
-    else:
-        return mask_output
+            return mask_output & padding_mask[:, None, None, :]
+    return mask_output
 
 class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
     _global_mapping = {
@@ -197,7 +203,7 @@ def make_bidirectional_mask(
         padding_mask = attention_mask
 
     full_mask = mask_interface(
-        batch_size=None,
+        batch_size=B,
         q_length=T,
         kv_length=T,
         mask_function=mask_factory_function,
@@ -208,7 +214,7 @@ def make_bidirectional_mask(
     return full_mask
 
 
-def slliding_window_full_mask(
+def sliding_window_full_mask(
     mask_impl: str,
     input_embeds: Float[Array, "B T H"],
     window_size: int,
@@ -238,7 +244,8 @@ def slliding_window_full_mask(
 
     mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = and_masks(
-        sliding_window_mask_overlay(window_size), dummy_mask_function
+        causal_mask_function,
+        sliding_window_mask_overlay(window_size),
     )
 
     padding_mask = None
@@ -250,7 +257,7 @@ def slliding_window_full_mask(
         padding_mask = attention_mask
 
     sliding_mask = mask_interface(
-        batch_size=None,
+        batch_size=B,
         q_length=T,
         kv_length=T,
         mask_function=mask_factory_function,
@@ -259,3 +266,19 @@ def slliding_window_full_mask(
     )
 
     return sliding_mask
+
+
+def make_sliding_window_mask(
+    mask_impl: str,
+    input_embeds: Float[Array, "B T H"],
+    window_size: int,
+    attention_mask: Bool[Array, "..."] | None = None,
+    segment_ids: Int[Array, "..."] | None = None,
+) -> Bool[Array, "B T T"] | BlockMask:
+    return sliding_window_full_mask(
+        mask_impl=mask_impl,
+        input_embeds=input_embeds,
+        window_size=window_size,
+        attention_mask=attention_mask,
+        segment_ids=segment_ids,
+    )

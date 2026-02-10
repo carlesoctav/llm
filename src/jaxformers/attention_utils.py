@@ -6,6 +6,8 @@ import tokamax
 from typing import Protocol
 from functools import partial
 
+from jaxformers.ops.ragged_paged_attention import ragged_paged_dot_product_attention
+
 
 class AttentionImpl(Protocol):
     def __call__(
@@ -38,6 +40,9 @@ def _normalize_mask(
         mask_array = mask_array[None, None, :, :]
         return jnp.broadcast_to(mask_array, (batch_size, num_heads, tgt_len, src_len))
     if mask_array.ndim == 3:
+        if mask_array.shape == (batch_size, tgt_len, src_len):
+            mask_array = mask_array[:, None, :, :]
+            return jnp.broadcast_to(mask_array, (batch_size, num_heads, tgt_len, src_len))
         if mask_array.shape[1:] != (tgt_len, src_len):
             raise ValueError(
                 f"Mask shape {mask_array.shape} must match ({num_heads}, {tgt_len}, {src_len})"
@@ -139,6 +144,7 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
         "sdpa": jax.nn.dot_product_attention,
+        "ragged_paged_dot_product_attention": ragged_paged_dot_product_attention,
         "xla_chunked": partial(
             tokamax.dot_product_attention,
             implementation="xla_chunked",

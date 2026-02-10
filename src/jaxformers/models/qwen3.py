@@ -1,7 +1,7 @@
 import copy
 import json
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, TypedDict, TypeVar
@@ -9,18 +9,18 @@ from typing import Any, Callable, TypedDict, TypeVar
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-import numpy as np
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
-from requests.utils import DEFAULT_ACCEPT_ENCODING
 from safetensors import safe_open
 from transformers import AddedToken, PreTrainedTokenizerFast
 
-from jaxformers.attention_utils import eager_dot_product_attention
 from jaxformers.distributed.parallel import check_mesh_axis_for_inference, ParallelDims
-from jaxformers.masking_utils import ATTENTION_MASK_INTERFACE
+from jaxformers.masking_utils import (
+    ATTENTION_MASK_INTERFACE,
+    make_causal_mask,
+)
 
 from ..attention_utils import ATTENTION_INTERFACE
 from ..distributed import (
@@ -36,6 +36,73 @@ from ..distributed import (
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 AxisName = str | tuple[str, ...] | None
+
+class AdditionalConfig(TypedDict):
+    # training
+    gradient_checkpointing: bool = True
+
+    # training and inference
+    attn_implementation: str = "sdpa"
+
+    # inference
+    max_num_batched_token: int = 2048
+    max_model_len: int = 2048
+    max_num_seqs: int = 256
+    page_size: int = 128
+    # Total pages allocated across all request slots.
+    # Static slot mapping: num_pages = ceil(max_model_len / page_size) * max_num_seqs.
+    num_pages: int
+
+class Config(TypedDict):
+    model_type: str = "qwen3"
+    attention_bias: bool
+    attention_dropout: float
+    bos_token_id: int
+    eos_token_id: int
+    head_dim: int
+    hidden_act: str
+    hidden_size: int
+    initializer_range: float
+    intermediate_size: int
+    max_position_embeddings: int
+    max_window_layers: int
+    num_attention_heads: int
+    num_hidden_layers: int
+    num_key_value_heads: int
+    rms_norm_eps: float
+    rope_scaling: dict[str, Any]
+    rope_theta: int
+    sliding_window: int | None
+    tie_word_embeddings: bool
+    use_cache: bool
+    use_sliding_window: bool
+    layer_types: list[str]
+    vocab_size: int
+
+    additional_config: AdditionalConfig
+
+    # come from args
+    sharding_rules: dict[str, AxisName]
+    parallel_dims: ParallelDims
+
+
+@dataclass
+class Model:
+    config: Config
+    weights: PyTree[Array, "ModelWeights"]
+    forward: Callable
+    tokenizer: PreTrainedTokenizerFast
+
+
+@dataclass
+class InferenceModel:
+    config: Config
+    weights: PyTree[Array, "ModelWeights"]
+    forward: Callable
+    compute_logits: Callable
+    embed_tokens: Callable
+    init_kv: Callable
+    tokenizer: PreTrainedTokenizerFast
 
 
 SHARDING_RULES = {
@@ -69,19 +136,6 @@ def logical_to_physical(logical, rules):
     return P(*spec)
 
 
-class AdditionalConfig(TypedDict):
-    # training
-    gradient_checkpointing: bool = True
-
-    # training and inference
-    attn_implementation: str = "sdpa"
-
-    # inference
-    max_num_batched_token: int = 2048
-    max_model_len: int = 2048
-    max_num_request: int = 256
-    page_size: int = 128
-    num_pages: int  # (max_model_len * max_num_request // page_size)
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
@@ -89,7 +143,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "attn_implementation": "sdpa",
     "max_num_batched_token": 2048,
     "max_model_len": 2048,
-    "max_num_request": 256,
+    "max_num_seqs": 256,
     "page_size": 256,
 }
 
@@ -98,64 +152,23 @@ def mutable_check_additional_config_for_inference(config: Config):
     additional_config = config["additional_config"]
     additional_config["attn_implementation"] = "ragged_paged_dot_product_attention"
     additional_config["gradient_checkpointing"] = False
+
     page_size = additional_config["page_size"]
-
-    additional_config["num_pages"] = (
-        additional_config["max_model_len"] * additional_config["max_num_request"]
-        + page_size
-        - 1
-    ) // page_size
-
-
-class Config(TypedDict):
-    model_type: str = "qwen3"
-    attention_bias: bool
-    attention_dropout: float
-    bos_token_id: int
-    eos_token_id: int
-    head_dim: int
-    hidden_act: str
-    hidden_size: int
-    initializer_range: float
-    intermediate_size: int
-    max_position_embeddings: int
-    max_window_layers: int
-    num_attention_heads: int
-    num_hidden_layers: int
-    num_key_value_heads: int
-    rms_norm_eps: float
-    rope_scaling: dict[str, Any]
-    rope_theta: int
-    sliding_window: int | None
-    tie_word_embeddings: bool
-    use_cache: bool
-    use_sliding_window: bool
-    vocab_size: int
-
-    additional_config: AdditionalConfig
-
-    # come from args
-    sharding_rules: dict[str, AxisName]
-    parallel_dims: ParallelDims
+    max_model_len = additional_config["max_model_len"]
+    max_num_seqs = additional_config.get("max_num_seqs")
+    if max_num_seqs is None:
+        max_num_seqs = additional_config.get("max_num_request")
+    if max_num_seqs is None:
+        raise KeyError(
+            "`additional_config` must include `max_num_seqs` (or legacy `max_num_request`)."
+        )
+    additional_config["max_num_seqs"] = int(max_num_seqs)
+    additional_config.pop("max_num_request", None)
+    # Reserve a fixed page range per request (static slot mapping).
+    pages_per_req = (max_model_len + page_size - 1) // page_size
+    additional_config["num_pages"] = pages_per_req * additional_config["max_num_seqs"]
 
 
-@dataclass
-class Model:
-    config: Config
-    weights: PyTree[Array, "ModelWeights"]
-    forward: Callable
-    tokenizer: PreTrainedTokenizerFast
-
-
-@dataclass
-class InferenceModel:
-    config: Config
-    weights: PyTree[Array, "ModelWeights"]
-    forward: Callable
-    compute_logits: Callable
-    forward_embedding: Callable
-    init_kv: Callable
-    tokenizer: PreTrainedTokenizerFast
 
 
 def init_kv(L, K, H, num_pages, page_size, dtype = jnp.bfloat16):
@@ -163,9 +176,57 @@ def init_kv(L, K, H, num_pages, page_size, dtype = jnp.bfloat16):
     return kv
 
 
-def apply_rope(x: jax.Array, theta, pos=0):
+def get_layer_attention_type(cfg: Config, layer_idx: int) -> str:
+    layer_types = cfg.get("layer_types")
+    if layer_types is not None and layer_idx < len(layer_types):
+        return layer_types[layer_idx]
+
+    if (
+        cfg.get("use_sliding_window", False)
+        and cfg.get("sliding_window") is not None
+        and layer_idx >= cfg.get("max_window_layers", cfg["num_hidden_layers"])
+    ):
+        return "sliding_attention"
+    return "full_attention"
+
+
+
+
+def build_attn_mask(
+    cfg: Config,
+    input_embeds: Float[Array, "B T D"],
+    attention_mask: Int[Array, "B T"] | None = None,
+    segment_ids: Int[Array, "B T"] | None = None,
+) -> Array | None:
+    attn_impl = cfg["additional_config"]["attn_implementation"]
+    if attn_impl not in ATTENTION_MASK_INTERFACE:
+        return None
+
+    # attention mask is just a padding mask from huggingface tokenizer
+    if attention_mask is not None:
+        attention_mask = attention_mask.astype(jnp.bool)
+
+    attn_mask = make_causal_mask(
+        mask_impl=attn_impl,
+        input_embeds=input_embeds,
+        attention_mask=attention_mask,
+        segment_ids=segment_ids,
+    )
+
+    return attn_mask
+
+
+def apply_rope(x: jax.Array, theta, pos=0, positions: jax.Array | None = None):
     B, T, N, H = x.shape
-    positions = pos + jnp.broadcast_to(jnp.arange(T)[None, :], [B, T])  # (B, T)
+    if positions is None:
+        positions = pos + jnp.broadcast_to(jnp.arange(T)[None, :], [B, T])  # (B, T)
+    else:
+        if positions.ndim == 1:
+            if positions.shape[0] != T:
+                raise ValueError(f"`positions` must have shape ({T},) but got {positions.shape}")
+            positions = jnp.broadcast_to(positions[None, :], (B, T))
+        elif positions.shape != (B, T):
+            raise ValueError(f"`positions` must have shape ({B}, {T}) but got {positions.shape}")
     freq = 1.0 / (theta ** (jnp.arange(0, H, 2, dtype=jnp.float32) / H))  # (H/2, )
     inp = jnp.einsum(
         "bt,h-> bth", positions, freq, precision=jax.lax.Precision.HIGHEST
@@ -246,32 +307,41 @@ def forward_layer(
     q = rms_norm(q, w["q_norm"], cfg["rms_norm_eps"])
     k = rms_norm(k, w["k_norm"], cfg["rms_norm_eps"])
 
-    q = apply_rope(q, cfg["rope_theta"], pos)
-    k = apply_rope(k, cfg["rope_theta"], pos)
-
-    if kv is not None:
-        raise NotImplementedError
-        # kv = jax.lax.dynamic_update_slice(kv, jnp.stack([k, v]), (0, 0, pos, 0, 0))
-        # k, v = kv
-
+    rope_positions = None
     attn_impl = cfg["additional_config"]["attn_implementation"]
+    if attn_impl == "ragged_paged_dot_product_attention":
+        attn_metadata = inputs.get("attn_metadata")
+        if attn_metadata is not None:
+            rope_positions = attn_metadata.input_positions
+
+    q = apply_rope(q, cfg["rope_theta"], pos, positions=rope_positions)
+    k = apply_rope(k, cfg["rope_theta"], pos, positions=rope_positions)
+
     attention_fn = ATTENTION_INTERFACE[attn_impl]
 
-    # think again about this
-    S = k.shape[1]
-    q_pos = pos + jnp.arange(T, dtype=jnp.int32)
-    kv_pos = jnp.arange(S, dtype=jnp.int32)
-    causal = q_pos[:, None] >= kv_pos[None, :]  # (T, S)
-    padding = inputs.get("attention_mask", None)
-    if padding is not None:
-        # padding is typically (B, S) with 1 for tokens, 0 for padding
-        pad = padding.astype(bool)
-        attn_mask = causal[None, None, :, :] & pad[:, None, None, :]
-        attn_mask = jnp.broadcast_to(attn_mask, (B, cfg["num_attention_heads"], T, S))
-    else:
-        attn_mask = causal  # (T, S) broadcasted by the attention implementation
+    if kv is not None and attn_impl != "ragged_paged_dot_product_attention":
+        raise NotImplementedError
 
-    attn_output = attention_fn(q, k, v, mask=attn_mask)  # (B, T, N, H)
+    attn_mask = inputs.get("attn_mask")
+
+    if attn_impl == "ragged_paged_dot_product_attention":
+        # JAX pallas ragged paged attention creates stateful refs and slices them
+        # along the query-head axis. That axis must be unsharded, even if `tp=1`.
+        q = reshard(q, P(None, None, None, None))
+        k = reshard(k, P(None, None, None, None))
+        v = reshard(v, P(None, None, None, None))
+        attn_metadata = inputs.get("attn_metadata")
+        if attn_metadata is None:
+            raise ValueError("`attn_metadata` is required for ragged paged attention.")
+        attn_output, kv = attention_fn(
+            q,
+            k,
+            v,
+            kv_cache=kv,
+            attn_metadata=attn_metadata,
+        )
+    else:
+        attn_output = attention_fn(q, k, v, mask=attn_mask)  # (B, T, N, H)
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
     o = jnp.einsum(
@@ -317,11 +387,34 @@ def forward_layer(
     return x, kv
 
 
-def compute_logits(cfg, input_ids, weights):
-    pass
+def compute_logits(cfg, hidden_states, weights):
+    rules = cfg.get("sharding_rules", SHARDING_RULES)
+    out_embed = (
+        weights["model.embed_tokens.weight"]
+        if cfg["tie_word_embeddings"]
+        else weights["lm_head.weight"]
+    )
+    hidden_states = rms_norm(
+        hidden_states, weights["model.norm.weight"], cfg["rms_norm_eps"]
+    )
+    return jnp.einsum(
+        "btd,vd->btv",
+        hidden_states,
+        out_embed,
+        out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
+        preferred_element_type=hidden_states.dtype,
+    )
 
-def embed_tokens(config, input_ids, weights):
-    pass
+
+def embed_tokens(cfg, input_ids, weights, dtype: jnp.dtype = jnp.float32):
+    rules = cfg.get("sharding_rules", SHARDING_RULES)
+    input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
+    return (
+        weights["model.embed_tokens.weight"]
+        .at[input_ids, :]
+        .get(out_sharding=logical_to_physical(("batch", "sequence", "none"), rules))
+        .astype(dtype)
+    )
 
 
 def forward(
@@ -331,6 +424,7 @@ def forward(
     kv: None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
+    return_hidden_states: bool = False,
     **inputs,
 ):
     B, T = input_ids.shape
@@ -342,6 +436,14 @@ def forward(
         .get(out_sharding=logical_to_physical(("batch", "sequence", "none"), rules))
         .astype(dtype)
     )
+    user_attention_mask = inputs.get("attention_mask")
+    attn_mask = build_attn_mask(
+        cfg,
+        input_ids,
+        attention_mask=user_attention_mask,
+        segment_ids=inputs.get("segment_ids"),
+    )
+    inputs["attn_mask"] = attn_mask
 
     return_kv = kv is not None
     if kv is None:
@@ -379,7 +481,10 @@ def forward(
         if cfg["tie_word_embeddings"]
         else weights["lm_head.weight"]
     )
-    input_ids = rms_norm(
+    if return_hidden_states:
+        return (input_ids, kv) if return_kv else input_ids
+
+    hidden_states = rms_norm(
         input_ids, weights["model.norm.weight"], cfg["rms_norm_eps"]
     )  # (batch, "seq", "None")
 
@@ -387,10 +492,10 @@ def forward(
     # to achieve this
     logits = jnp.einsum(
         "btd,vd-> btv",
-        input_ids,
+        hidden_states,
         out_embed,
         out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
-        preferred_element_type=input_ids.dtype,
+        preferred_element_type=hidden_states.dtype,
     )
 
     return (logits, kv) if return_kv else logits
@@ -410,8 +515,20 @@ def load(
     param_dtype: jnp.dtype = jnp.bfloat16,
 ) -> Model:
 
-    if not config_kwargs:
-        config_kwargs = dict(DEFAULT_ADDITIONAL_CONFIG)
+    additional_config = dict(DEFAULT_ADDITIONAL_CONFIG)
+    if config_kwargs:
+        additional_config.update(config_kwargs)
+    if "max_num_request" in additional_config:
+        if (
+            "max_num_seqs" in additional_config
+            and additional_config["max_num_seqs"] != additional_config["max_num_request"]
+        ):
+            raise ValueError(
+                "`config_kwargs` specified both `max_num_seqs` and legacy "
+                "`max_num_request` with different values."
+            )
+        additional_config.setdefault("max_num_seqs", additional_config["max_num_request"])
+        additional_config.pop("max_num_request", None)
 
     sharding_rules = mutate_sharding_rule_parallel_dims(
         dict(SHARDING_RULES), parallel_dims
@@ -437,7 +554,7 @@ def load(
     cfg = json.loads(cfg_path.read_text())
     cfg = Config(
         **cfg,
-        **config_kwargs,
+        additional_config=additional_config,
         parallel_dims=parallel_dims,
         sharding_rules=sharding_rules,
     )
@@ -542,7 +659,7 @@ def load_inference(
     return InferenceModel(
         config=config,
         weights=model.weights,
-        forward=partial(forward, config),
+        forward=partial(forward, config, dtype=param_dtype),
         init_kv=partial(init_kv, L, K, H, num_pages, page_size, kv_dtype),
         compute_logits=partial(compute_logits, config),
         embed_tokens=partial(embed_tokens, config),

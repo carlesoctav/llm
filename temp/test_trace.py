@@ -11,7 +11,6 @@ def main():
     w = jax.random.normal(key1, (1, 10))
     x = jax.random.normal(key2, (10, 1))
     trace = f.trace(w, x).lower().compile().input_formats
-    print("DEBUGPRINT {trace}:", trace)
 
 
 main()

@@ -27,11 +27,27 @@ class SparseParallelDims(TypedDict):
     ep: int
     etp: int
 
-def mutate_sharding_rule_parallel_dims(rules: dict[str, AxisName], parallel_dims: ParallelDims):
+def drop_axis(mesh_axes: AxisName, axis_name: str) -> AxisName:
+    if mesh_axes is None:
+        return None
+    if isinstance(mesh_axes, str):
+        return None if mesh_axes == axis_name else mesh_axes
+
+    filtered_axes = tuple(axis for axis in mesh_axes if axis != axis_name)
+    return filtered_axes if filtered_axes else None
+
+
+def mutate_sharding_rule_parallel_dims(
+    rules: dict[str, AxisName],
+    parallel_dims: ParallelDims,
+    sequence_parallelism: bool = True,
+):
+    if not sequence_parallelism:
+        rules["context"] = drop_axis(rules.get("context"), "tp")
+        rules["sequence"] = drop_axis(rules.get("sequence"), "tp")
+
     if parallel_dims["cp"] == 1:
-        rules["context"] = None
-        # rules["sequence"] = ("tp",)
-        # rules["fsdp"] = ("dp_shard", )
+        rules["context"] = drop_axis(rules.get("context"), "cp")
 
     return rules
 

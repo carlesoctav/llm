@@ -10,9 +10,7 @@ class Rules:
 
 def logical_to_physical(logicals, rules):
     spec = [getattr(rules, logical) for logical in logicals]
-    print("DEBUGPRINT {spec}:", spec)
     leave = jtu.tree_leaves(spec)
-    print("DEBUGPRINT {leave}:", leave)
     if len(set(leave)) != len(leave):
         raise ValueError("soemthing when wrong")
 

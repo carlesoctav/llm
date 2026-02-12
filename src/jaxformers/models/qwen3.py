@@ -14,13 +14,20 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
-from requests.utils import DEFAULT_ACCEPT_ENCODING
 from safetensors import safe_open
 from transformers import AddedToken, PreTrainedTokenizerFast
 
-from jaxformers.attention_utils import eager_dot_product_attention
-from jaxformers.distributed.parallel import check_mesh_axis_for_inference, ParallelDims
-from jaxformers.masking_utils import ATTENTION_MASK_INTERFACE
+from jaxformers.distributed.parallel import ParallelDims
+from jaxformers.masking_utils import (
+    ATTENTION_MASK_INTERFACE,
+    make_causal_mask,
+)
+from jaxformers.modeling_utils import (
+    AdditionalConfig,
+    DEFAULT_ADDITIONAL_CONFIG,
+    logical_to_physical,
+    Model,
+)
 
 from ..attention_utils import ATTENTION_INTERFACE
 from ..distributed import (
@@ -58,55 +65,6 @@ SHARDING_RULES = {
 }
 
 
-def logical_to_physical(logical, rules):
-    spec = [rules[lo] for lo in logical]
-    flat_leaves = jtu.tree_leaves(spec)
-    if len(flat_leaves) != len(set(flat_leaves)):
-        raise ValueError(
-            f"Colliding physical axes from translating logical spec {logical} -> {spec}"
-        )
-
-    return P(*spec)
-
-
-class AdditionalConfig(TypedDict):
-    # training
-    gradient_checkpointing: bool = True
-
-    # training and inference
-    attn_implementation: str = "sdpa"
-
-    # inference
-    max_num_batched_token: int = 2048
-    max_model_len: int = 2048
-    max_num_request: int = 256
-    page_size: int = 128
-    num_pages: int  # (max_model_len * max_num_request // page_size)
-
-
-DEFAULT_ADDITIONAL_CONFIG = {
-    "gradient_checkpointing": True,
-    "attn_implementation": "sdpa",
-    "max_num_batched_token": 2048,
-    "max_model_len": 2048,
-    "max_num_request": 256,
-    "page_size": 256,
-}
-
-
-def mutable_check_additional_config_for_inference(config: Config):
-    additional_config = config["additional_config"]
-    additional_config["attn_implementation"] = "ragged_paged_dot_product_attention"
-    additional_config["gradient_checkpointing"] = False
-    page_size = additional_config["page_size"]
-
-    additional_config["num_pages"] = (
-        additional_config["max_model_len"] * additional_config["max_num_request"]
-        + page_size
-        - 1
-    ) // page_size
-
-
 class Config(TypedDict):
     model_type: str = "qwen3"
     attention_bias: bool
@@ -137,31 +95,6 @@ class Config(TypedDict):
     # come from args
     sharding_rules: dict[str, AxisName]
     parallel_dims: ParallelDims
-
-
-@dataclass
-class Model:
-    config: Config
-    weights: PyTree[Array, "ModelWeights"]
-    forward: Callable
-    tokenizer: PreTrainedTokenizerFast
-
-
-@dataclass
-class InferenceModel:
-    config: Config
-    weights: PyTree[Array, "ModelWeights"]
-    forward: Callable
-    compute_logits: Callable
-    forward_embedding: Callable
-    init_kv: Callable
-    tokenizer: PreTrainedTokenizerFast
-
-
-def init_kv(L, K, H, num_pages, page_size, dtype = jnp.bfloat16):
-    kv = [jnp.zeros((num_pages, page_size, 2*K, H), dtype = dtype) for _ in range(L)]
-    return kv
-
 
 def apply_rope(x: jax.Array, theta, pos=0):
     B, T, N, H = x.shape
@@ -196,7 +129,7 @@ def forward_layer(
     **inputs,
 ):
     B, T, D = x.shape
-    rules = cfg.get("sharding_rules", SHARDING_RULES)
+    rules = cfg["sharding_rules"]
 
     x_norm = rms_norm(x, w["input_layernorm"], cfg["rms_norm_eps"])
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
@@ -249,29 +182,12 @@ def forward_layer(
     q = apply_rope(q, cfg["rope_theta"], pos)
     k = apply_rope(k, cfg["rope_theta"], pos)
 
-    if kv is not None:
-        raise NotImplementedError
-        # kv = jax.lax.dynamic_update_slice(kv, jnp.stack([k, v]), (0, 0, pos, 0, 0))
-        # k, v = kv
-
     attn_impl = cfg["additional_config"]["attn_implementation"]
-    attention_fn = ATTENTION_INTERFACE[attn_impl]
+    attention_interface = ATTENTION_INTERFACE[attn_impl]
 
-    # think again about this
-    S = k.shape[1]
-    q_pos = pos + jnp.arange(T, dtype=jnp.int32)
-    kv_pos = jnp.arange(S, dtype=jnp.int32)
-    causal = q_pos[:, None] >= kv_pos[None, :]  # (T, S)
-    padding = inputs.get("attention_mask", None)
-    if padding is not None:
-        # padding is typically (B, S) with 1 for tokens, 0 for padding
-        pad = padding.astype(bool)
-        attn_mask = causal[None, None, :, :] & pad[:, None, None, :]
-        attn_mask = jnp.broadcast_to(attn_mask, (B, cfg["num_attention_heads"], T, S))
-    else:
-        attn_mask = causal  # (T, S) broadcasted by the attention implementation
-
-    attn_output = attention_fn(q, k, v, mask=attn_mask)  # (B, T, N, H)
+    attn_output = attention_interface(
+        q, k, v, mask=inputs["attention_mask"]
+    )  # (B, T, N, H)
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
     o = jnp.einsum(
@@ -317,15 +233,22 @@ def forward_layer(
     return x, kv
 
 
-def compute_logits(cfg, input_ids, weights):
-    pass
+def make_mask(config, input_ids, attention_mask=None, segment_ids=None):
+    attn_implementation = config["additional_config"]["attn_implementation"]
+    if attn_implementation not in ATTENTION_MASK_INTERFACE:
+        return None
 
-def embed_tokens(config, input_ids, weights):
-    pass
+    if attention_mask is not None:
+        attention_mask = attention_mask.astype(jnp.bool_)
+
+    attention_mask = make_causal_mask(
+        attn_implementation, input_ids, attention_mask, segment_ids
+    )
+    return attention_mask
 
 
 def forward(
-    cfg: Config,
+    config: Config,
     input_ids: Int[Array, "B T"],
     weights: PyTree[Array, "ModelWeights"],
     kv: None = None,
@@ -334,7 +257,7 @@ def forward(
     **inputs,
 ):
     B, T = input_ids.shape
-    rules = cfg.get("sharding_rules", SHARDING_RULES)
+    rules = config["sharding_rules"]
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     input_ids = (
         weights["model.embed_tokens.weight"]
@@ -347,7 +270,9 @@ def forward(
     if kv is None:
         kv = defaultdict(lambda: None)
 
-    for layer_idx in range(cfg["num_hidden_layers"]):
+    inputs["attention_mask"] = make_mask(config, input_ids, **inputs)
+
+    for layer_idx in range(config["num_hidden_layers"]):
         prefix = f"model.layers.{layer_idx}."
         layer_weights = {
             "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
@@ -365,10 +290,10 @@ def forward(
             "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
         }
 
-        if cfg.get("additional_config", {}).get("gradient_checkpointing", None):
-            fwd = jax.remat(partial(forward_layer, cfg, layer_idx))
+        if config["additional_config"]["gradient_checkpointing"]:
+            fwd = jax.remat(partial(forward_layer, config, layer_idx))
         else:
-            fwd = partial(forward_layer, cfg, layer_idx)
+            fwd = partial(forward_layer, config, layer_idx)
 
         input_ids, kv[layer_idx] = fwd(
             input_ids, layer_weights, kv[layer_idx], pos, **inputs
@@ -376,11 +301,11 @@ def forward(
 
     out_embed = (
         weights["model.embed_tokens.weight"]
-        if cfg["tie_word_embeddings"]
+        if config["tie_word_embeddings"]
         else weights["lm_head.weight"]
     )
     input_ids = rms_norm(
-        input_ids, weights["model.norm.weight"], cfg["rms_norm_eps"]
+        input_ids, weights["model.norm.weight"], config["rms_norm_eps"]
     )  # (batch, "seq", "None")
 
     # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, none)
@@ -404,22 +329,24 @@ def load(
     model_id: str,
     parallel_dims: ParallelDims,
     devices: list | None = None,
-    hf_ckpt_dir: str = "~/weights/huggingface",
+    local_dir: str | None = None,
     multihost: bool = False,
-    config_kwargs: AdditionalConfig | None = None,
+    additional_config: AdditionalConfig | None = None,
     param_dtype: jnp.dtype = jnp.bfloat16,
 ) -> Model:
 
-    if not config_kwargs:
-        config_kwargs = dict(DEFAULT_ADDITIONAL_CONFIG)
+    additional_config = {
+        **DEFAULT_ADDITIONAL_CONFIG,
+        **(additional_config or {}),
+    }
 
     sharding_rules = mutate_sharding_rule_parallel_dims(
-        dict(SHARDING_RULES), parallel_dims
+        dict(SHARDING_RULES),
+        parallel_dims,
+        sequence_parallelism=additional_config["sequence_parallelism"],
     )
-    model_ckpt_dir = Path(hf_ckpt_dir).expanduser() / model_id
 
-    if not model_ckpt_dir.exists():
-        snapshot_download(repo_id=model_id, local_dir=model_ckpt_dir)
+    model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
 
     tokenizer_config_path = model_ckpt_dir / "tokenizer_config.json"
     tokenizer_config = json.loads(tokenizer_config_path.read_text())
@@ -437,17 +364,9 @@ def load(
     cfg = json.loads(cfg_path.read_text())
     cfg = Config(
         **cfg,
-        **config_kwargs,
+        additional_config=additional_config,
         parallel_dims=parallel_dims,
         sharding_rules=sharding_rules,
-    )
-
-    L, N, K, H, D = (
-        cfg["num_hidden_layers"],
-        cfg["num_attention_heads"],
-        cfg["num_key_value_heads"],
-        cfg["head_dim"],
-        cfg["hidden_size"],
     )
 
     if multihost:
@@ -496,55 +415,5 @@ def load(
         config=cfg,
         weights=weights,
         forward=partial(forward, cfg),
-        tokenizer = tokenizer,
-    )
-
-
-def load_inference(
-    model_or_model_id: Model | str,
-    parallel_dims: ParallelDims,
-    devices: list | None = None,
-    hf_ckpt_dir: str = "~/weights/huggingface",
-    multihost: bool = False,
-    config_kwargs: AdditionalConfig | None = None,
-    param_dtype: jnp.dtype = jnp.bfloat16,
-    kv_dtype: jnp.dtype = jnp.bfloat16,
-):
-    if isinstance(model_or_model_id, Model):
-        model = model_or_model_id
-        print("using cololcated mode by passing Model")
-    elif isinstance(model_or_model_id, str):
-        model_id = model_or_model_id
-        model = load(
-            model_id=model_id,
-            parallel_dims=parallel_dims,
-            devices=devices,
-            hf_ckpt_dir=hf_ckpt_dir,
-            multihost=multihost,
-            config_kwargs=config_kwargs,
-            param_dtype=param_dtype,
-        )
-    else:
-        raise TypeError("model_or_model_id must be a Model instance or a model id string")
-
-    config = copy.deepcopy(model.config)
-    check_mesh_axis_for_inference(config["parallel_dims"])
-    mutable_check_additional_config_for_inference(config)
-
-    L, K, H, num_pages, page_size = (
-        config["num_hidden_layers"],
-        config["num_key_value_heads"],
-        config["head_dim"],
-        config["additional_config"]["num_pages"],
-        config["additional_config"]["page_size"],
-    )
-
-    return InferenceModel(
-        config=config,
-        weights=model.weights,
-        forward=partial(forward, config),
-        init_kv=partial(init_kv, L, K, H, num_pages, page_size, kv_dtype),
-        compute_logits=partial(compute_logits, config),
-        embed_tokens=partial(embed_tokens, config),
-        tokenizer = model.tokenizer
+        tokenizer=tokenizer,
     )

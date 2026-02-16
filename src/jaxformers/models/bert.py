@@ -1,19 +1,16 @@
-import json
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, TypedDict, TypeVar
+from typing import TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoTokenizer, PreTrainedConfig, PreTrainedTokenizerBase
 
 from jaxformers.modeling_utils import (
     AdditionalConfig,
@@ -59,26 +56,7 @@ SHARDING_RULES = {
 }
 
 
-class Config(TypedDict):
-    model_type: str
-    vocab_size: int
-    hidden_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    intermediate_size: int
-    hidden_act: str
-    hidden_dropout_prob: float
-    attention_probs_dropout_prob: float
-    max_position_embeddings: int
-    type_vocab_size: int
-    layer_norm_eps: float
-    pad_token_id: int | None
-
-    additional_config: AdditionalConfig
-
-    # from args
-    sharding_rules: dict[str, AxisName]
-    parallel_dims: ParallelDims
+Config: TypeAlias = PreTrainedConfig
 
 def layer_norm(x: jax.Array, gamma: jax.Array, beta: jax.Array, eps: float):
     x_fp32 = x.astype(jnp.float32)
@@ -107,7 +85,7 @@ def build_bidirectional_mask(
     attention_mask: Int[Array, "B T"] | None = None,
     segment_ids: Int[Array, "B T"] | None = None,
 ) -> Array | None:
-    attn_impl = cfg["additional_config"]["attn_implementation"]
+    attn_impl = cfg.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_INTERFACE:
         return None
 
@@ -136,7 +114,7 @@ def embed_input(
     dtype: jnp.dtype = jnp.float32,
 ):
     B, T = input_ids.shape
-    rules = cfg["sharding_rules"]
+    rules = cfg.sharding_rules
 
     input_ids = input_ids.astype(jnp.int32)
     if token_type_ids is None:
@@ -175,7 +153,7 @@ def embed_input(
         x,
         weights["bert.embeddings.LayerNorm.weight"],
         weights["bert.embeddings.LayerNorm.bias"],
-        cfg["layer_norm_eps"],
+        cfg.layer_norm_eps,
     )
     return x
 
@@ -187,10 +165,10 @@ def forward_layer(
     w: PyTree[Array, "LayerWeights"],
     **inputs,
 ):
-    rules = cfg["sharding_rules"]
+    rules = cfg.sharding_rules
     dtype = x.dtype
-    num_heads = cfg["num_attention_heads"]
-    head_dim = cfg["hidden_size"] // num_heads
+    num_heads = cfg.num_attention_heads
+    head_dim = cfg.hidden_size // num_heads
 
     q = (
         jnp.einsum(
@@ -227,7 +205,7 @@ def forward_layer(
     k = rearrange(k, "b t (n h) -> b t n h", n=num_heads, h=head_dim)
     v = rearrange(v, "b t (n h) -> b t n h", n=num_heads, h=head_dim)
 
-    attn_impl = cfg["additional_config"]["attn_implementation"]
+    attn_impl = cfg.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
     attn_output = attention_interface(q, k, v, mask=inputs.get("attn_mask"))
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
@@ -248,11 +226,11 @@ def forward_layer(
         x + attn_output,
         w["attn_ln_w"],
         w["attn_ln_b"],
-        cfg["layer_norm_eps"],
+        cfg.layer_norm_eps,
     )
     x = reshard(x, logical_to_physical(("batch", "context", "none"), rules))
 
-    activation = get_activation_fn(cfg["hidden_act"])
+    activation = get_activation_fn(cfg.hidden_act)
     inter = activation(
         jnp.einsum(
             "btd,fd->btf",
@@ -279,7 +257,7 @@ def forward_layer(
         x + out,
         w["ffn_ln_w"],
         w["ffn_ln_b"],
-        cfg["layer_norm_eps"],
+        cfg.layer_norm_eps,
     )
     return x
 
@@ -312,7 +290,7 @@ def forward(
         segment_ids=segment_ids,
     )
 
-    for layer_idx in range(cfg["num_hidden_layers"]):
+    for layer_idx in range(cfg.num_hidden_layers):
         prefix = f"bert.encoder.layer.{layer_idx}."
         layer_weights = {
             "q_proj_w": weights[f"{prefix}attention.self.query.weight"],
@@ -333,7 +311,7 @@ def forward(
             "ffn_ln_b": weights[f"{prefix}output.LayerNorm.bias"],
         }
 
-        if cfg["additional_config"]["gradient_checkpointing"]:
+        if cfg.additional_config["gradient_checkpointing"]:
             fwd = jax.remat(partial(forward_layer, cfg, layer_idx))
         else:
             fwd = partial(forward_layer, cfg, layer_idx)
@@ -388,14 +366,12 @@ def load(
 
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
 
-    cfg_path = model_ckpt_dir / "config.json"
-    cfg = json.loads(cfg_path.read_text())
-    cfg = Config(
-        **cfg,
-        additional_config=additional_config,
-        parallel_dims=parallel_dims,
-        sharding_rules=sharding_rules,
-    )
+    cfg = AutoConfig.from_pretrained(model_ckpt_dir)
+    if not isinstance(cfg, PreTrainedConfig):
+        raise TypeError(f"Expected HF config, got {type(cfg)!r}")
+    cfg.additional_config = additional_config
+    cfg.parallel_dims = parallel_dims
+    cfg.sharding_rules = sharding_rules
 
     if multihost:
         jax.distributed.initialize()

@@ -1,14 +1,18 @@
-import grain
+import typing as tp
 import warnings
-from datasets import IterableDataset, Dataset
-from grain._src.python import options
+from typing import Any
+
+import grain
+from datasets import Dataset, IterableDataset, load_dataset
+
+
+Batch = tp.Any
+_T = tp.TypeVar("_T")
+_S = tp.TypeVar("_S")
+
 
 class _HuggingFaceSourceIterator(grain.DatasetIterator):
-
-    def __init__(
-        self,
-        dataset: IterableDataset
-    ):
+    def __init__(self, dataset: IterableDataset):
         super().__init__()
         self._dataset = dataset
         self._iterator = iter(self._dataset)
@@ -25,7 +29,6 @@ class _HuggingFaceSourceIterator(grain.DatasetIterator):
 
 
 class HuggingFaceSourceIterDataset(grain.IterDataset):
-
     def __init__(
         self,
         source: IterableDataset,
@@ -48,15 +51,13 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         index: int,
         contiguous: bool = True,
     ):
-        return HuggingFaceSourceIterDataset(self._source.shard(num_shards, index, contiguous))
+        return HuggingFaceSourceIterDataset(
+            self._source.shard(num_shards, index, contiguous)
+        )
 
-    def set_slice(
-        self,
-        sl: slice,
-        sequential_slice: bool = True
-    ) -> None:
+    def set_slice(self, sl: slice, sequential_slice: bool = True) -> None:
 
-        #sl.step is num of worker
+        # sl.step is num of worker
         # (1, 2, 4)
         if sl.step is None or sl.step <= 0:
             raise ValueError("slice.step (num_workers) must be a positive integer.")
@@ -64,7 +65,9 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         contiguous = bool(sequential_slice)
 
         if self._source.num_shards < sl.step:
-            warnings.warn("The number of shards in the HuggingFace dataset is smaller than the number of workers. Some workers will not receive any data.")
+            warnings.warn(
+                "The number of shards in the HuggingFace dataset is smaller than the number of workers. Some workers will not receive any data."
+            )
 
         self._source = self._source.shard(
             num_shards=sl.step,
@@ -77,7 +80,10 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         seed: int | None = None,
         buffer_size: int | None = 1000,
     ) -> "HuggingFaceSourceIterDataset":
-        return HuggingFaceSourceIterDataset(self._source.shuffle(seed=seed, buffer_size = buffer_size))
+        return HuggingFaceSourceIterDataset(
+            self._source.shuffle(seed=seed, buffer_size=buffer_size)
+        )
+
 
 class HuggingFaceSourceMapDataset(grain.MapDataset):
     def __init__(self, source: Dataset):
@@ -95,14 +101,16 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
 
     def slice(self, sl: slice) -> "HuggingFaceSourceMapDataset":
         start, stop, step = sl.indices(len(self._source))
-        if step == 1: #[ start: end]
+        if step == 1:  # [ start: end]
             return HuggingFaceSourceMapDataset(self._source.select(range(start, stop)))
         if stop == len(self._source) and start < step:
             return HuggingFaceSourceMapDataset(
                 self._source.shard(num_shards=step, index=start, contiguous=False)
             )
 
-        return HuggingFaceSourceMapDataset(self._source.select(range(start, stop, step)))
+        return HuggingFaceSourceMapDataset(
+            self._source.select(range(start, stop, step))
+        )
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -116,7 +124,9 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         contiguous: bool = True,
     ) -> "HuggingFaceSourceMapDataset":
         return HuggingFaceSourceMapDataset(
-            self._source.shard(num_shards=num_shards, index=index, contiguous=contiguous)
+            self._source.shard(
+                num_shards=num_shards, index=index, contiguous=contiguous
+            )
         )
 
     def set_slice(
@@ -132,3 +142,18 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
             index=worker_index,
             contiguous=sequential_slice,
         )
+
+
+def load(load_kwargs: list[dict[str, Any]]):
+    datasets = []
+    for load_kwarg in load_kwargs:
+        dataset = load_dataset(**load_kwarg)
+        if isinstance(dataset, IterableDataset):
+            datasets.append(HuggingFaceSourceIterDataset(dataset))
+        elif isinstance(dataset, Dataset):
+            datasets.append(HuggingFaceSourceMapDataset(dataset))
+        else:
+            raise ValueError(
+                f"dataset must be IterableDataset or Dataset, got {type(dataset)}"
+            )
+    return datasets

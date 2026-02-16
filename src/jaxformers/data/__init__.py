@@ -1,3 +1,3 @@
-from .huggingface_dataset import  HuggingFaceSourceIterDataset, HuggingFaceSourceMapDataset
-from .training import make_dataloader_from_huggingface
-from .next_token_prediction import next_token_prediction_transforms
+from .huggingface import  HuggingFaceSourceIterDataset, HuggingFaceSourceMapDataset
+from .training import make_dataloader
+from .next_token_prediction import transforms

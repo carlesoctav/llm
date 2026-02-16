@@ -1,19 +1,20 @@
-import json
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, TypedDict, TypeVar
+from typing import Callable, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    PreTrainedConfig,
+)
 
 from jaxformers.distributed.parallel import ParallelDims
 from jaxformers.masking_utils import (
@@ -64,50 +65,7 @@ SHARDING_RULES = {
 }
 
 
-class Config(TypedDict):
-    model_type: str
-    attention_bias: bool
-    attention_dropout: float
-    attn_logit_softcapping: float | None
-    bos_token_id: int
-    eos_token_id: int
-    final_logit_softcapping: float | None
-    head_dim: int
-    hidden_activation: str
-    hidden_size: int
-    initializer_range: float
-    intermediate_size: int
-    layer_types: list[str]
-    max_position_embeddings: int
-    num_attention_heads: int
-    num_hidden_layers: int
-    num_key_value_heads: int
-    pad_token_id: int | None
-    query_pre_attn_scalar: float
-    rms_norm_eps: float
-    rope_parameters: dict[str, Any] | None
-    sliding_window: int | None
-    tie_word_embeddings: bool
-    use_bidirectional_attention: bool
-    use_cache: bool
-    vocab_size: int
-
-    additional_config: AdditionalConfig
-
-    # filled in load()
-    sharding_rules: dict[str, AxisName]
-    parallel_dims: ParallelDims
-    model_prefix: str
-    lm_head_key: str
-
-
-@dataclass
-class Model:
-    config: Config
-    weights: PyTree[Array, "ModelWeights"]
-    forward: Callable
-    tokenizer: PreTrainedTokenizerBase
-    opt_state: PyTree["ModelWeights"] | None = None
+Config: TypeAlias = PreTrainedConfig
 
 
 def apply_rope(x: jax.Array, theta: float, pos=0):
@@ -147,39 +105,25 @@ def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array
     raise ValueError(f"Unsupported hidden activation {hidden_activation!r}")
 
 
-def get_rope_theta(cfg: Config, layer_idx: int) -> float:
-    rope_parameters = cfg.get("rope_parameters")
-    if isinstance(rope_parameters, dict):
-        layer_types = cfg.get("layer_types")
-        if isinstance(layer_types, list) and layer_idx < len(layer_types):
-            layer_rope = rope_parameters.get(layer_types[layer_idx])
-            if (
-                isinstance(layer_rope, dict)
-                and layer_rope.get("rope_theta") is not None
-            ):
-                return float(layer_rope["rope_theta"])
-        for rope_cfg in rope_parameters.values():
-            if isinstance(rope_cfg, dict) and rope_cfg.get("rope_theta") is not None:
-                return float(rope_cfg["rope_theta"])
+def get_rope_theta(cfg: Config, attention_type: str) -> float:
+    rope_parameters = getattr(cfg, "rope_parameters", None)
+    if not isinstance(rope_parameters, dict):
+        raise TypeError(
+            "Gemma-3 config must define `rope_parameters` as a dict with per-attention-type "
+            "settings (e.g. {'full_attention': {'rope_theta': ...}, ...})."
+        )
 
-    layer_types = cfg.get("layer_types")
-    if isinstance(layer_types, list) and layer_idx < len(layer_types):
-        layer_type = layer_types[layer_idx]
-        if (
-            layer_type == "sliding_attention"
-            and cfg.get("rope_local_base_freq") is not None
-        ):
-            return float(cfg["rope_local_base_freq"])
-        if layer_type == "full_attention" and cfg.get("rope_theta") is not None:
-            return float(cfg["rope_theta"])
-            
-    if cfg.get("rope_theta") is not None:
-        return float(cfg["rope_theta"])
-    return 10_000.0
+    attn_cfg = rope_parameters.get(attention_type)
+    if not isinstance(attn_cfg, dict) or attn_cfg.get("rope_theta") is None:
+        raise KeyError(
+            f"Missing `rope_theta` for attention_type={attention_type!r} in `rope_parameters`. "
+            f"Available keys: {sorted(rope_parameters.keys())!r}"
+        )
+    return float(attn_cfg["rope_theta"])
 
 
 def make_mask_mapping(config, input_embeds, attention_mask=None, segment_ids=None):
-    attn_impl = config["additional_config"]["attn_implementation"]
+    attn_impl = config.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
         return {
             "full_attention": None,
@@ -190,7 +134,7 @@ def make_mask_mapping(config, input_embeds, attention_mask=None, segment_ids=Non
         attention_mask = attention_mask.astype(jnp.bool_)
 
     full_mask = make_causal_mask(attn_impl, input_embeds, attention_mask, segment_ids)
-    window_size = config.get("sliding_window")
+    window_size = getattr(config, "sliding_window", None)
     if window_size is None:
         sliding_mask = full_mask
     else:
@@ -229,19 +173,19 @@ def linear_3d(x, w, b=None, *, out_sharding=None):
 
 def forward_layer(
     cfg: Config,
-    layer_idx: int,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
+    rope_theta: float,
     kv=None,
     pos=0,
     **inputs,
 ):
-    rules = cfg["sharding_rules"]
-    act_fn = get_activation_fn(cfg["hidden_activation"])
-    head_dim = cfg["head_dim"]
+    rules = cfg.sharding_rules
+    act_fn = get_activation_fn(cfg.hidden_activation)
+    head_dim = cfg.head_dim
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["input_layernorm"], cfg["rms_norm_eps"])
+    x_norm = gemma_rms_norm(x, w["input_layernorm"], cfg.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     q = linear_3d(
@@ -263,21 +207,20 @@ def forward_layer(
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
 
-    q = rearrange(q, "b t (n h) -> b t n h", n=cfg["num_attention_heads"], h=head_dim)
-    k = rearrange(k, "b t (k h) -> b t k h", k=cfg["num_key_value_heads"], h=head_dim)
-    v = rearrange(v, "b t (k h) -> b t k h", k=cfg["num_key_value_heads"], h=head_dim)
+    q = rearrange(q, "b t (n h) -> b t n h", n=cfg.num_attention_heads, h=head_dim)
+    k = rearrange(k, "b t (k h) -> b t k h", k=cfg.num_key_value_heads, h=head_dim)
+    v = rearrange(v, "b t (k h) -> b t k h", k=cfg.num_key_value_heads, h=head_dim)
 
-    q = gemma_rms_norm(q, w["q_norm"], cfg["rms_norm_eps"])
-    k = gemma_rms_norm(k, w["k_norm"], cfg["rms_norm_eps"])
+    q = gemma_rms_norm(q, w["q_norm"], cfg.rms_norm_eps)
+    k = gemma_rms_norm(k, w["k_norm"], cfg.rms_norm_eps)
 
-    query_pre_attn_scalar = float(cfg.get("query_pre_attn_scalar", cfg["head_dim"]))
-    q = q * jnp.sqrt(jnp.array(cfg["head_dim"] / query_pre_attn_scalar, dtype=q.dtype))
+    query_pre_attn_scalar = float(getattr(cfg, "query_pre_attn_scalar", cfg.head_dim))
+    q = q * jnp.sqrt(jnp.array(cfg.head_dim / query_pre_attn_scalar, dtype=q.dtype))
 
-    rope_theta = get_rope_theta(cfg, layer_idx)
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
 
-    attn_impl = cfg["additional_config"]["attn_implementation"]
+    attn_impl = cfg.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
     attn_output = attention_interface(q, k, v, mask=inputs["attention_mask"])
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
@@ -291,12 +234,12 @@ def forward_layer(
     attn_output = gemma_rms_norm(
         attn_output,
         w["post_attention_layernorm"],
-        cfg["rms_norm_eps"],
+        cfg.rms_norm_eps,
     )
     x = residual + attn_output
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["pre_feedforward_layernorm"], cfg["rms_norm_eps"])
+    x_norm = gemma_rms_norm(x, w["pre_feedforward_layernorm"], cfg.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     gate = act_fn(
@@ -323,7 +266,7 @@ def forward_layer(
     if w.get("down_proj_bias") is not None:
         ffw = ffw + w["down_proj_bias"][None, None, :]
 
-    ffw = gemma_rms_norm(ffw, w["post_feedforward_layernorm"], cfg["rms_norm_eps"])
+    ffw = gemma_rms_norm(ffw, w["post_feedforward_layernorm"], cfg.rms_norm_eps)
     x = residual + ffw
     return x, kv
 
@@ -340,10 +283,11 @@ def forward(
     logits_to_keep: int = 0,
     **inputs,
 ):
-    rules = config["sharding_rules"]
-    model_prefix = config["model_prefix"]
+    rules = config.sharding_rules
+    model_prefix = "model"
     embed_key = f"{model_prefix}.embed_tokens.weight"
     final_norm_key = f"{model_prefix}.norm.weight"
+    lm_head_key = "lm_head.weight"
 
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     x = (
@@ -352,7 +296,7 @@ def forward(
         .get(out_sharding=logical_to_physical(("batch", "sequence", "none"), rules))
         .astype(dtype)
     )
-    x *= jnp.sqrt(jnp.array(config["hidden_size"], dtype=dtype))
+    x *= jnp.sqrt(jnp.array(config.hidden_size, dtype=dtype))
 
     return_kv = kv is not None
     if kv is None:
@@ -365,17 +309,10 @@ def forward(
         segment_ids=segment_ids,
     )
 
-    for layer_idx in range(config["num_hidden_layers"]):
-        layer_types = config.get("layer_types")
-        if isinstance(layer_types, list) and layer_idx < len(layer_types):
-            attention_type = layer_types[layer_idx]
-        else:
-            pattern = int(config.get("sliding_window_pattern", 6))
-            attention_type = (
-                "sliding_attention"
-                if bool((layer_idx + 1) % pattern)
-                else "full_attention"
-            )
+    layer_types = config.layer_types
+    for layer_idx in range(int(config.num_hidden_layers)):
+        attention_type = layer_types[layer_idx % len(layer_types)]
+        rope_theta = get_rope_theta(config, attention_type)
 
         prefix = f"{model_prefix}.layers.{layer_idx}."
         layer_weights = {
@@ -407,26 +344,27 @@ def forward(
             "down_proj_bias": weights.get(f"{prefix}mlp.down_proj.bias"),
         }
 
-        if config["additional_config"]["gradient_checkpointing"]:
-            fwd = jax.remat(partial(forward_layer, config, layer_idx))
+        if config.additional_config["gradient_checkpointing"]:
+            fwd = jax.remat(partial(forward_layer, config))
         else:
-            fwd = partial(forward_layer, config, layer_idx)
+            fwd = partial(forward_layer, config)
 
         layer_mask = mask_mapping.get(attention_type)
         x, kv[layer_idx] = fwd(
             x,
             layer_weights,
+            rope_theta,
             kv[layer_idx],
             pos,
             attention_mask=layer_mask,
             **inputs,
         )
 
-    x = gemma_rms_norm(x, weights[final_norm_key], config["rms_norm_eps"])
-    if config.get("tie_word_embeddings", True) or config["lm_head_key"] not in weights:
+    x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
+    if getattr(config, "tie_word_embeddings", True) or lm_head_key not in weights:
         out_embed = weights[embed_key]
     else:
-        out_embed = weights[config["lm_head_key"]]
+        out_embed = weights[lm_head_key]
 
     if logits_to_keep:
         x = x[:, -int(logits_to_keep) :, :]
@@ -439,7 +377,7 @@ def forward(
         preferred_element_type=x.dtype,
     )
 
-    softcap = config.get("final_logit_softcapping")
+    softcap = getattr(config, "final_logit_softcapping", None)
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
 
@@ -448,28 +386,6 @@ def forward(
 
 def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
     pass
-
-
-def detect_weight_prefixes(weights: dict[str, jax.Array]):
-    if "model.embed_tokens.weight" in weights:
-        return "model", "lm_head.weight"
-    if "language_model.model.embed_tokens.weight" in weights:
-        return "language_model.model", "language_model.lm_head.weight"
-
-    embed_key = next(
-        (key for key in weights if key.endswith("model.embed_tokens.weight")),
-        None,
-    )
-    if embed_key is None:
-        raise KeyError("Could not locate Gemma-3 embedding weights in checkpoint.")
-
-    model_prefix = embed_key[: -len(".embed_tokens.weight")]
-    lm_head_key = (
-        "language_model.lm_head.weight"
-        if model_prefix.startswith("language_model.")
-        else "lm_head.weight"
-    )
-    return model_prefix, lm_head_key
 
 
 def load(
@@ -494,36 +410,9 @@ def load(
 
     model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
-
-    cfg_path = model_ckpt_dir / "config.json"
-    raw_cfg = json.loads(cfg_path.read_text())
-    if isinstance(raw_cfg.get("text_config"), dict):
-        base_cfg = dict(raw_cfg["text_config"])
-    else:
-        base_cfg = dict(raw_cfg)
-
-    if base_cfg.get("layer_types") is None:
-        pattern = int(
-            base_cfg.get(
-                "sliding_window_pattern", raw_cfg.get("sliding_window_pattern", 6)
-            )
-        )
-        num_layers = int(base_cfg["num_hidden_layers"])
-        base_cfg["layer_types"] = [
-            "sliding_attention" if bool((i + 1) % pattern) else "full_attention"
-            for i in range(num_layers)
-        ]
-
-    if base_cfg.get("rope_parameters") is None and (
-        base_cfg.get("rope_theta") is not None
-        or base_cfg.get("rope_local_base_freq") is not None
-    ):
-        full_theta = float(base_cfg.get("rope_theta") or 10_000.0)
-        sliding_theta = float(base_cfg.get("rope_local_base_freq") or full_theta)
-        base_cfg["rope_parameters"] = {
-            "full_attention": {"rope_theta": full_theta},
-            "sliding_attention": {"rope_theta": sliding_theta},
-        }
+    cfg = AutoConfig.from_pretrained(model_ckpt_dir)
+    if not isinstance(cfg, PreTrainedConfig):
+        raise TypeError(f"Expected HF config, got {type(cfg)!r}")
 
     if multihost:
         jax.distributed.initialize()
@@ -571,16 +460,16 @@ def load(
                     get_sharding(key),
                 )
 
-    model_prefix, lm_head_key = detect_weight_prefixes(weights)
+    if "model.embed_tokens.weight" not in weights:
+        raise KeyError(
+            "Could not locate Gemma-3 text embedding weights. "
+            "Expected 'model.embed_tokens.weight'. "
+            "If this is a multimodal checkpoint, load it via your gemma3_mm module."
+        )
 
-    cfg = Config(
-        **base_cfg,
-        additional_config=additional_config,
-        parallel_dims=parallel_dims,
-        sharding_rules=sharding_rules,
-        model_prefix=model_prefix,
-        lm_head_key=lm_head_key,
-    )
+    cfg.additional_config = additional_config
+    cfg.parallel_dims = parallel_dims
+    cfg.sharding_rules = sharding_rules
 
     return Model(
         config=cfg,

@@ -4,7 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, TypedDict, TypeVar
+from typing import Callable, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -15,7 +15,12 @@ from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
-from transformers import AddedToken, PreTrainedTokenizerFast
+from transformers import (
+    AddedToken,
+    AutoConfig,
+    PreTrainedConfig,
+    PreTrainedTokenizerFast,
+)
 
 from jaxformers.distributed.parallel import ParallelDims
 from jaxformers.masking_utils import (
@@ -65,36 +70,21 @@ SHARDING_RULES = {
 }
 
 
-class Config(TypedDict):
-    model_type: str = "qwen3"
-    attention_bias: bool
-    attention_dropout: float
-    bos_token_id: int
-    eos_token_id: int
-    head_dim: int
-    hidden_act: str
-    hidden_size: int
-    initializer_range: float
-    intermediate_size: int
-    max_position_embeddings: int
-    max_window_layers: int
-    num_attention_heads: int
-    num_hidden_layers: int
-    num_key_value_heads: int
-    rms_norm_eps: float
-    rope_scaling: dict[str, Any]
-    rope_theta: int
-    sliding_window: int | None
-    tie_word_embeddings: bool
-    use_cache: bool
-    use_sliding_window: bool
-    vocab_size: int
+Config: TypeAlias = PreTrainedConfig
 
-    additional_config: AdditionalConfig
 
-    # come from args
-    sharding_rules: dict[str, AxisName]
-    parallel_dims: ParallelDims
+def get_rope_theta(cfg: Config) -> float:
+    rope_parameters = getattr(cfg, "rope_parameters", None)
+    if (
+        not isinstance(rope_parameters, dict)
+        or rope_parameters.get("rope_theta") is None
+    ):
+        raise TypeError(
+            "Qwen-3 config must define `rope_parameters` as a dict with a `rope_theta` key "
+            "(e.g. {'rope_theta': 1000000, ...})."
+        )
+    return float(rope_parameters["rope_theta"])
+
 
 def apply_rope(x: jax.Array, theta, pos=0):
     B, T, N, H = x.shape
@@ -129,9 +119,9 @@ def forward_layer(
     **inputs,
 ):
     B, T, D = x.shape
-    rules = cfg["sharding_rules"]
+    rules = cfg.sharding_rules
 
-    x_norm = rms_norm(x, w["input_layernorm"], cfg["rms_norm_eps"])
+    x_norm = rms_norm(x, w["input_layernorm"], cfg.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     q = jnp.einsum(
@@ -159,30 +149,31 @@ def forward_layer(
     q = rearrange(
         q,
         "b t (n h) -> b t n h",
-        n=cfg["num_attention_heads"],
-        h=cfg["head_dim"],
+        n=cfg.num_attention_heads,
+        h=cfg.head_dim,
     )
 
     k = rearrange(
         k,
         "b t (k h) -> b t k h",
-        k=cfg["num_key_value_heads"],
-        h=cfg["head_dim"],
+        k=cfg.num_key_value_heads,
+        h=cfg.head_dim,
     )
     v = rearrange(
         v,
         "b t (k h) -> b t k h",
-        k=cfg["num_key_value_heads"],
-        h=cfg["head_dim"],
+        k=cfg.num_key_value_heads,
+        h=cfg.head_dim,
     )
 
-    q = rms_norm(q, w["q_norm"], cfg["rms_norm_eps"])
-    k = rms_norm(k, w["k_norm"], cfg["rms_norm_eps"])
+    q = rms_norm(q, w["q_norm"], cfg.rms_norm_eps)
+    k = rms_norm(k, w["k_norm"], cfg.rms_norm_eps)
 
-    q = apply_rope(q, cfg["rope_theta"], pos)
-    k = apply_rope(k, cfg["rope_theta"], pos)
+    rope_theta = get_rope_theta(cfg)
+    q = apply_rope(q, rope_theta, pos)
+    k = apply_rope(k, rope_theta, pos)
 
-    attn_impl = cfg["additional_config"]["attn_implementation"]
+    attn_impl = cfg.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
 
     attn_output = attention_interface(
@@ -199,7 +190,7 @@ def forward_layer(
     )
 
     x += o
-    x_norm = rms_norm(x, w["post_attention_layernorm"], cfg["rms_norm_eps"])
+    x_norm = rms_norm(x, w["post_attention_layernorm"], cfg.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     # FFN
@@ -234,7 +225,7 @@ def forward_layer(
 
 
 def make_mask(config, input_ids, attention_mask=None, segment_ids=None):
-    attn_implementation = config["additional_config"]["attn_implementation"]
+    attn_implementation = config.additional_config["attn_implementation"]
     if attn_implementation not in ATTENTION_MASK_INTERFACE:
         return None
 
@@ -249,15 +240,15 @@ def make_mask(config, input_ids, attention_mask=None, segment_ids=None):
 
 def forward(
     config: Config,
-    input_ids: Int[Array, "B T"],
     weights: PyTree[Array, "ModelWeights"],
+    input_ids: Int[Array, "B T"],
     kv: None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
     **inputs,
 ):
     B, T = input_ids.shape
-    rules = config["sharding_rules"]
+    rules = config.sharding_rules
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     input_ids = (
         weights["model.embed_tokens.weight"]
@@ -272,7 +263,7 @@ def forward(
 
     inputs["attention_mask"] = make_mask(config, input_ids, **inputs)
 
-    for layer_idx in range(config["num_hidden_layers"]):
+    for layer_idx in range(config.num_hidden_layers):
         prefix = f"model.layers.{layer_idx}."
         layer_weights = {
             "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
@@ -290,7 +281,7 @@ def forward(
             "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
         }
 
-        if config["additional_config"]["gradient_checkpointing"]:
+        if config.additional_config["gradient_checkpointing"]:
             fwd = jax.remat(partial(forward_layer, config, layer_idx))
         else:
             fwd = partial(forward_layer, config, layer_idx)
@@ -301,11 +292,11 @@ def forward(
 
     out_embed = (
         weights["model.embed_tokens.weight"]
-        if config["tie_word_embeddings"]
+        if config.tie_word_embeddings
         else weights["lm_head.weight"]
     )
     input_ids = rms_norm(
-        input_ids, weights["model.norm.weight"], config["rms_norm_eps"]
+        input_ids, weights["model.norm.weight"], config.rms_norm_eps
     )  # (batch, "seq", "None")
 
     # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, none)
@@ -360,14 +351,12 @@ def load(
         },
     )
 
-    cfg_path = model_ckpt_dir / "config.json"
-    cfg = json.loads(cfg_path.read_text())
-    cfg = Config(
-        **cfg,
-        additional_config=additional_config,
-        parallel_dims=parallel_dims,
-        sharding_rules=sharding_rules,
-    )
+    cfg = AutoConfig.from_pretrained(model_ckpt_dir)
+    if not isinstance(cfg, PreTrainedConfig):
+        raise TypeError(f"Expected HF config, got {type(cfg)!r}")
+    cfg.additional_config = additional_config
+    cfg.parallel_dims = parallel_dims
+    cfg.sharding_rules = sharding_rules
 
     if multihost:
         jax.distributed.initialize()
@@ -379,7 +368,6 @@ def load(
         axis_shapes, axis_names, axis_types=axis_types, devices=devices
     )
     jax.set_mesh(mesh)
-
     def get_sharding(key):
         if "self_attn.q_proj" in key:
             return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)

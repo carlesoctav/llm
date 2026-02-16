@@ -78,7 +78,8 @@ def main() -> int:
 
     if args.seq_len is None:
         hf_token = tokenizer(args.prompt, return_tensors="pt")
-        jax_token = tokenizer(args.prompt, return_tensors="jax")
+        import jax.numpy as jnp
+        jax_token = {k: jnp.asarray(v) for k, v in tokenizer(args.prompt, return_tensors="np").items()}
         logits_to_keep = 0
     else:
         seq_len = int(args.seq_len)

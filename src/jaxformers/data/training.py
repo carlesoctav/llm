@@ -2,16 +2,22 @@ import logging
 import time
 import typing as tp
 from collections.abc import Sequence
-from datasets import IterableDataset, Dataset
 
 import grain
 import jax
 import jax.tree_util as jtu
-from grain import DatasetIterator, IterDataset, transforms as grain_transforms
+from datasets import Dataset, IterableDataset
+from grain import (
+    DatasetIterator,
+    IterDataset,
+    MapDataset,
+    transforms as grain_transforms,
+)
 from jax.sharding import Mesh, PartitionSpec
 
 from jaxformers.data.transforms import DatasetTransforms
-from .huggingface_dataset import (
+
+from .huggingface import (
     HuggingFaceSourceIterDataset,
     HuggingFaceSourceMapDataset,
 )
@@ -100,8 +106,8 @@ class IterDatasetWithInputSpec(IterDataset[_T]):
         )
 
 
-def make_dataloader_from_huggingface(
-    datasets: Sequence[IterableDataset | Dataset],
+def make_dataloader(
+    datasets: Sequence[IterDataset | MapDataset],
     transforms: Sequence[
         grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms
     ]
@@ -151,7 +157,6 @@ def make_dataloader_from_huggingface(
         if not transforms:
             raise ValueError("No operations provided for dataset preparation")
 
-        ds: grain._src.python.dataset.dataset._Dataset
         if isinstance(dataset, Dataset):
             ds = HuggingFaceSourceMapDataset(dataset)
         else:

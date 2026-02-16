@@ -57,8 +57,7 @@ class TokenizeText(grain_transforms.Map):
         encoded["attention_mask"] = encoded["attention_mask"].squeeze(0)
         return encoded
 
-def next_token_prediction_transforms(
-    dataset_type: str,
+def transforms(
     column: str,
     max_length: int,
     tokenizer: PreTrainedTokenizerBase,

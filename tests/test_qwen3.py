@@ -9,8 +9,12 @@ from jaxformers.models import qwen3
 
 def test_correctness_qwen3_0_6_b_cpu():
     hf_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", low_cpu_mem_usage=False, attn_implementation="sdpa"
+        "Qwen/Qwen3-0.6B",
+        low_cpu_mem_usage=False,
+        attn_implementation="sdpa",
+        torch_dtype=torch.float32,
     )
+    hf_model.eval()
 
     devices = jax.devices("cpu")
     jax_model = qwen3.load(
@@ -23,10 +27,10 @@ def test_correctness_qwen3_0_6_b_cpu():
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     test_str = "hallo saya makan nasi goreng"
     hf_token = tokenizer(test_str, return_tensors="pt")
-    jax_token = tokenizer(test_str, return_tensors="jax")
+    jax_token = {k: jnp.asarray(v) for k, v in tokenizer(test_str, return_tensors="np").items()}
 
     with torch.no_grad():
-        hf_logits = hf_model(**hf_token).logits.cpu().numpy().astype(np.float32)
+        hf_logits = hf_model(**hf_token).logits.to(torch.float32).cpu().numpy()
 
     jax_logits = jax_model.forward(**jax_token, weights=jax_model.weights)
 
@@ -53,7 +57,7 @@ def test_pass_qwen3_0_6b_tpu_tp():
     jax_logits = jax_model.forward(jax_token, weights=jax_model.weights)
 
     assert jax_logits.ndim == 3
-    assert jax_logits.shape == (1, 12, jax_model.config["vocab_size"])
+    assert jax_logits.shape == (1, 12, jax_model.config.vocab_size)
 
 
 if __name__ == "__main__":

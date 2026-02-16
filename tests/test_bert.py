@@ -29,12 +29,12 @@ def test_bert_base_cpu_parity():
 
     text = "jax bert parity check"
     hf_token = tokenizer(text, return_tensors="pt")
-    jax_token = tokenizer(text, return_tensors="jax")
+    jax_token = {k: jnp.asarray(v) for k, v in tokenizer(text, return_tensors="np").items()}
 
     with torch.no_grad():
         hf_output = hf_model(**hf_token)
-        hf_hidden = hf_output.last_hidden_state.cpu().numpy().astype(np.float32)
-        hf_pool = hf_output.pooler_output.cpu().numpy().astype(np.float32)
+        hf_hidden = hf_output.last_hidden_state.to(torch.float32).cpu().numpy()
+        hf_pool = hf_output.pooler_output.to(torch.float32).cpu().numpy()
 
     jax_hidden, jax_pool = jax_model.forward(
         **jax_token,
@@ -79,7 +79,7 @@ def test_pass_bert_200M_tpu():
         return_pooled=True,
     )
 
-    assert hidden.shape == (1, seq_len, jax_model.config["hidden_size"])
-    assert pooled.shape == (1, jax_model.config["hidden_size"])
+    assert hidden.shape == (1, seq_len, jax_model.config.hidden_size)
+    assert pooled.shape == (1, jax_model.config.hidden_size)
     assert bool(jnp.all(jnp.isfinite(hidden)))
     assert bool(jnp.all(jnp.isfinite(pooled)))

@@ -1,12 +1,12 @@
 from dataclasses import dataclass
-from typing import Any, Callable, TypedDict, TypeVar
 from functools import partial
+from typing import Any, Callable, TypedDict, TypeVar
 
 import jax.tree_util as jtu
+import optax
 from jax import P
 from jaxtyping import Array, PyTree
-from transformers import PreTrainedTokenizerFast
-import optax
+from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
 
 LayerWeights = TypeVar("LayerWeights")
@@ -42,12 +42,12 @@ DEFAULT_ADDITIONAL_CONFIG = {
 
 @partial(
     jtu.register_dataclass,
-    data_fields = ["weights", "opt_state", "step"],
-    meta_fields = ["tokenizer", "forward", "config", "tx"]
+    data_fields=["weights", "opt_state", "step"],
+    meta_fields=["tokenizer", "forward", "config", "tx"],
 )
 @dataclass
 class Model:
-    config: dict[str, Any]
+    config: PreTrainedConfig
     weights: PyTree[Array, "ModelWeights"]
     forward: Callable
     tokenizer: PreTrainedTokenizerFast

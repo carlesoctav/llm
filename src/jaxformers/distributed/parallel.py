@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import TypedDict
 
+
 BATCH = ("dp_replicate", "dp_shard")
 FSDP = ("dp_shard", "cp")
 MODEL = ("tp",)
@@ -16,6 +17,10 @@ class ParallelDims(TypedDict):
     cp: int
     tp: int
 
+
+DEFAULT_PARALLEL_DIMS = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1}
+
+
 @dataclass
 class SparseParallelDims(TypedDict):
     dp_replicate: int
@@ -26,6 +31,7 @@ class SparseParallelDims(TypedDict):
 
     ep: int
     etp: int
+
 
 def drop_axis(mesh_axes: AxisName, axis_name: str) -> AxisName:
     if mesh_axes is None:

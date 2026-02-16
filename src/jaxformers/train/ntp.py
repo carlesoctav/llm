@@ -17,6 +17,7 @@ import wandb
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.modeling_utils import Model
+optax.tree_utils.tree_l2_norm
 
 
 def get_config():
@@ -107,26 +108,29 @@ def load_dataset(data_name: str, config: sws.FinalConfig):
     return train_ds, eval_ds
 
 
-def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
+def train_step(config: sws.FinalConfig, model: Model, batch, step: int, rngs):
     def loss_fn(weights, batch, rngs):
         logits = model.forward(weights, **batch, rngs=rngs)  # [b,t, v]
         logits = logits[:, :-1, :]
         labels = jax.nn.one_hot(batch["input_ids"][:, 1:], logits.shape[-1])
         loss = optax.safe_softmax_cross_entropy(logits, labels)  # [b,t-1, v]
         aux = {"loss": loss}
+
         return loss, aux
 
+    emit = step == (config.grad_accum - 1)
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, aux), grad = grad_fn(model.weights, batch, rngs)
-    n_grad, n_opt_state = model.tx.update(grad, model.opt_state, model.weights)
-    n_weights = optax.apply_updates(model.weights, n_grad)
 
-    return dataclasses.replace(model, weights=n_weights, opt_state=n_opt_state)
+    (loss, aux), grad = grad_fn(model.weights, batch, rngs)
+    updates, nst = model.tx.update(grad, model.opt_state, model.weights)
+    nst = jtu.tree_map(lambda st, nst: jnp.where(emit, nst, st), model.opt_state, nst)
+
+    nweights = optax.apply_updates(model.weights, updates)
+    return dataclasses.replace(model, weights=nweights, opt_state=nst), aux
 
 
 def eval(model, eval_ds):
     raise NotImplementedError
-    pass
 
 
 def process_metrics(config: sws.FinalConfig, accum_aux: list[dict[str, Any]]):
@@ -141,8 +145,12 @@ def process_metrics(config: sws.FinalConfig, accum_aux: list[dict[str, Any]]):
     return reduced
 
 
+def mini_train_step(config: sws.FinalConfig):
+    pass
+
+
 def train(
-    model,
+    model: Model,
     train_ds,
     eval_ds,
     scheduler,
@@ -178,9 +186,12 @@ def train(
     if emit:
         processed_aux = process_metrics(accum_aux)
         if config.log.learning_rate:
-            processed_aux["learning_rate"] = scheduler(step - 1)
+            processed_aux["learning_rate"] = scheduler(step)
+        if config.log.grad_norm:
+            processed_aux["grad_norm"] = optax.tree_utils.tree_l2_norm(model.opt_state[0].grad_acc)
         if jax.process_index() == 0:
             logger.log(processed_aux, step=step)
+
         accum_aux = []
 
     ckpt_manager.save(
@@ -198,7 +209,8 @@ def train(
 
     while step < config.max_train_step:
         if not skip_eval and (step % config.eval_every_n_steps) == 0:
-            eval(model, eval_ds)
+            eval_aux = eval(model, eval_ds)
+            processed_aux = process_metrics(eval_aux)
 
         batch = next(train_iterator)
         with (

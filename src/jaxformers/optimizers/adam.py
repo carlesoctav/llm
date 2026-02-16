@@ -1,3 +1,4 @@
+from sympy import comp
 import optax
 from typing import Callable
 
@@ -12,6 +13,7 @@ def make(
     **kwargs,
 ):
     components = []
+    components.append(optax.apply_every(grad_accum))
     if max_grad_norm:
         components.append(optax.clip_by_global_norm(max_grad_norm))
 
@@ -24,8 +26,4 @@ def make(
         ),
     )
 
-    if grad_accum > 1:
-       tx = optax.chain(*components)
-       return optax.MultiSteps(tx, grad_accum, use_grad_accum_mean)
-    else:
-        return optax.chain(*components)
+    return optax.chain(*components)

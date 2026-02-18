@@ -54,6 +54,7 @@ def mutate_sharding_rule_parallel_dims(
 
     if parallel_dims["cp"] == 1:
         rules["context"] = drop_axis(rules.get("context"), "cp")
+        rules["sequence"] = drop_axis(rules.get("sequence"), "cp")
 
     return rules
 

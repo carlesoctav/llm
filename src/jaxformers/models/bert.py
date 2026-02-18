@@ -44,15 +44,6 @@ SHARDING_RULES = {
     "model": MODEL,
     "sequence": SEQ,
     "context": CONTEXT,
-    "qkv_embed": FSDP,
-    "q_heads": MODEL,
-    "o_heads": MODEL,
-    "mlp_up_embed": FSDP,
-    "mlp_up_ffw": MODEL,
-    "mlp_down_ffw": MODEL,
-    "mlp_down_embed": FSDP,
-    "vocab_in": MODEL,
-    "vocab_out": None,
 }
 
 
@@ -176,7 +167,7 @@ def forward_layer(
             x,
             w["q_proj_w"],
             preferred_element_type=dtype,
-            out_sharding=logical_to_physical(("batch", "context", "q_heads"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
         + w["q_proj_b"][None, None, :]
     )
@@ -186,7 +177,7 @@ def forward_layer(
             x,
             w["k_proj_w"],
             preferred_element_type=dtype,
-            out_sharding=logical_to_physical(("batch", "context", "q_heads"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
         + w["k_proj_b"][None, None, :]
     )
@@ -196,7 +187,7 @@ def forward_layer(
             x,
             w["v_proj_w"],
             preferred_element_type=dtype,
-            out_sharding=logical_to_physical(("batch", "context", "q_heads"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
         + w["v_proj_b"][None, None, :]
     )
@@ -237,7 +228,7 @@ def forward_layer(
             x,
             w["ffn_in_w"],
             preferred_element_type=dtype,
-            out_sharding=logical_to_physical(("batch", "context", "mlp_up_ffw"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
         + w["ffn_in_b"][None, None, :]
     )
@@ -408,21 +399,21 @@ def load(
     def get_sharding(key: str):
         try:
             if key.endswith("attention.self.query.weight"):
-                return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+                return logical_to_physical(("model", "fsdp"), sharding_rules)
             if key.endswith("attention.self.key.weight"):
-                return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+                return logical_to_physical(("model", "fsdp"), sharding_rules)
             if key.endswith("attention.self.value.weight"):
-                return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+                return logical_to_physical(("model", "fsdp"), sharding_rules)
             if key.endswith("attention.output.dense.weight"):
-                return logical_to_physical(("qkv_embed", "o_heads"), sharding_rules)
+                return logical_to_physical(("fsdp", "model"), sharding_rules)
             if key.endswith("intermediate.dense.weight"):
-                return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+                return logical_to_physical(("model", "fsdp"), sharding_rules)
             if key.endswith("output.dense.weight"):
                 return logical_to_physical(
-                    ("mlp_down_embed", "mlp_down_ffw"), sharding_rules
+                    ("fsdp", "model"), sharding_rules
                 )
             if key.endswith("embeddings.word_embeddings.weight"):
-                return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+                return logical_to_physical(("model", "none"), sharding_rules)
             return P()
         except Exception as e:
             print(f"Failed to weight shard key {key}, see {e}, defaulting to replicated")

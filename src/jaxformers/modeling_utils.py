@@ -31,12 +31,14 @@ class AdditionalConfig(TypedDict):
     # training and inference
     attn_implementation: str = "sdpa"
     sequence_parallelism: bool = True
+    loss_parallel: True
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
     "gradient_checkpointing": True,
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
+    "loss_parallel": True,
 }
 
 

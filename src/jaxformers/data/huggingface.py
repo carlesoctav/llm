@@ -81,7 +81,7 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         buffer_size: int | None = 1000,
     ) -> "HuggingFaceSourceIterDataset":
         return HuggingFaceSourceIterDataset(
-            self._source.shuffle(seed=seed, buffer_size=buffer_size)
+            self._source.shuffle(seed=seed)
         )
 
 
@@ -110,6 +110,13 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
 
         return HuggingFaceSourceMapDataset(
             self._source.select(range(start, stop, step))
+        )
+    def shuffle(
+        self,
+        seed: int | None = None,
+    ) -> "HuggingFaceSourceIterDataset":
+        return HuggingFaceSourceMapDataset(
+            self._source.shuffle(seed=seed)
         )
 
     def __getitem__(self, index):

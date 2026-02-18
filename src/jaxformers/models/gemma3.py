@@ -52,16 +52,6 @@ SHARDING_RULES = {
     "model": MODEL,
     "sequence": SEQ,
     "context": CONTEXT,
-    "qkv_embed": FSDP,
-    "q_heads": MODEL,
-    "kv_heads": MODEL,
-    "o_heads": MODEL,
-    "mlp_up_embed": FSDP,
-    "mlp_up_ffw": MODEL,
-    "mlp_down_ffw": MODEL,
-    "mlp_down_embed": FSDP,
-    "vocab_in": MODEL,
-    "vocab_out": None,
 }
 
 
@@ -247,14 +237,14 @@ def forward_layer(
             x_norm,
             w["gate_proj"],
             w.get("gate_proj_bias"),
-            out_sharding=logical_to_physical(("batch", "context", "mlp_up_ffw"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
     )
     up = linear_3d(
         x_norm,
         w["up_proj"],
         w.get("up_proj_bias"),
-        out_sharding=logical_to_physical(("batch", "context", "mlp_up_ffw"), rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
     ffw = jnp.einsum(
         "btf,df->btd",
@@ -369,11 +359,18 @@ def forward(
     if logits_to_keep:
         x = x[:, -int(logits_to_keep) :, :]
 
+    # If TP is enabled, keep the vocabulary dimension sharded so we don't
+    # materialize a full (vocab, hidden) gradient on every shard.
+    vocab_axis = (
+        "model"
+        if getattr(config, "parallel_dims", {}).get("tp", 1) > 1
+        else "none"
+    )
     logits = jnp.einsum(
         "btd,vd->btv",
         x,
         out_embed,
-        out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
+        out_sharding=logical_to_physical(("batch", "sequence", vocab_axis), rules),
         preferred_element_type=x.dtype,
     )
 
@@ -430,25 +427,23 @@ def load(
 
     def get_sharding(key):
         if "self_attn.q_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.k_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.v_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "mlp.gate_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "mlp.up_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.o_proj" in key:
-            return logical_to_physical(("qkv_embed", "o_heads"), sharding_rules)
+            return logical_to_physical(("fsdp", "model"), sharding_rules)
         if "mlp.down_proj" in key:
-            return logical_to_physical(
-                ("mlp_down_embed", "mlp_down_ffw"), sharding_rules
-            )
+            return logical_to_physical(("fsdp", "model"), sharding_rules)
         if "embed_tokens" in key:
-            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+            return logical_to_physical(("model", "none"), sharding_rules)
         if "lm_head" in key:
-            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+            return logical_to_physical(("model", "none"), sharding_rules)
         return P()
 
     weights = {}

@@ -1,6 +1,7 @@
 import logging
 import time
 import typing as tp
+import warnings
 from collections.abc import Sequence
 
 import grain
@@ -153,14 +154,9 @@ def make_dataloader(
         num_threads=read_num_threads, prefetch_buffer_size=read_prefetch_buffer_size
     )
 
-    for dataset in datasets:
+    for ds in datasets:
         if not transforms:
             raise ValueError("No operations provided for dataset preparation")
-
-        if isinstance(dataset, Dataset):
-            ds = HuggingFaceSourceMapDataset(dataset)
-        else:
-            ds = HuggingFaceSourceIterDataset(dataset)
 
         if dataloading_host_count > 1 and is_not_sharded:
             ds = ds.shard(
@@ -170,7 +166,11 @@ def make_dataloader(
             )
 
         if shuffle:
-            if isinstance(ds, grain.MapDataset):
+            if isinstance(ds, HuggingFaceSourceMapDataset):
+                warnings.warn(
+                    "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
+                    "If shuffling is important for your workflow, please pre-shuffle the dataset."
+                )
                 ds = ds.shuffle(seed=seed + dataloading_host_index)
             elif isinstance(ds, HuggingFaceSourceIterDataset):
                 ds = ds.shuffle(

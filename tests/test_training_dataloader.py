@@ -1,9 +1,9 @@
 import dataclasses as dc
 
+import jax
 import numpy as np
 from datasets import Dataset, IterableDataset
 from grain import transforms as grain_transforms
-import jax
 from jax.sharding import Mesh, PartitionSpec
 
 from jaxformers.data.training import make_dataloader
@@ -135,10 +135,10 @@ def test_training_single_host_tpu():
 #     ids0 = _flatten_batches(dl0, "id")
 #     ids1 = _flatten_batches(dl1, "id")
 
-    # assert ids0 == [0, 1, 2, 3]
-    # assert ids1 == [4, 5, 6, 7]
-    # assert set(ids0).isdisjoint(ids1)
-    # assert sorted(ids0 + ids1) == list(range(8))
+# assert ids0 == [0, 1, 2, 3]
+# assert ids1 == [4, 5, 6, 7]
+# assert set(ids0).isdisjoint(ids1)
+# assert sorted(ids0 + ids1) == list(range(8))
 
 
 def test_training_mix_two_datasets_cpu_only():

@@ -1,10 +1,12 @@
 import typing as tp
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-from functools import partial
 from jaxtyping import Array, Bool, Float, Int
+
 from jaxformers.utils import GeneralInterface
+
 
 BlockMask = Array
 MaskImpl = tp.Callable
@@ -32,18 +34,18 @@ def or_masks(*mask_fns):
 
 
 def vmap_bhqkv(mask_fn, with_head=False):
-
-    fn = jax.vmap(mask_fn, in_axes = (None, None, None, 0)) #kv arange
-    fn = jax.vmap(fn, in_axes = (None, None, 0, None)) # q arange
+    fn = jax.vmap(mask_fn, in_axes=(None, None, None, 0))  # kv arange
+    fn = jax.vmap(fn, in_axes=(None, None, 0, None))  # q arange
     if with_head:
-        fn = jax.vmap(fn, in_axes = (None, 0, None, None)) # h arange
-    fn = jax.vmap(fn, in_axes = (0, None, None, None))
+        fn = jax.vmap(fn, in_axes=(None, 0, None, None))  # h arange
+    fn = jax.vmap(fn, in_axes=(0, None, None, None))
 
     return fn
 
 
 def causal_mask_function(b, h, q, kv):
     return q >= kv
+
 
 def sliding_window_mask_overlay(window_size: int):
     def mask(b, h, q, kv):
@@ -81,6 +83,7 @@ def ignore_padding_overlay(segment_ids: Int[Array, "..."], pad_id: int = 0):
 def dummy_mask_function(b, h, q, kv):
     return True
 
+
 def make_bool_interface(
     q_length: int,
     kv_length: int,
@@ -93,23 +96,24 @@ def make_bool_interface(
     batch_arange = jnp.arange(batch_size, dtype=jnp.int32)
     q_arange = jnp.arange(q_length, dtype=jnp.int32)
     kv_arange = jnp.arange(kv_length, dtype=jnp.int32)
-    head_arange = jnp.arange(nheads, dtype = jnp.int32) if nheads else None
+    head_arange = jnp.arange(nheads, dtype=jnp.int32) if nheads else None
 
     mask_output = vmap_bhqkv(
         mask_function,
-        with_head = head_arange is not None,
-    )(
-        batch_arange, head_arange, q_arange, kv_arange
-    )
+        with_head=head_arange is not None,
+    )(batch_arange, head_arange, q_arange, kv_arange)
 
     mask_ndim = mask_output.ndim
     if padding_mask is not None:
-        if mask_ndim == 3: # (B, T, S), (B, T)
-            return (mask_output & padding_mask[:, :, None]).astype(jnp.bool)
-        elif mask_ndim == 4: #(B, N, T, S), (B, T) -> (B, N, T, S)
+        if mask_ndim == 3:  # (B, T, S), (B, T) -> (B, 1, T, S)
+            return (mask_output & padding_mask[:, :, None]).astype(jnp.bool)[
+                :, None, :, :
+            ]
+        elif mask_ndim == 4:  # (B, N, T, S), (B, T) -> (B, N, T, S)
             return (mask_output & padding_mask[:, None, :, None]).astype(jnp.bool)
     else:
-        return mask_output.astype(jnp.bool)
+        return mask_output.astype(jnp.bool)[:, None, :, :]
+
 
 class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
     _global_mapping = {
@@ -142,11 +146,11 @@ def make_causal_mask(
         Segment IDs of the input embeddings. If provided, used for document-level masking (sequence packing).
 
     Returns:
-    Bool[Array, "B T T"] or _BlockMask
+    Bool[Array, "B #N T T"] or _BlockMask
         The computed causal attention mask,
     """
 
-    #Need to think more about maskign for inference but whatever
+    # Need to think more about maskign for inference but whatever
     B, T, H = input_embeds.shape
 
     mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
@@ -170,6 +174,7 @@ def make_causal_mask(
     )
 
     return causal_mask
+
 
 def make_bidirectional_mask(
     mask_impl: str,

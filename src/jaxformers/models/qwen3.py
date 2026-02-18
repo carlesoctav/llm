@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from functools import partial
@@ -13,7 +14,7 @@ import numpy as np
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
-from jaxtyping import Array, Float, Int, PyTree
+from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
 from safetensors import safe_open
 from transformers import (
     AddedToken,
@@ -57,16 +58,6 @@ SHARDING_RULES = {
     "model": MODEL,
     "sequence": SEQ,
     "context": CONTEXT,
-    "qkv_embed": FSDP,
-    "q_heads": MODEL,
-    "kv_heads": MODEL,
-    "o_heads": MODEL,
-    "mlp_up_embed": FSDP,
-    "mlp_up_ffw": MODEL,
-    "mlp_down_ffw": MODEL,
-    "mlp_down_embed": FSDP,
-    "vocab_in": MODEL,
-    "vocab_out": None,
 }
 
 
@@ -110,7 +101,7 @@ def rms_norm(x: jax.Array, gamma, eps):
 
 
 def forward_layer(
-    cfg: Config,
+    config: Config,
     layer_idx: int,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
@@ -119,9 +110,9 @@ def forward_layer(
     **inputs,
 ):
     B, T, D = x.shape
-    rules = cfg.sharding_rules
+    rules = config.sharding_rules
 
-    x_norm = rms_norm(x, w["input_layernorm"], cfg.rms_norm_eps)
+    x_norm = rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     q = jnp.einsum(
@@ -129,55 +120,56 @@ def forward_layer(
         x_norm,
         w["q_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=logical_to_physical(("batch", "context", "q_heads"), rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
     k = jnp.einsum(
         "btd,md->btm",
         x_norm,
         w["k_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=logical_to_physical(("batch", "context", "kv_heads"), rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
     v = jnp.einsum(
         "btd,md->btm",
         x_norm,
         w["v_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=logical_to_physical(("batch", "context", "kv_heads"), rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
     q = rearrange(
         q,
         "b t (n h) -> b t n h",
-        n=cfg.num_attention_heads,
-        h=cfg.head_dim,
+        n=config.num_attention_heads,
+        h=config.head_dim,
     )
 
     k = rearrange(
         k,
         "b t (k h) -> b t k h",
-        k=cfg.num_key_value_heads,
-        h=cfg.head_dim,
+        k=config.num_key_value_heads,
+        h=config.head_dim,
     )
     v = rearrange(
         v,
         "b t (k h) -> b t k h",
-        k=cfg.num_key_value_heads,
-        h=cfg.head_dim,
+        k=config.num_key_value_heads,
+        h=config.head_dim,
     )
 
-    q = rms_norm(q, w["q_norm"], cfg.rms_norm_eps)
-    k = rms_norm(k, w["k_norm"], cfg.rms_norm_eps)
+    q = rms_norm(q, w["q_norm"], config.rms_norm_eps)
+    k = rms_norm(k, w["k_norm"], config.rms_norm_eps)
 
-    rope_theta = get_rope_theta(cfg)
+    rope_theta = get_rope_theta(config)
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
 
-    attn_impl = cfg.additional_config["attn_implementation"]
+    attn_impl = config.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
 
+    q_sharding = jax.NamedSharding(jax.sharding.get_abstract_mesh(), logical_to_physical(("batch", "context", "model", "none"), config.sharding_rules))
     attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"]
+        q, k, v, mask=inputs["attention_mask"], q_sharding = q_sharding
     )  # (B, T, N, H)
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
@@ -190,7 +182,7 @@ def forward_layer(
     )
 
     x += o
-    x_norm = rms_norm(x, w["post_attention_layernorm"], cfg.rms_norm_eps)
+    x_norm = rms_norm(x, w["post_attention_layernorm"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     # FFN
@@ -201,7 +193,7 @@ def forward_layer(
             x_norm,
             w["gate_proj"],
             preferred_element_type=jnp.float32,
-            out_sharding=logical_to_physical(("batch", "context", "mlp_up_ffw"), rules),
+            out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
     )
 
@@ -210,7 +202,7 @@ def forward_layer(
         x_norm,
         w["up_proj"],
         preferred_element_type=x.dtype,
-        out_sharding=logical_to_physical(("batch", "context", "mlp_up_ffw"), rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
     x += jnp.einsum(
@@ -245,6 +237,7 @@ def forward(
     kv: None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
+    rngs: PRNGKeyArray | None = None,
     **inputs,
 ):
     B, T = input_ids.shape
@@ -299,14 +292,21 @@ def forward(
         input_ids, weights["model.norm.weight"], config.rms_norm_eps
     )  # (batch, "seq", "None")
 
-    # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, none)
-    # to achieve this
+    # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, vocab)
+    # If TP is enabled, keep the vocabulary dimension sharded so we don't
+    # materialize a full (vocab, hidden) gradient on every shard.
+    loss_sharding = (
+        ("batch", "context", "model")
+        if config.additional_config.get("loss_parallel")
+        else ("batch", "context", "none")
+    )
+
     logits = jnp.einsum(
         "btd,vd-> btv",
         input_ids,
         out_embed,
-        out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
-        preferred_element_type=input_ids.dtype,
+        out_sharding=logical_to_physical(loss_sharding, rules),
+        preferred_element_type=jnp.float32,
     )
 
     return (logits, kv) if return_kv else logits
@@ -368,36 +368,38 @@ def load(
         axis_shapes, axis_names, axis_types=axis_types, devices=devices
     )
     jax.set_mesh(mesh)
+
     def get_sharding(key):
         if "self_attn.q_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.k_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.v_proj" in key:
-            return logical_to_physical(("q_heads", "qkv_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "mlp.gate_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "mlp.up_proj" in key:
-            return logical_to_physical(("mlp_up_ffw", "mlp_up_embed"), sharding_rules)
+            return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "self_attn.o_proj" in key:
-            return logical_to_physical(("qkv_embed", "o_heads"), sharding_rules)
+            return logical_to_physical(("fsdp", "model"), sharding_rules)
         if "mlp.down_proj" in key:
-            return logical_to_physical(
-                ("mlp_down_embed", "mlp_down_ffw"), sharding_rules
-            )
+            return logical_to_physical(("fsdp", "model"), sharding_rules)
         if "embed_tokens" in key:
-            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+            return logical_to_physical(("model", "none"), sharding_rules)
         if "lm_head" in key:
-            return logical_to_physical(("vocab_in", "vocab_out"), sharding_rules)
+            return logical_to_physical(("model", "none"), sharding_rules)
         return P()
 
     weights = {}
+    t0 = time.monotonic()
     for file in model_ckpt_dir.glob("*.safetensors"):
         with safe_open(file, framework="numpy") as f:
             for key in f.keys():
                 weights[key] = jax.device_put(
                     f.get_tensor(key).astype(param_dtype), get_sharding(key)
                 )
+    diff = time.monotonic() - t0
+    print(f"model loaded at {diff}s ")
 
     return Model(
         config=cfg,

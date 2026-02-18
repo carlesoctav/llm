@@ -3,6 +3,7 @@ import numpy as np
 import optax
 optax.MultiSteps
 optax.apply_every
+optax.global_norm
 
 
 list_of = [{"a": 1, "b": 100}, {"a": 10, "b": 1000}, {"a": 100, "b": 10000, "c": 10}]

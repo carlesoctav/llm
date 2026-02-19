@@ -49,12 +49,12 @@ def get_config():
     config.forward_dtype = lambda: jnp.bfloat16
 
     config.model_name = "qwen3"
-    # config.model.model_id = "Qwen/Qwen3-4B-Instruct-2507"
-    # config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
-    config.model.model_id = "Qwen/Qwen3-0.6B"
-    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
+    config.model.model_id = "Qwen/Qwen3-4B-Instruct-2507"
+    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    # config.model.model_id = "Qwen/Qwen3-0.6B"
+    # config.model.parallel_dims = {"dp_replicate": 4, "dp_shard": 1, "cp": 1, "tp": 1}
     # config.model.additional_config = {"attn_implementation": "eager", "loss_parallel": False, "gradient_checkpointing": True}
-    config.model.additional_config.gradient_checkpointing = False
+    config.model.additional_config.gradient_checkpointing = True
     config.model.additional_config.attn_implementation = "eager"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.loss_parallel = False
@@ -63,8 +63,8 @@ def get_config():
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.random_init_lora = True
-    config.lora.rank = 64
-    config.lora.alpha = 64
+    config.lora.rank = 1
+    config.lora.alpha = 1
     config.lora.weights_path = [
         "*.q_proj.weight",
         "*.k_proj.weight",
@@ -99,7 +99,7 @@ def get_config():
     ]
     config.data.transforms.column = "id_title"
     config.data.transforms.max_length = 512
-    config.data.transforms.packing = False
+    config.data.transforms.packing = True
     config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
         config.model.model_id
     )
@@ -132,6 +132,7 @@ def get_config():
     config.checkpoint_options.save_interval_steps = 1000
     config.checkpoint_options.max_to_keep = 1
 
+    #plesae don't change this
     config.reduced = {"loss": "mean", "token_count": "sum"}
 
     config.wandb.project = "test-training"
@@ -202,7 +203,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     (loss, aux), grad = grad_fn(model.weights, batch, rngs)
 
-    token_count = jnp.sum(batch["inputs"]["attention_mask"])
+    token_count = aux["token_count"]
     updates, nst = model.tx.update(
         grad, model.opt_state, model.weights, token_count=token_count
     )
@@ -252,65 +253,67 @@ def train(
     ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
 
-    while step < config.max_train_step:
-        if not skip_eval and (step % config.eval_every_n_steps) == 0:
-            eval_aux = eval(model, eval_ds)
-            processed_aux = process_metrics(config, eval_aux)
+    try:
+        while step < config.max_train_step:
+            if not skip_eval and (step % config.eval_every_n_steps) == 0:
+                eval_aux = eval(model, eval_ds)
+                processed_aux = process_metrics(config, eval_aux)
 
-        try:
-            batch = next(train_iterator)
-        except StopIteration:
-            print("dataloader is exhausted")
-            break
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                print("dataloader is exhausted")
+                break
 
-        loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
-        if step == 0:
-            with jax.named_scope("compile train step"):
-                start_time = time.monotonic()
-                train_step_fn = (
-                    jax.jit(partial(train_step, config))
-                    .lower(model, batch, loop_rngs)
-                    .compile()
+            loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
+            if step == 0:
+                with jax.named_scope("compile train step"):
+                    start_time = time.monotonic()
+                    train_step_fn = (
+                        jax.jit(partial(train_step, config))
+                        .lower(model, batch, loop_rngs)
+                        .compile()
+                    )
+                    first_compile_time = time.monotonic() - start_time
+                    model, aux = train_step_fn(model, batch, loop_rngs)
+                    print("compile time: ", first_compile_time)
+                    compiled_analysis = train_step_fn.memory_analysis()
+                    print_compiled_memory_stats(compiled_analysis)
+            else:
+                with (
+                    jax.named_scope("train_step"),
+                    jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
+                ):
+                    model, aux = train_step_fn(model, batch, loop_rngs)
+
+            emit = mini_step == (config.optimizer.grad_accum - 1)
+            accum_aux.append(aux)
+            if emit:
+                processed_aux = process_metrics(config, accum_aux)
+                if config.log.learning_rate:
+                    processed_aux["learning_rate"] = (
+                        scheduler(step) if isinstance(scheduler, Callable) else scheduler
+                    )
+                if config.log.grad_norm:
+                    logged = get_logged_grad_norm(model.opt_state)
+                    processed_aux["grad_norm"] = logged
+                if jax.process_index() == 0:
+                    logger.log(processed_aux, step=step)
+                accum_aux = []
+
+                ckpt_manager.save(
+                    step,
+                    args=ocp.args.Composite(
+                        weights=ocp.args.StandardSave(model.weights),
+                        opt_state=ocp.args.StandardSave(model.opt_state),
+                        step=ocp.args.JsonSave(int(step)),
+                    ),
                 )
-                first_compile_time = time.monotonic() - start_time
-                model, aux = train_step_fn(model, batch, loop_rngs)
-                print("compile time: ", first_compile_time)
-                compiled_analysis = train_step_fn.memory_analysis()
-                print_compiled_memory_stats(compiled_analysis)
-        else:
-            with (
-                jax.named_scope("train_step"),
-                jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-            ):
-                model, aux = train_step_fn(model, batch, loop_rngs)
 
-        emit = mini_step == (config.optimizer.grad_accum - 1)
-        accum_aux.append(aux)
-
-        if emit:
-            processed_aux = process_metrics(config, accum_aux)
-            if config.log.learning_rate:
-                processed_aux["learning_rate"] = (
-                    scheduler(step) if isinstance(scheduler, Callable) else scheduler
-                )
-            if config.log.grad_norm:
-                logged = get_logged_grad_norm(model.opt_state)
-                processed_aux["grad_norm"] = logged
-            if jax.process_index() == 0:
-                logger.log(processed_aux, step=step)
-            accum_aux = []
-
-            ckpt_manager.save(
-                step,
-                args=ocp.args.Composite(
-                    weights=ocp.args.StandardSave(model.weights),
-                    opt_state=ocp.args.StandardSave(model.opt_state),
-                    step=ocp.args.JsonSave(int(step)),
-                ),
-            )
-
-        mini_step = (mini_step + 1) % config.optimizer.grad_accum
-        step = emit * (step + 1) + (1 - emit) * step
+            mini_step = (mini_step + 1) % config.optimizer.grad_accum
+            step = emit * (step + 1) + (1 - emit) * step
+    finally:
+        ckpt_manager.close()
     return model
 
 
@@ -327,7 +330,10 @@ def main(config: sws.FinalConfig):
                 model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
             else:
                 raise NotImplementedError
+        t0 = time.monotonic()
         model = load_optimizer(config, model, config.optimizer_name, scheduler)
+        diff = time.monotonic() - t0
+        print(f"Created optimizer and its state in {diff:.2f} seconds.")
     else:
         raise NotImplementedError
 

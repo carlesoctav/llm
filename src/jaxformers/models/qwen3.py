@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
+import quax
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
@@ -44,6 +45,8 @@ from ..distributed import (
     mutate_sharding_rule_parallel_dims,
     SEQ,
 )
+
+_einsum = quax.quaxify(jnp.einsum)
 
 
 LayerWeights = TypeVar("LayerWeights")
@@ -117,21 +120,21 @@ def forward_layer(
     x_norm = rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
-    q = jnp.einsum(
+    q = _einsum(
         "btd,md->btm",
         x_norm,
         w["q_proj"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
-    k = jnp.einsum(
+    k = _einsum(
         "btd,md->btm",
         x_norm,
         w["k_proj"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
-    v = jnp.einsum(
+    v = _einsum(
         "btd,md->btm",
         x_norm,
         w["v_proj"],
@@ -175,7 +178,7 @@ def forward_layer(
     )  # (B, T, N, H)
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
-    o = jnp.einsum(
+    o = _einsum(
         "btd,ed->bte",
         attn_output,
         w["o_proj"],
@@ -190,7 +193,7 @@ def forward_layer(
     # FFN
     act_fn = jax.nn.silu
     gate = act_fn(
-        jnp.einsum(
+        _einsum(
             "btd,fd->btf",
             x_norm,
             w["gate_proj"],
@@ -199,7 +202,7 @@ def forward_layer(
         )
     )
 
-    up = jnp.einsum(
+    up = _einsum(
         "btd,fd->btf",
         x_norm,
         w["up_proj"],
@@ -207,7 +210,7 @@ def forward_layer(
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
-    x += jnp.einsum(
+    x += _einsum(
         "btf,df->btd",
         gate * up,
         w["down_proj"],

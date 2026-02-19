@@ -3,6 +3,7 @@ copied from quax.examples.lora
 """
 
 import fnmatch
+import time
 from dataclasses import replace
 from typing import cast
 
@@ -40,7 +41,7 @@ class LoraArray(quax.ArrayValue):
     _w: Shaped[Array, "*batch x y"]
     a: Shaped[Array, "*batch x z"]
     b: Shaped[Array, "*batch z y"]
-    alpha: float = eqx.field(static = True)
+    alpha: float = eqx.field(static=True)
     stop_gradient: bool = eqx.field(static=True)
     allow_materialise: bool = eqx.field(static=True)
 
@@ -116,7 +117,9 @@ class LoraArray(quax.ArrayValue):
 # `make_jaxpr`). Register a rule that re-traces the body with Quax enabled, while
 # preserving the `remat` primitive so gradient checkpointing still works.
 try:  # pragma: no cover
-    from jax._src.ad_checkpoint import remat_p as _remat_p  # pyright: ignore[reportPrivateImportUsage]
+    from jax._src.ad_checkpoint import (
+        remat_p as _remat_p,  # pyright: ignore[reportPrivateImportUsage]
+    )
 except Exception:  # pragma: no cover
     _remat_p = None
 
@@ -141,7 +144,9 @@ if _remat_p is not None:  # pragma: no cover
 
         # `remat_p` expects a jaxpr with no constvars; move any consts into explicit
         # leading invars and pass the corresponding values as leading arguments.
-        from jax._src.interpreters import partial_eval as pe  # pyright: ignore[reportPrivateImportUsage]
+        from jax._src.interpreters import (
+            partial_eval as pe,  # pyright: ignore[reportPrivateImportUsage]
+        )
 
         closed_no_constvars, consts = pe.separate_consts(closed)
 
@@ -179,6 +184,7 @@ def loraify(
 ) -> PyTree:
     counter = 0
     loraify_weight = []
+    t0 = time.monotonic()
     def _loraify(path, weight):
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
@@ -188,7 +194,7 @@ def loraify(
             lora_weight = LoraArray(
                 weight,
                 rank=rank,
-                alpha = alpha,
+                alpha=alpha,
                 scale=scale,
                 stop_gradient=stop_gradient,
                 allow_materialise=allow_materialise,
@@ -200,33 +206,57 @@ def loraify(
             return weight
 
     weights = jtu.tree_map_with_path(_loraify, model.weights)
+    diff = time.monotonic() - t0
     print("Model weights converted to LoRA:", *loraify_weight)
+    print(f"loraify takes {diff}s")
     return replace(
         model,
         weights=weights,
         is_lora=True,
-        forward=quax.quaxify(model.forward),
+        # Don't wrap the whole forward pass in `quaxify`, as some implementations
+        # (e.g. shard_map-based attention) are not compatible with Quax's custom trace.
+        # Instead, quaxify only the specific ops that touch `LoraArray` weights.
+        forward=model.forward,
     )
 
 
 @quax.quaxify
-def _lora_array_matmul_impl(w, a, b, rhs, lhs_batch, ndim, scaling, dimension_numbers, kwargs):
+def _lora_array_matmul_impl(
+    w,
+    a,
+    b,
+    rhs,
+    lhs_batch,
+    ndim,
+    scaling,
+    dimension_numbers,
+    kwargs,
+    *,
+    out_sharding,
+    out2_sharding,
+):
     n_sharedbatch = len(lhs_batch)  # = len(rhs_batch)
     # All of the lora batch dimensions that aren't a dot_general batch dimension.
     n_lorabatch = ndim - n_sharedbatch - 2
     assert n_lorabatch >= 0
-    out1 = lax.dot_general(w, rhs, dimension_numbers, **kwargs)
+    out1 = lax.dot_general(
+        w, rhs, dimension_numbers, out_sharding=out_sharding, **kwargs
+    )
     # out1 has shape (*sharedbatch, *lorabatch, x, *otherbatch)
     # `kwargs` must not include `out_sharding` here; `out2` has a different shape
     # from the outer dot_general output.
-    out2 = lax.dot_general(b, rhs, dimension_numbers, **kwargs)
+    out2 = lax.dot_general(
+        b, rhs, dimension_numbers, out_sharding=out2_sharding, **kwargs
+    )
     # out2 has shape(*sharedbatch, *lorabatch, z, *otherbatch)
     lhs_contract2 = (w.ndim - 1,)
     rhs_contract2 = (n_sharedbatch + n_lorabatch,)
     rhs_batch2 = tuple(range(n_sharedbatch + n_lorabatch))
     lhs_batch2 = lhs_batch + tuple(i for i in rhs_batch2 if i not in lhs_batch)
     dimension_numbers2 = ((lhs_contract2, rhs_contract2), (lhs_batch2, rhs_batch2))
-    out3 = lax.dot_general(a, out2, dimension_numbers2, **kwargs)
+    out3 = lax.dot_general(
+        a, out2, dimension_numbers2, out_sharding=out_sharding, **kwargs
+    )
     # out3 has shape (*sharedbatch, *lorabatch, x, *otherbatch)
     return out1 + scaling * out3
 
@@ -250,6 +280,23 @@ def _lora_array_matmul(
     inner_kwargs.pop("out_sharding", None)
 
     scaling = jnp.asarray(lhs.alpha / lhs.a.shape[-1], dtype=lhs.w.dtype)
+    # `out2` replaces the lhs uncontracted dimension with `rank`; shard it with
+    # replication by default.
+    if out_sharding is None:
+        out2_sharding = None
+    elif isinstance(out_sharding, jax.sharding.NamedSharding):
+        spec = tuple(out_sharding.spec)
+        spec = spec[: ndim - 2] + (None,) + spec[ndim - 1 :]
+        out2_sharding = jax.sharding.NamedSharding(
+            out_sharding.mesh, jax.sharding.PartitionSpec(*spec)
+        )
+    elif isinstance(out_sharding, jax.sharding.PartitionSpec):
+        spec = tuple(out_sharding)
+        spec = spec[: ndim - 2] + (None,) + spec[ndim - 1 :]
+        out2_sharding = jax.sharding.PartitionSpec(*spec)
+    else:
+        out2_sharding = None
+
     if lhs_contract == (ndim - 1,) and (ndim - 2 not in lhs_batch):
         out = _lora_array_matmul_impl(
             lhs.w,
@@ -261,6 +308,8 @@ def _lora_array_matmul(
             scaling,
             dimension_numbers,
             inner_kwargs,
+            out_sharding=out_sharding,
+            out2_sharding=out2_sharding,
         )
     elif lhs_contract == (ndim - 2,) and (ndim - 1 not in lhs_batch):
         T = lambda x: jnp.swapaxes(x, -1, -2)
@@ -276,14 +325,18 @@ def _lora_array_matmul(
             scaling,
             dimension_numbers,
             inner_kwargs,
+            out_sharding=out_sharding,
+            out2_sharding=out2_sharding,
         )
     else:
         return quax.quaxify(lax.dot_general)(
-            lhs.materialise(), rhs, dimension_numbers, **kwargs
+            lhs.materialise(),
+            rhs,
+            dimension_numbers,
+            out_sharding=out_sharding,
+            **inner_kwargs,
         )
 
-    if out_sharding is not None:
-        out = lax.with_sharding_constraint(out, out_sharding)
     return out
 
 
@@ -302,8 +355,41 @@ def _(
     inner_kwargs = dict(kwargs)
     inner_kwargs.pop("out_sharding", None)
 
+    if out_sharding is None:
+        out_sharding_flipped = None
+    elif isinstance(out_sharding, jax.sharding.NamedSharding):
+        spec = tuple(out_sharding.spec)
+        n_sharedbatch = len(lhs_batch)
+        n_rhs_uncontracted = rhs.aval().ndim - len(rhs_contract) - len(rhs_batch)
+        n_lhs_uncontracted = len(spec) - n_sharedbatch - n_rhs_uncontracted
+        spec = (
+            spec[:n_sharedbatch]
+            + spec[n_sharedbatch + n_lhs_uncontracted :]
+            + spec[n_sharedbatch : n_sharedbatch + n_lhs_uncontracted]
+        )
+        out_sharding_flipped = jax.sharding.NamedSharding(
+            out_sharding.mesh, jax.sharding.PartitionSpec(*spec)
+        )
+    elif isinstance(out_sharding, jax.sharding.PartitionSpec):
+        spec = tuple(out_sharding)
+        n_sharedbatch = len(lhs_batch)
+        n_rhs_uncontracted = rhs.aval().ndim - len(rhs_contract) - len(rhs_batch)
+        n_lhs_uncontracted = len(spec) - n_sharedbatch - n_rhs_uncontracted
+        spec = (
+            spec[:n_sharedbatch]
+            + spec[n_sharedbatch + n_lhs_uncontracted :]
+            + spec[n_sharedbatch : n_sharedbatch + n_lhs_uncontracted]
+        )
+        out_sharding_flipped = jax.sharding.PartitionSpec(*spec)
+    else:
+        out_sharding_flipped = None
+
     out = _lora_array_matmul(
-        rhs, lhs, dimension_numbers=dimension_numbers_flipped, **inner_kwargs
+        rhs,
+        lhs,
+        dimension_numbers=dimension_numbers_flipped,
+        out_sharding=out_sharding_flipped,
+        **inner_kwargs,
     )
     # out has shape (*sharedbatch, *rhs_uncontracted, *lhs_uncontracted)
     n_sharedbatch = len(lhs_batch)
@@ -312,5 +398,5 @@ def _(
     dest = tuple(range(-n_rhs_uncontracted, 0))
     out = quax.quaxify(jnp.moveaxis)(out, src, dest)  # pyright: ignore[reportArgumentType,reportAssignmentType]
     if out_sharding is not None:
-        out = lax.with_sharding_constraint(out, out_sharding)
+        out = jax.sharding.reshard(out, out_sharding)
     return out

@@ -230,6 +230,15 @@ wheels = [
 ]
 
 [[package]]
+name = "beartype"
+version = "0.22.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c7/94/1009e248bbfbab11397abca7193bea6626806be9a327d399810d523a07cb/beartype-0.22.9.tar.gz", hash = "sha256:8f82b54aa723a2848a56008d18875f91c1db02c32ef6a62319a002e3e25a975f", size = 1608866, upload-time = "2025-12-13T06:50:30.72Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/cc/18245721fa7747065ab478316c7fea7c74777d07f37ae60db2e84f8172e8/beartype-0.22.9-py3-none-any.whl", hash = "sha256:d16c9bbc61ea14637596c5f6fbff2ee99cbe3573e46a716401734ef50c3060c2", size = 1333658, upload-time = "2025-12-13T06:50:28.266Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.1.4"
 source = { registry = "https://pypi.org/simple" }
@@ -563,6 +572,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/cb/c6/95ad0a036656aec1cb32177a5d5abfcfbf53a01c1416484cacb8c7332a84/einshape-1.0.tar.gz", hash = "sha256:53538d75dd099f4ead4a4f786fafdcb0b729bb587e0b3afeca25ceef18c9ac14", size = 14571, upload-time = "2022-12-19T17:09:34.618Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/bb/34cc02f13b438d550e4709216ee1df9da8e55e15b0cc87a2cb5dee19a729/einshape-1.0-py3-none-any.whl", hash = "sha256:42da4c2dea3a27f87ee45a7cee5072a636b97cb184bb07bf5d6412ba0ff7b965", size = 21392, upload-time = "2022-12-19T17:09:32.904Z" },
+]
+
+[[package]]
+name = "equinox"
+version = "0.13.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jax" },
+    { name = "jaxtyping" },
+    { name = "typing-extensions" },
+    { name = "wadler-lindig" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2d/80/1704c3375a9c3cae4713a1be12b59dbd8ddff03808862264be622b333cd1/equinox-0.13.4.tar.gz", hash = "sha256:d4eed5d7f981a5ddcb7bc70e601707769fb4da20f777703cc6e01a6248af9758", size = 140981, upload-time = "2026-01-26T22:29:19.417Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/4c/eea4860010ba31d6793038073c66f2e1755c80d0adb704c4926d549e724a/equinox-0.13.4-py3-none-any.whl", hash = "sha256:8203b6b84c1641a58aad07c040c171fc5a38e2c3bc90c5feb2f221d398354378", size = 181231, upload-time = "2026-01-26T22:29:17.859Z" },
 ]
 
 [[package]]
@@ -1342,6 +1366,7 @@ dependencies = [
     { name = "jaxtyping" },
     { name = "orbax" },
     { name = "orbax-checkpoint" },
+    { name = "quax" },
     { name = "sws-config" },
     { name = "tokamax" },
     { name = "tpu-info" },
@@ -1367,6 +1392,7 @@ requires-dist = [
     { name = "jaxtyping", specifier = ">=0.3.5" },
     { name = "orbax", specifier = ">=0.1.9" },
     { name = "orbax-checkpoint", specifier = ">=0.11.32" },
+    { name = "quax", specifier = ">=0.2.1" },
     { name = "sws-config", specifier = ">=0.6.3" },
     { name = "tokamax", specifier = ">=0.0.10" },
     { name = "tpu-info", specifier = ">=0.8.1" },
@@ -1884,6 +1910,20 @@ wheels = [
 ]
 
 [[package]]
+name = "plum-dispatch"
+version = "2.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "beartype" },
+    { name = "rich" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a8/df/36f6677eff00a853c6a7d365316920ea411aa8015cf218612871082e25e7/plum_dispatch-2.6.1.tar.gz", hash = "sha256:05d14f31bf2ac8550d7742426d5c5a3fa532d8ed7cc12ffd695c4b452cffbdfa", size = 34952, upload-time = "2025-12-18T11:56:54.862Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/88/71fa06eb487ed9d4fab0ad173300b7a58706385f98fb66b1ccdc3ec3d4dd/plum_dispatch-2.6.1-py3-none-any.whl", hash = "sha256:49cd83027498e35eac32c7a93ecd6a99970d72d90f4141cc93be760c7ba831c4", size = 41456, upload-time = "2025-12-18T11:56:53.599Z" },
+]
+
+[[package]]
 name = "propcache"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2319,6 +2359,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/92/1446574745d74df0c92e6aa4a7b0b3130706a4142b2d1a5869f2eaa423c6/pyyaml-6.0.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65", size = 829923, upload-time = "2025-09-25T21:32:54.537Z" },
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
+]
+
+[[package]]
+name = "quax"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "equinox" },
+    { name = "jax" },
+    { name = "jaxtyping" },
+    { name = "plum-dispatch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/e1/638586f89e19a0609b341581ec5d437cc3815823a9ddd22898136a732e40/quax-0.2.1.tar.gz", hash = "sha256:d527780dcfc539df6bca329f43d561870b872a691128eaea52007f9ff86c95f4", size = 26944, upload-time = "2025-10-12T18:58:27.323Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/dc/502ea6cd427255ccd44fb4073dd687255f8d72066925ec440c239f6061d3/quax-0.2.1-py3-none-any.whl", hash = "sha256:1a55e66affcb7cef05cbad3170723220d8aebf9746d655bbe6ac1cd2501f2676", size = 38113, upload-time = "2025-10-12T18:58:26.091Z" },
 ]
 
 [[package]]

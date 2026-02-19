@@ -10,7 +10,12 @@ from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PyTree
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer, PreTrainedConfig, PreTrainedTokenizerBase
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    PreTrainedConfig,
+    PreTrainedTokenizerBase,
+)
 
 from jaxformers.modeling_utils import (
     AdditionalConfig,
@@ -48,6 +53,7 @@ SHARDING_RULES = {
 
 
 Config: TypeAlias = PreTrainedConfig
+
 
 def layer_norm(x: jax.Array, gamma: jax.Array, beta: jax.Array, eps: float):
     x_fp32 = x.astype(jnp.float32)
@@ -151,9 +157,9 @@ def embed_input(
 
 def forward_layer(
     cfg: Config,
-    layer_idx: int,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
+    layer_idx: int,
     **inputs,
 ):
     rules = cfg.sharding_rules
@@ -303,10 +309,10 @@ def forward(
         }
 
         if cfg.additional_config["gradient_checkpointing"]:
-            fwd = jax.remat(partial(forward_layer, cfg, layer_idx))
+            fwd = jax.remat(partial(forward_layer, cfg))
         else:
-            fwd = partial(forward_layer, cfg, layer_idx)
-        x = fwd(x, layer_weights, **inputs)
+            fwd = partial(forward_layer, cfg)
+        x = fwd(x, layer_weights, layer_idx, **inputs)
 
     if not return_pooled:
         return x
@@ -409,9 +415,14 @@ def load(
             if key.endswith("intermediate.dense.weight"):
                 return logical_to_physical(("model", "fsdp"), sharding_rules)
             if key.endswith("output.dense.weight"):
-                return logical_to_physical(
-                    ("fsdp", "model"), sharding_rules
-                )
+                return logical_to_physical(("fsdp", "model"), sharding_rules)
+            if key.endswith("embeddings.word_embeddings.weight"):
+                return logical_to_physical(("model", "none"), sharding_rules)
+            return P()
+        except Exception as e:
+            print(
+                f"Failed to weight shard key {key}, see {e}, defaulting to replicated"
+            )
             if key.endswith("embeddings.word_embeddings.weight"):
                 return logical_to_physical(("model", "none"), sharding_rules)
             return P()

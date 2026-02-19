@@ -45,7 +45,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
 @partial(
     jtu.register_dataclass,
     data_fields=["weights", "opt_state", "step"],
-    meta_fields=["tokenizer", "forward", "config", "tx"],
+    meta_fields=["tokenizer", "forward", "config", "tx", "is_lora"],
 )
 @dataclass
 class Model:
@@ -57,3 +57,5 @@ class Model:
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None
     step: int | None = None
+
+    is_lora: bool = False

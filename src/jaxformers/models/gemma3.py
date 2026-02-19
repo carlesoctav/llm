@@ -165,6 +165,7 @@ def forward_layer(
     cfg: Config,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
+    layer_idx: int,
     rope_theta: float,
     kv=None,
     pos=0,
@@ -343,6 +344,7 @@ def forward(
         x, kv[layer_idx] = fwd(
             x,
             layer_weights,
+            layer_idx,
             rope_theta,
             kv[layer_idx],
             pos,
@@ -359,18 +361,16 @@ def forward(
     if logits_to_keep:
         x = x[:, -int(logits_to_keep) :, :]
 
-    # If TP is enabled, keep the vocabulary dimension sharded so we don't
-    # materialize a full (vocab, hidden) gradient on every shard.
-    vocab_axis = (
-        "model"
-        if getattr(config, "parallel_dims", {}).get("tp", 1) > 1
-        else "none"
+    loss_sharding = (
+        ("batch", "context", "model")
+        if config.additional_config.get("loss_parallel")
+        else ("batch", "context", "none")
     )
     logits = jnp.einsum(
         "btd,vd->btv",
         x,
         out_embed,
-        out_sharding=logical_to_physical(("batch", "sequence", vocab_axis), rules),
+        out_sharding=logical_to_physical(loss_sharding, rules),
         preferred_element_type=x.dtype,
     )
 

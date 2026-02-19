@@ -102,11 +102,13 @@ def rms_norm(x: jax.Array, gamma, eps):
 
 def forward_layer(
     config: Config,
-    layer_idx: int,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
+    layer_idx: int,
     kv=None,
     pos=0,
+    *,
+    rngs: PRNGKeyArray | None = None,
     **inputs,
 ):
     B, T, D = x.shape
@@ -237,6 +239,7 @@ def forward(
     kv: None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
+    *,
     rngs: PRNGKeyArray | None = None,
     **inputs,
 ):
@@ -275,12 +278,12 @@ def forward(
         }
 
         if config.additional_config["gradient_checkpointing"]:
-            fwd = jax.remat(partial(forward_layer, config, layer_idx))
+            fwd = jax.remat(partial(forward_layer, config))
         else:
-            fwd = partial(forward_layer, config, layer_idx)
+            fwd = partial(forward_layer, config)
 
         input_ids, kv[layer_idx] = fwd(
-            input_ids, layer_weights, kv[layer_idx], pos, **inputs
+            input_ids, layer_weights, layer_idx, kv[layer_idx], pos, **inputs
         )  # sharding: (batch, seq, None)
 
     out_embed = (

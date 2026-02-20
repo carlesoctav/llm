@@ -1,4 +1,3 @@
-from rich.themes import DEFAULT
 import dataclasses
 import importlib
 import time
@@ -14,6 +13,7 @@ import orbax.checkpoint as ocp
 import quax._core as qc
 import sws
 from jax.experimental.rnn import PRNGKeyArray
+from rich.themes import DEFAULT
 from transformers import AutoTokenizer
 
 import wandb
@@ -49,7 +49,7 @@ def get_config():
     config.random_init = False
     config.skip_eval = True
 
-    config.use_lora = False
+    config.use_lora = True
     config.random_init_lora = True
 
     config.exp_name = "test1"
@@ -63,8 +63,8 @@ def get_config():
     config.model_name = "qwen3"
     config.model.model_id = "Qwen/Qwen3-4B-Instruct-2507"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
-    config.model.model_id = "Qwen/Qwen3-0.6B"
-    config.model.additional_config.gradient_checkpointing = False
+    # config.model.model_id = "Qwen/Qwen3-0.6B"
+    config.model.additional_config.gradient_checkpointing = True
     config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.loss_parallel = False
@@ -72,17 +72,17 @@ def get_config():
     config.model.devices = jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
-    # config.lora.rank = 64
-    # config.lora.alpha = 1
-    # config.lora.weights_path = [
-    #     "*.q_proj.weight",
-    #     "*.k_proj.weight",
-    #     "*.v_proj.weight",
-    #     "*.o_proj.weight",
-    #     "*.gate_proj.weight",
-    #     "*.up_proj.weight",
-    #     "*.down_proj.weight",
-    # ]
+    config.lora.rank = 64
+    config.lora.alpha = 1
+    config.lora.weights_path = [
+        "*.q_proj.weight",
+        "*.k_proj.weight",
+        "*.v_proj.weight",
+        "*.o_proj.weight",
+        "*.gate_proj.weight",
+        "*.up_proj.weight",
+        "*.down_proj.weight",
+    ]
 
     config.lr_scheduler_name = None
     config.learning_rate = 1e-5
@@ -157,6 +157,7 @@ def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
     freeze_mask = None
     if getattr(model, "is_lora", False):
         freeze_mask = mask_non_lora(model.weights)
+        print("DEBUGPRINT {freeze_mask}:", freeze_mask)
 
     tx = optmizer_module.make(
         scheduler, **config.optimizer.to_dict(), freeze_mask=freeze_mask
@@ -236,8 +237,9 @@ def process_aux(accum_aux: dict[str, Any], namespace=""):
 
 def add_aux(accum_aux, aux):
     is_tuple = lambda x: isinstance(x, tuple)
+
     def f(path, accum_leaf, leaf):
-        method = DEFAULT_REDUCED[jtu.keystr(path, simple = True)]
+        method = DEFAULT_REDUCED[jtu.keystr(path, simple=True)]
         match method:
             case "max":
                 return jnp.maximum(accum_leaf, leaf)
@@ -248,7 +250,7 @@ def add_aux(accum_aux, aux):
             case "mean":
                 return (accum_leaf[0] + leaf[0], accum_leaf[1] + leaf[1])
 
-    return jtu.tree_map_with_path(f, accum_aux, aux, is_leaf = is_tuple)
+    return jtu.tree_map_with_path(f, accum_aux, aux, is_leaf=is_tuple)
 
 
 def train(

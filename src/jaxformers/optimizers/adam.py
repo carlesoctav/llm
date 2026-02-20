@@ -3,7 +3,7 @@ from typing import Callable
 import optax
 from jaxtyping import Bool, PyTree
 
-from .base import make as make_base
+from .base import make_opt_base_components
 from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
 
 
@@ -20,9 +20,13 @@ def make(
 ):
 
     components = []
-    components.append(
-        make_base(grad_accum, max_grad_norm),
+
+    components.extend(
+        make_opt_base_components(grad_accum),
     )
+
+    if max_grad_norm:
+        components.append(optax.clip_by_global_norm(max_grad_norm))
 
     components.append(
         optax.scale_by_adam(

@@ -27,10 +27,12 @@ def find_learning_rate(opt_state):
 
     def f(path, leaf):
         if is_lr_state(leaf):
-            res[tree_util.optimizerstr(path)] = leaf.learning_rate
+            log_key = tree_util.optimizerstr(path)
+            log_key = f"{log_key}/lr" if log_key else "lr"
+            res[f"optim/{log_key}"] = leaf.learning_rate
 
     jtu.tree_map_with_path(f, opt_state, is_leaf=is_lr_state)
     return res
 
 def find_grad_norm(opt_state):
-    return {"grad_norm": opt_state[2].grad_norm}
+    return {"grad/egrad_norm": opt_state[2].grad_norm}

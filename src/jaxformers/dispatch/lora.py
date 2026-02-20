@@ -42,53 +42,11 @@ class LoraArray(quax.ArrayValue):
     a: Shaped[Array, "*batch x z"]
     b: Shaped[Array, "*batch z y"]
     alpha: float = eqx.field(static=True)
-    stop_gradient: bool = eqx.field(static=True)
     allow_materialise: bool = eqx.field(static=True)
-
-    def __init__(
-        self,
-        weight: Shaped[Array, "*batch x y"],
-        *,
-        rank: int,
-        alpha: float | None = None,
-        scale: float = 0.01,
-        allow_materialise: bool = False,
-        stop_gradient: bool = True,
-        key: PRNGKeyArray,
-    ):
-        """**Arguments:**
-
-        - `weight`: the original weight to wrap.
-        - `rank`: the rank of the low-rank adaptation.
-        - `scale`: `a` will be initialised at `Normal(0, scale^2)`. (`b` is initialised
-            at zero.)
-        - `allow_materialise`: if Quax encounters an operation for which there has not
-            been a specific override specified for LoraArrays, should it either (a)
-            throw an error (`allow_materialise=False`, the default), or (b) silently
-            convert the `LoraArray` back into an JAX array, by explicitly calculating
-            `w + a @ b` (`allow_materialise=True`).
-        - `stop_gradient`: whether to automatically stop the gradient (prevent training)
-            of the original weight matrix `weight`.
-        - `key`: used to provide randomness for initialising `a`.
-        """
-
-        *batch, x, y = weight.shape
-        if alpha is None:
-            # Common LoRA default; makes the effective scaling `alpha / rank == 1`.
-            alpha = float(rank)
-        self._w = weight
-        self.a = jr.normal(key, (*batch, x, rank), dtype=weight.dtype) * scale
-        self.b = jnp.zeros((*batch, rank, y), dtype=weight.dtype)
-        self.alpha = alpha
-        self.stop_gradient = stop_gradient
-        self.allow_materialise = allow_materialise
 
     @property
     def w(self):
-        if self.stop_gradient:
-            return lax.stop_gradient(self._w)
-        else:
-            return self._w
+        return lax.stop_gradient(self._w)
 
     def materialise(self):
         if self.allow_materialise:
@@ -171,6 +129,10 @@ def _is_match(array_path, weights_path):
     return False
 
 
+def random_weight(key,shape):
+    return jax.random.normal(key, shape)
+
+
 def loraify(
     model: Model,
     weights_path: list[str],
@@ -189,16 +151,18 @@ def loraify(
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
+            X, Y = weight.shape
             lora_key = jax.random.fold_in(rngs, counter)
             counter += 1
+            a = jax.random.normal(lora_key, (X, rank))
+            b = jnp.zeros((rank, Y))
+
             lora_weight = LoraArray(
-                weight,
-                rank=rank,
+                _w =weight,
+                a = a,
+                b = b,
                 alpha=alpha,
-                scale=scale,
-                stop_gradient=stop_gradient,
                 allow_materialise=allow_materialise,
-                key=lora_key,
             )
             loraify_weight.append(keystr)
             return lora_weight

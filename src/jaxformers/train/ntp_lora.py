@@ -21,18 +21,23 @@ from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import LoraArray, loraify
 from jaxformers.modeling_utils import Model
+from jaxformers.optimizer_utils import (
+    find_apply_every_count,
+    _freeze_non_accum_states,
+    lora_only_param_labels,
+)
 from jaxformers.optimizers.log_grad_norm import get_logged_grad_norm
 
 
-orig = qc.Value.default
-def dbg(prim, values, params):
-    if any(isinstance(v, LoraArray) for v in values):
-        print("quax fallback primtiive", prim)
-    return orig(prim, values, params)
-
-qc.Value.default = staticmethod(dbg)
+# orig = qc.Value.default
+# def dbg(prim, values, params):
+#     if any(isinstance(v, LoraArray) for v in values):
+#         print("quax fallback primtiive", prim)
+#     return orig(prim, values, params)
 
 
+# qc.Value.default = staticmethod(dbg)
+#
 def get_config():
     config = sws.Config()
 
@@ -50,12 +55,12 @@ def get_config():
 
     config.model_name = "qwen3"
     config.model.model_id = "Qwen/Qwen3-4B-Instruct-2507"
-    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
     # config.model.model_id = "Qwen/Qwen3-0.6B"
     # config.model.parallel_dims = {"dp_replicate": 4, "dp_shard": 1, "cp": 1, "tp": 1}
     # config.model.additional_config = {"attn_implementation": "eager", "loss_parallel": False, "gradient_checkpointing": True}
-    config.model.additional_config.gradient_checkpointing = True
-    config.model.additional_config.attn_implementation = "eager"
+    config.model.additional_config.gradient_checkpointing = False
+    config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.loss_parallel = False
 
@@ -63,7 +68,7 @@ def get_config():
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.random_init_lora = True
-    config.lora.rank = 1
+    config.lora.rank = 64
     config.lora.alpha = 1
     config.lora.weights_path = [
         "*.q_proj.weight",
@@ -132,7 +137,7 @@ def get_config():
     config.checkpoint_options.save_interval_steps = 1000
     config.checkpoint_options.max_to_keep = 1
 
-    #plesae don't change this
+    # plesae don't change this
     config.reduced = {"loss": "mean", "token_count": "sum"}
 
     config.wandb.project = "test-training"
@@ -154,7 +159,9 @@ def load_model(config: sws.FinalConfig, name: str):
 
 def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
     optmizer_module = importlib.import_module(f"jaxformers.optimizers.{opt_name}")
-    tx = optmizer_module.make(scheduler, **config.optimizer.to_dict())
+    base_tx = optmizer_module.make(scheduler, **config.optimizer.to_dict())
+    if getattr(model, "is_lora", False):
+        tx = optax.masked(base_tx, mask = lora_only_param_labels(model.weights))
     opt_state = tx.init(model.weights)
     return dataclasses.replace(model, opt_state=opt_state, tx=tx)
 
@@ -198,8 +205,15 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     k = config.optimizer.grad_accum
-    c = model.opt_state[0].count % k
-    emit = c == (k - 1)
+    if k == 1:
+        emit = True
+    else:
+        count = find_apply_every_count(model.opt_state)
+        if count is None:
+            raise RuntimeError(
+                "grad_accum > 1 but couldn't find optax.apply_every state in opt_state"
+            )
+        emit = (count % k) == (k - 1)
 
     (loss, aux), grad = grad_fn(model.weights, batch, rngs)
 
@@ -207,9 +221,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     updates, nst = model.tx.update(
         grad, model.opt_state, model.weights, token_count=token_count
     )
-    nst = (nst[0], nst[1]) + jtu.tree_map(
-        lambda nst, st: jnp.where(emit, nst, st), nst[2:], model.opt_state[2:]
-    )
+    if k != 1:
+        nst = _freeze_non_accum_states(emit, nst, model.opt_state)
     nweights = optax.apply_updates(model.weights, updates)
 
     return dataclasses.replace(model, weights=nweights, opt_state=nst), aux
@@ -292,7 +305,9 @@ def train(
                 processed_aux = process_metrics(config, accum_aux)
                 if config.log.learning_rate:
                     processed_aux["learning_rate"] = (
-                        scheduler(step) if isinstance(scheduler, Callable) else scheduler
+                        scheduler(step)
+                        if isinstance(scheduler, Callable)
+                        else scheduler
                     )
                 if config.log.grad_norm:
                     logged = get_logged_grad_norm(model.opt_state)

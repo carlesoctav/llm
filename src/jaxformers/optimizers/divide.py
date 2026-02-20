@@ -13,7 +13,7 @@ class DivideByState(NamedTuple):
 def divide_every(
     every_k: int = 1,
     *,
-    denom_key: str = "token_count",
+    denom_key: str = "count",
     eps: float = 1e-8,
 ) -> optax.GradientTransformationExtraArgs:
     """Divide updates by an accumulated scalar denominator.

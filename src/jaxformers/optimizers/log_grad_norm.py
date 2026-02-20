@@ -35,17 +35,3 @@ def log_grad_norm() -> optax.GradientTransformation:
         return updates, LogGradNormState(grad_norm=grad_norm_next)
 
     return optax.GradientTransformation(init_fn, update_fn)
-
-
-def get_logged_grad_norm(opt_state) -> jax.Array | None:
-    """Extract the most recent logged grad norm from a chained optax state."""
-
-    if isinstance(opt_state, LogGradNormState):
-        return opt_state.grad_norm
-    if isinstance(opt_state, tuple):
-        for item in opt_state:
-            found = get_logged_grad_norm(item)
-            if found is not None:
-                return found
-    return None
-

@@ -25,6 +25,7 @@ from jaxformers.modeling_utils import (
 )
 
 from ..attention_utils import ATTENTION_INTERFACE
+from ..dispatch.einsum import einsum
 from ..distributed import (
     BATCH,
     CONTEXT,
@@ -168,7 +169,7 @@ def forward_layer(
     head_dim = cfg.hidden_size // num_heads
 
     q = (
-        jnp.einsum(
+        einsum(
             "btd,md->btm",
             x,
             w["q_proj_w"],
@@ -178,7 +179,7 @@ def forward_layer(
         + w["q_proj_b"][None, None, :]
     )
     k = (
-        jnp.einsum(
+        einsum(
             "btd,md->btm",
             x,
             w["k_proj_w"],
@@ -188,7 +189,7 @@ def forward_layer(
         + w["k_proj_b"][None, None, :]
     )
     v = (
-        jnp.einsum(
+        einsum(
             "btd,md->btm",
             x,
             w["v_proj_w"],
@@ -208,7 +209,7 @@ def forward_layer(
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
 
     attn_output = (
-        jnp.einsum(
+        einsum(
             "btd,ed->bte",
             attn_output,
             w["attn_out_w"],
@@ -229,7 +230,7 @@ def forward_layer(
 
     activation = get_activation_fn(cfg.hidden_act)
     inter = activation(
-        jnp.einsum(
+        einsum(
             "btd,fd->btf",
             x,
             w["ffn_in_w"],
@@ -239,7 +240,7 @@ def forward_layer(
         + w["ffn_in_b"][None, None, :]
     )
     out = (
-        jnp.einsum(
+        einsum(
             "btf,df->btd",
             inter,
             w["ffn_out_w"],
@@ -320,7 +321,7 @@ def forward(
     if "bert.pooler.dense.weight" in weights and "bert.pooler.dense.bias" in weights:
         cls_state = x[:, 0, :]
         pooled = (
-            jnp.einsum(
+            einsum(
                 "bd,ed->be",
                 cls_state,
                 weights["bert.pooler.dense.weight"],

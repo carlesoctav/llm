@@ -30,6 +30,7 @@ from jaxformers.modeling_utils import (
 )
 
 from ..attention_utils import ATTENTION_INTERFACE
+from ..dispatch.einsum import einsum
 from ..distributed import (
     BATCH,
     CONTEXT,
@@ -62,7 +63,7 @@ def apply_rope(x: jax.Array, theta: float, pos=0):
     bsz, seqlen, _nheads, head_dim = x.shape
     positions = pos + jnp.broadcast_to(jnp.arange(seqlen)[None, :], [bsz, seqlen])
     freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-    inp = jnp.einsum(
+    inp = einsum(
         "bt,h->bth",
         positions,
         freq,
@@ -149,7 +150,7 @@ def make_mask_mapping(config, input_embeds, attention_mask=None, segment_ids=Non
 
 
 def linear_3d(x, w, b=None, *, out_sharding=None):
-    y = jnp.einsum(
+    y = einsum(
         "btd,md->btm",
         x,
         w,
@@ -247,7 +248,7 @@ def forward_layer(
         w.get("up_proj_bias"),
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
-    ffw = jnp.einsum(
+    ffw = einsum(
         "btf,df->btd",
         gate * up,
         w["down_proj"],
@@ -366,7 +367,7 @@ def forward(
         if config.additional_config.get("loss_parallel")
         else ("batch", "context", "none")
     )
-    logits = jnp.einsum(
+    logits = einsum(
         "btd,vd->btv",
         x,
         out_embed,

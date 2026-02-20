@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import quax
 from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
@@ -37,6 +36,7 @@ from jaxformers.modeling_utils import (
 )
 
 from ..attention_utils import ATTENTION_INTERFACE
+from ..dispatch.einsum import einsum
 from ..distributed import (
     BATCH,
     CONTEXT,
@@ -45,8 +45,6 @@ from ..distributed import (
     mutate_sharding_rule_parallel_dims,
     SEQ,
 )
-
-_einsum = quax.quaxify(jnp.einsum)
 
 
 LayerWeights = TypeVar("LayerWeights")
@@ -84,7 +82,7 @@ def apply_rope(x: jax.Array, theta, pos=0):
     B, T, N, H = x.shape
     positions = pos + jnp.broadcast_to(jnp.arange(T)[None, :], [B, T])  # (B, T)
     freq = 1.0 / (theta ** (jnp.arange(0, H, 2, dtype=jnp.float32) / H))  # (H/2, )
-    inp = jnp.einsum(
+    inp = einsum(
         "bt,h-> bth", positions, freq, precision=jax.lax.Precision.HIGHEST
     )  # (B, T, H/2)
     x1, x2 = x[:, :, :, : H // 2], x[:, :, :, H // 2 :]  # (B, T, N, H/2)
@@ -120,21 +118,21 @@ def forward_layer(
     x_norm = rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
-    q = _einsum(
+    q = einsum(
         "btd,md->btm",
         x_norm,
         w["q_proj"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
-    k = _einsum(
+    k = einsum(
         "btd,md->btm",
         x_norm,
         w["k_proj"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
-    v = _einsum(
+    v = einsum(
         "btd,md->btm",
         x_norm,
         w["v_proj"],
@@ -171,14 +169,18 @@ def forward_layer(
 
     attn_impl = config.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
-
-    q_sharding = jax.NamedSharding(jax.sharding.get_abstract_mesh(), logical_to_physical(("batch", "context", "model", "none"), config.sharding_rules))
+    q_sharding = jax.NamedSharding(
+        jax.sharding.get_abstract_mesh(),
+        logical_to_physical(
+            ("batch", "context", "model", "none"), config.sharding_rules
+        ),
+    )
     attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"], q_sharding = q_sharding
+        q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
     )  # (B, T, N, H)
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
-    o = _einsum(
+    o = einsum(
         "btd,ed->bte",
         attn_output,
         w["o_proj"],
@@ -193,7 +195,7 @@ def forward_layer(
     # FFN
     act_fn = jax.nn.silu
     gate = act_fn(
-        _einsum(
+        einsum(
             "btd,fd->btf",
             x_norm,
             w["gate_proj"],
@@ -202,7 +204,7 @@ def forward_layer(
         )
     )
 
-    up = _einsum(
+    up = einsum(
         "btd,fd->btf",
         x_norm,
         w["up_proj"],
@@ -210,7 +212,7 @@ def forward_layer(
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
-    x += _einsum(
+    x += einsum(
         "btf,df->btd",
         gate * up,
         w["down_proj"],
@@ -307,7 +309,7 @@ def forward(
         else ("batch", "context", "none")
     )
 
-    logits = jnp.einsum(
+    logits = einsum(
         "btd,vd-> btv",
         input_ids,
         out_embed,

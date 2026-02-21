@@ -72,7 +72,7 @@ def get_config():
     config.model.devices = jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
-    config.lora.rank = 64
+    config.lora.rank = 8
     config.lora.alpha = 1
     config.lora.weights_path = [
         "*.q_proj.weight",
@@ -205,7 +205,10 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     k = config.optimizer.grad_accum
-    c = model.opt_state[0].count
+    apply_every_state = model.opt_state[0]
+    if isinstance(apply_every_state, optax.MaskedState):
+        apply_every_state = apply_every_state.inner_state
+    c = apply_every_state.count
     emit = c == (k - 1)
 
     (loss, aux), grad = grad_fn(model.weights, batch, rngs)

@@ -7,6 +7,7 @@ import optax
 
 from jaxformers import tree_util
 from jaxformers.dispatch.lora import LoraArray
+from jaxformers.optimizers.log_grad_norm import LogGradNormState
 from jaxformers.optimizers.lr import ScaleByLearningRateState
 
 
@@ -35,4 +36,12 @@ def find_learning_rate(opt_state):
     return res
 
 def find_grad_norm(opt_state):
-    return {"grad/egrad_norm": opt_state[2].grad_norm}
+    is_grad_norm_state = lambda x: isinstance(x, LogGradNormState)
+    res = {}
+
+    def f(path, leaf):
+        if is_grad_norm_state(leaf):
+            res["grad/egrad_norm"] = leaf.grad_norm
+
+    jtu.tree_map_with_path(f, opt_state, is_leaf=is_grad_norm_state)
+    return res

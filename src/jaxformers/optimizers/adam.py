@@ -1,5 +1,6 @@
 from typing import Callable
 
+import jax.tree_util as jtu
 import optax
 from jaxtyping import Bool, PyTree
 
@@ -19,28 +20,35 @@ def make(
     **kwargs,
 ):
 
-    components = []
+    train_mask = None
+    if freeze_mask is not None:
+        # `freeze_mask=True` means "frozen". Optax masking expects `True` for the
+        # leaves we want to *apply* transforms to, so we invert it.
+        train_mask = jtu.tree_map(lambda m: not m, freeze_mask)
 
-    components.extend(
-        make_opt_base_components(grad_accum),
-    )
+    def maybe_mask(tx: optax.GradientTransformation) -> optax.GradientTransformation:
+        return optax.masked(tx, train_mask) if train_mask is not None else tx
+
+    components = [maybe_mask(tx) for tx in make_opt_base_components(grad_accum)]
 
     if max_grad_norm:
-        components.append(optax.clip_by_global_norm(max_grad_norm))
+        components.append(maybe_mask(optax.clip_by_global_norm(max_grad_norm)))
 
     components.append(
-        optax.scale_by_adam(
-            b2=b2,
-            b1=b1,
-            eps=eps,
+        maybe_mask(
+            optax.scale_by_adam(
+                b2=b2,
+                b1=b1,
+                eps=eps,
+            )
         ),
     )
 
     components.append(
-        custom_scale_by_learning_rate(learning_rate)
+        maybe_mask(custom_scale_by_learning_rate(learning_rate))
     )
 
-    if freeze_mask:
+    if freeze_mask is not None:
         components.append(optax.freeze(freeze_mask))
 
     return optax.chain(*components)

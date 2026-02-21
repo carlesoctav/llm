@@ -1,5 +1,6 @@
 from typing import Callable
 
+import jax.tree_util as jtu
 import optax
 from jaxtyping import Bool, PyTree
 
@@ -14,17 +15,10 @@ def make(
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
-    *,
-    freeze_mask: PyTree[Bool] | None = None,
     **kwargs,
 ):
 
-    components = []
-
-    components.extend(
-        make_opt_base_components(grad_accum),
-    )
-
+    components = make_opt_base_components(grad_accum)
     if max_grad_norm:
         components.append(optax.clip_by_global_norm(max_grad_norm))
 
@@ -36,11 +30,5 @@ def make(
         ),
     )
 
-    components.append(
-        custom_scale_by_learning_rate(learning_rate)
-    )
-
-    if freeze_mask:
-        components.append(optax.freeze(freeze_mask))
-
+    components.append(custom_scale_by_learning_rate(learning_rate))
     return optax.chain(*components)

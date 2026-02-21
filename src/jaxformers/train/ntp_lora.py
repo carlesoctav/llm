@@ -17,6 +17,7 @@ from rich.themes import DEFAULT
 from transformers import AutoTokenizer
 
 import wandb
+from jaxformers import tree_util
 from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
@@ -25,7 +26,7 @@ from jaxformers.modeling_utils import Model
 from jaxformers.optimizer_utils import (
     find_grad_norm,
     find_learning_rate,
-    mask_non_lora,
+    mask_trainable_lora,
 )
 
 
@@ -154,16 +155,14 @@ def load_model(config: sws.FinalConfig, name: str):
 
 def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
     optmizer_module = importlib.import_module(f"jaxformers.optimizers.{opt_name}")
-    freeze_mask = None
+    train_mask = None
     if getattr(model, "is_lora", False):
-        freeze_mask = mask_non_lora(model.weights)
-        print("DEBUGPRINT {freeze_mask}:", freeze_mask)
+        train_mask = mask_trainable_lora(model.weights)
 
-    tx = optmizer_module.make(
-        scheduler, **config.optimizer.to_dict(), freeze_mask=freeze_mask
-    )
-    opt_state = tx.init(model.weights)
-    return dataclasses.replace(model, opt_state=opt_state, tx=tx)
+    train_weights, _ = tree_util.partition(model.weights, train_mask)
+    tx = optmizer_module.make(scheduler, **config.optimizer.to_dict())
+    opt_state = tx.init(train_weights)
+    return dataclasses.replace(model, opt_state=opt_state, tx=tx, train_mask=train_mask)
 
 
 def load_scheduler(config: sws.FinalConfig, sched_name):
@@ -192,7 +191,9 @@ def load_dataset(config: sws.FinalConfig, data_name: str):
 
 
 def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
-    def loss_fn(weights, batch, rngs):
+    def loss_fn(train_weights, frozen_weights, batch, rngs):
+        weights = tree_util.combine(train_weights, frozen_weights)
+
         logits = model.forward(weights, **batch["inputs"], rngs=rngs)
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits, batch["labels"]
@@ -203,12 +204,13 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
         return loss, aux
 
+    train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     k = config.optimizer.grad_accum
     c = model.opt_state[0].count
     emit = c == (k - 1)
 
-    (loss, aux), grad = grad_fn(model.weights, batch, rngs)
+    (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
     token_count = aux["token_count"]
 
     updates, nst = model.tx.update(
@@ -219,7 +221,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
         lambda nst, st: jnp.where(emit, nst, st), nst[2:], model.opt_state[2:]
     )
 
-    nweights = optax.apply_updates(model.weights, updates)
+    nweights = tree_util.apply_updates(model.weights, updates)
 
     return dataclasses.replace(model, weights=nweights, opt_state=nst), aux
 

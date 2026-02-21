@@ -10,13 +10,13 @@ from jaxformers.dispatch.lora import LoraArray
 from jaxformers.optimizers.lr import ScaleByLearningRateState
 
 
-def mask_non_lora(params):
+def mask_trainable_lora(params):
     is_lora_array = lambda x: isinstance(x, LoraArray)
 
     def label(leaf):
         if isinstance(leaf, LoraArray):
-            return replace(leaf, _w=True, a=False, b=False)
-        return True
+            return replace(leaf, _w=False, a=True, b=True)
+        return False
 
     return jtu.tree_map(label, params, is_leaf=is_lora_array)
 

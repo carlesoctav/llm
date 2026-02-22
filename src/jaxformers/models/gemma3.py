@@ -265,8 +265,8 @@ def forward_layer(
 
 def forward(
     config: Config,
-    input_ids: Int[Array, "B T"],
     weights: PyTree[Array, "ModelWeights"],
+    input_ids: Int[Array, "B T"],
     kv: None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,

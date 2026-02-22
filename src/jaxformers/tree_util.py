@@ -1,4 +1,3 @@
-from jaxformers.print_utils import tree_pprint
 import jax.tree_util as jtu
 from jax.tree_util import (
     DictKey,
@@ -15,9 +14,9 @@ def optimizerstr(keys: KeyPath, separator: str = "/") -> str:
     return separator.join(map(str_fn, keys))
 
 
-def partition(pytree, filter, replace=None, is_leaf=None):
+def partition(pytree, filter=None, replace=None, is_leaf=None):
     if filter is None:
-        return pytree, None
+        return pytree, jtu.tree_map(lambda x: None, pytree)
 
     left = jtu.tree_map(lambda m, v: v if m else None, filter, pytree, is_leaf=is_leaf)
     right = jtu.tree_map(
@@ -26,7 +25,7 @@ def partition(pytree, filter, replace=None, is_leaf=None):
     return left, right
 
 
-def combine(left, right, is_leaf = None):
+def combine(left, right, is_leaf=None):
     def _combine(*args):
         for arg in args:
             if arg is not None:
@@ -34,7 +33,7 @@ def combine(left, right, is_leaf = None):
 
     is_none = lambda x: x is None
     _is_leaf = is_none if is_leaf is None else lambda x: is_none(x) or is_leaf(x)
-    return jtu.tree_map(_combine, left, right, is_leaf = _is_leaf)
+    return jtu.tree_map(_combine, left, right, is_leaf=_is_leaf)
 
 
 def apply_updates(weights, updates):
@@ -45,7 +44,7 @@ def apply_updates(weights, updates):
             return w + u
 
     is_none = lambda x: x is None
-    return jtu.tree_map(_f, weights, updates, is_leaf = is_none)
+    return jtu.tree_map(_f, weights, updates, is_leaf=is_none)
 
 
 def _optimizer_entrystr(key: KeyEntry) -> str:

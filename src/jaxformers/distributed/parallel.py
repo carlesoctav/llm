@@ -54,7 +54,6 @@ def mutate_sharding_rule_parallel_dims(
 
     if parallel_dims["cp"] == 1:
         rules["context"] = drop_axis(rules.get("context"), "cp")
-        rules["sequence"] = drop_axis(rules.get("sequence"), "cp")
 
     # Avoid explicit singleton mesh axes in PartitionSpecs. These can trigger sharding
     # mismatches in transposes/VJPs (e.g. reductions) on newer JAX versions.
@@ -62,6 +61,8 @@ def mutate_sharding_rule_parallel_dims(
         if axis_size != 1:
             continue
         for rule_key, rule_val in list(rules.items()):
+            if axis_name == "cp" and rule_key == "sequence":
+                continue
             rules[rule_key] = drop_axis(rule_val, axis_name)
 
     return rules

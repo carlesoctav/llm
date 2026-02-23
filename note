@@ -1,0 +1,62 @@
+
+
+before
+  warnings.warn(
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/carlesoctav/.netrc.
+wandb: Currently logged in as: carlesoctav to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /mnt/carles/llm/wandb/run-20260220_033543-mvzqvcdw
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run test1
+wandb: ⭐️ View project at https://wandb.ai/carlesoctav/test-training
+wandb: 🚀 View run at https://wandb.ai/carlesoctav/test-training/runs/mvzqvcdw
+compile time:  171.486406060867
+Total memory size: 11.9 GB, Output size: 2.9 GB, Temp size: 6.2 GB, Argument size: 2.9 GB, Host temp size: 0.0 GB.
+
+
+after refactor
+ alpha=1, allow_materialise=False), 'model.layers.9.self_attn.q_norm.weight': True, 'model.layers.9.self_attn.q_proj.weight': LoraArray(_w=True, a=False, b=False, alpha=1, allow_materialise=False), 'model.layers.9.self_attn.v_proj.weight': LoraArray(_w=True, a=False, b=False, alpha=1, allow_materialise=False), 'model.norm.weight': True}
+Created optimizer and its state in 2.77 seconds.
+/mnt/carles/llm/src/jaxformers/data/training.py:170: UserWarning: Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. If shuffling is important for your workflow, please pre-shuffle the dataset.
+  warnings.warn(
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/carlesoctav/.netrc.
+wandb: Currently logged in as: carlesoctav to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /mnt/carles/llm/wandb/run-20260220_180133-t03anunz
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run with_lora
+wandb: ⭐️ View project at https://wandb.ai/carlesoctav/test-training
+wandb: 🚀 View run at https://wandb.ai/carlesoctav/test-training/runs/t03anunz
+compile time:  213.07155562611297
+Total memory size: 20.6 GB, Output size: 7.5 GB, Temp size: 5.5 GB, Argument size: 7.5 GB, Host temp size: 0.0 GB.
+dataloader is exhausted
+
+
+
+
+
+after
+compile time:  162.61084827734157
+Total memory size: 13.9 GB, Output size: 3.8 GB, Temp size: 6.3 GB, Argument size: 3.8 GB, Host temp size: 0.0 GB.
+dataloader is exhausted
+
+
+compile time:  153.19838387379423
+Total memory size: 13.2 GB, Output size: 3.8 GB, Temp size: 5.6 GB, Argument size: 3.8 GB, Host temp size: 0.0 GB.
+
+compile time:  155.66090642102063
+Total memory size: 13.2 GB, Output size: 3.8 GB, Temp size: 5.6 GB, Argument size: 3.8 GB, Host temp size: 0.0 GB.
+dataloader is exhausted
+
+
+
+without grad checkpointing
+compile time:  129.34646356711164
+Total memory size: 22.6 GB, Output size: 3.8 GB, Temp size: 14.9 GB, Argument size: 3.8 GB, Host temp size: 0.0 GB.
+
+
+
+compile time:  159.91658977372572
+Total memory size: 12.7 GB, Output size: 2.0 GB, Temp size: 8.7 GB, Argument size: 2.0 GB, Host temp size: 0.0 GB.
+Traceback (most recent call last):
+

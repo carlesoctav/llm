@@ -57,7 +57,6 @@ def sliding_window_mask_overlay(window_size: int):
 def sliding_window_causal_overlay(window_size: int):
     """Overlay depicting a sliding-window pattern for causal attention.
 
-    Mirrors HF's semantics: kv_idx > q_idx - window_size (exclusive bound).
     """
 
     def mask(b, h, q, kv):

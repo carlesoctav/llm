@@ -27,12 +27,14 @@ def logical_to_physical(logical, rules):
 
 class AdditionalConfig(TypedDict):
     # training
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool
+    remat_layer: bool
+    remat_loss: bool
 
     # training and inference
-    attn_implementation: str = "sdpa"
-    sequence_parallelism: bool = True
-    loss_parallel: True
+    attn_implementation: str
+    sequence_parallelism: bool
+    loss_parallel: bool
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
@@ -40,19 +42,32 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
     "loss_parallel": True,
+    "remat_layer": False,
+    "remat_loss": False,
 }
 
 
 @partial(
     jtu.register_dataclass,
     data_fields=["weights", "opt_state", "step"],
-    meta_fields=["tokenizer", "forward", "config", "tx", "is_lora", "train_mask"],
+    meta_fields=[
+        "tokenizer",
+        "embed",
+        "forward",
+        "unembed",
+        "config",
+        "tx",
+        "is_lora",
+        "train_mask",
+    ],
 )
 @dataclass
 class Model:
     config: PreTrainedConfig
     weights: PyTree[Float, "ModelWeights"]
+    embed: Callable | None
     forward: Callable
+    unembed: Callable | None
     tokenizer: PreTrainedTokenizerFast
 
     opt_state: PyTree["ModelWeights"] | None = None

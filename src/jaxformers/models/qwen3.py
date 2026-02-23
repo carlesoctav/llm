@@ -223,7 +223,7 @@ def forward_layer(
     return x, kv
 
 
-def make_mask(config, input_ids, attention_mask=None, segment_ids=None, **kwargs):
+def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
     attn_implementation = config.additional_config["attn_implementation"]
     if attn_implementation not in ATTENTION_MASK_INTERFACE:
         return None
@@ -232,37 +232,43 @@ def make_mask(config, input_ids, attention_mask=None, segment_ids=None, **kwargs
         attention_mask = attention_mask.astype(jnp.bool_)
 
     attention_mask = make_causal_mask(
-        attn_implementation, input_ids, attention_mask, segment_ids
+        attn_implementation, input_embeds, attention_mask, segment_ids
     )
     return attention_mask
 
 
-def forward(
+def embed_tokens(
     config: Config,
     weights: PyTree[Array, "ModelWeights"],
     input_ids: Int[Array, "B T"],
-    kv: None = None,
-    pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
-    *,
-    rngs: PRNGKeyArray | None = None,
-    **inputs,
-):
-    B, T = input_ids.shape
+) -> Float[Array, "B T D"]:
     rules = config.sharding_rules
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
-    input_ids = (
+    input_embeds = (
         weights["model.embed_tokens.weight"]
         .at[input_ids, :]
         .get(out_sharding=logical_to_physical(("batch", "sequence", "none"), rules))
         .astype(dtype)
     )
+    return input_embeds
 
+
+def forward(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    input_embeds: Float[Array, "B T D"],
+    kv: None = None,
+    pos: int = 0,
+    *,
+    rngs: PRNGKeyArray | None = None,
+    **inputs,
+):
     return_kv = kv is not None
     if kv is None:
         kv = defaultdict(lambda: None)
 
-    inputs["attention_mask"] = make_mask(config, input_ids, **inputs)
+    inputs["attention_mask"] = make_mask(config, input_embeds, **inputs)
 
     for layer_idx in range(config.num_hidden_layers):
         prefix = f"model.layers.{layer_idx}."
@@ -287,18 +293,30 @@ def forward(
         else:
             fwd = partial(forward_layer, config)
 
-        input_ids, kv[layer_idx] = fwd(
-            input_ids, layer_weights, layer_idx, kv[layer_idx], pos, **inputs
+        input_embeds, kv[layer_idx] = fwd(
+            input_embeds, layer_weights, layer_idx, kv[layer_idx], pos, **inputs
         )  # sharding: (batch, seq, None)
 
+    hidden_states = rms_norm(
+        input_embeds,
+        weights["model.norm.weight"],
+        config.rms_norm_eps,
+    )  # (batch, seq, None)
+
+    return (hidden_states, kv) if return_kv else hidden_states
+
+
+def unembed(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    hidden_states: Float[Array, "B T D"],
+) -> Float[Array, "B T V"]:
+    rules = config.sharding_rules
     out_embed = (
         weights["model.embed_tokens.weight"]
         if config.tie_word_embeddings
         else weights["lm_head.weight"]
     )
-    input_ids = rms_norm(
-        input_ids, weights["model.norm.weight"], config.rms_norm_eps
-    )  # (batch, "seq", "None")
 
     # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, vocab)
     # If TP is enabled, keep the vocabulary dimension sharded so we don't
@@ -311,13 +329,13 @@ def forward(
 
     logits = einsum(
         "btd,vd-> btv",
-        input_ids,
+        hidden_states,
         out_embed,
         out_sharding=logical_to_physical(loss_sharding, rules),
         preferred_element_type=jnp.float32,
     )
 
-    return (logits, kv) if return_kv else logits
+    return logits
 
 
 def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
@@ -412,6 +430,8 @@ def load(
     return Model(
         config=cfg,
         weights=weights,
+        embed=partial(embed_tokens, cfg),
         forward=partial(forward, cfg),
+        unembed=partial(unembed, cfg),
         tokenizer=tokenizer,
     )

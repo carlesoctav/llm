@@ -107,6 +107,53 @@ class IterDatasetWithInputSpec(IterDataset[_T]):
         )
 
 
+class _ShardedIterDataset(IterDataset[_T]):
+    """Shard a Grain IterDataset by taking every Nth element.
+
+    This is mainly intended for simple multi-host dataloading when a dataset does
+    not provide a native `.shard(...)` method.
+    """
+
+    def __init__(self, parent: IterDataset[_T], *, num_shards: int, index: int):
+        super().__init__(parent)
+        if num_shards <= 0:
+            raise ValueError("num_shards must be positive")
+        if index < 0 or index >= num_shards:
+            raise ValueError("index must be in [0, num_shards)")
+        self._num_shards = num_shards
+        self._index = index
+
+    def __iter__(self) -> DatasetIterator[_T]:
+        parent_iter = self._parent.__iter__()
+        shard_index = self._index
+        num_shards = self._num_shards
+
+        class _Iterator(DatasetIterator[_T]):
+            def __init__(self, parent_it: DatasetIterator[_T]):
+                super().__init__(parent_it)
+                self._counter = 0
+
+            def __next__(self) -> _T:
+                while True:
+                    item = next(self._parent)
+                    counter = self._counter
+                    self._counter = counter + 1
+                    if counter % num_shards == shard_index:
+                        return item
+
+            def get_state(self):
+                return {
+                    "parent_state": self._parent.get_state(),
+                    "counter": self._counter,
+                }
+
+            def set_state(self, state):
+                self._parent.set_state(state["parent_state"])
+                self._counter = state["counter"]
+
+        return _Iterator(parent_iter)
+
+
 def make_dataloader(
     datasets: Sequence[IterDataset | MapDataset],
     transforms: Sequence[
@@ -135,6 +182,8 @@ def make_dataloader(
     if dataloading_host_count is None:
         dataloading_host_count = jax.process_count()
 
+    transforms = tuple(transforms or ())
+
     if dataloading_host_count <= 0:
         raise ValueError("dataloading_host_count must be positive")
     if global_batch_size % dataloading_host_count != 0:
@@ -155,27 +204,51 @@ def make_dataloader(
     )
 
     for ds in datasets:
-        if not transforms:
-            raise ValueError("No operations provided for dataset preparation")
+        if isinstance(ds, IterableDataset):
+            ds = HuggingFaceSourceIterDataset(ds)
+        elif isinstance(ds, Dataset):
+            ds = HuggingFaceSourceMapDataset(ds)
 
         if dataloading_host_count > 1 and is_not_sharded:
-            ds = ds.shard(
-                num_shards=dataloading_host_count,
-                index=dataloading_host_index,
-                contiguous=True,
-            )
+            if hasattr(ds, "shard"):
+                ds = ds.shard(
+                    num_shards=dataloading_host_count,
+                    index=dataloading_host_index,
+                    contiguous=True,
+                )
+            elif isinstance(ds, grain.MapDataset):
+                length = len(ds)
+                start = (length * dataloading_host_index) // dataloading_host_count
+                end = (length * (dataloading_host_index + 1)) // dataloading_host_count
+                ds = ds.slice(slice(start, end))
+            elif isinstance(ds, grain.IterDataset):
+                ds = _ShardedIterDataset(
+                    ds,
+                    num_shards=dataloading_host_count,
+                    index=dataloading_host_index,
+                )
+            else:
+                raise TypeError(f"Dataset sharding unsupported for type {type(ds)}")
 
         if shuffle:
-            if isinstance(ds, HuggingFaceSourceMapDataset):
-                warnings.warn(
-                    "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
-                    "If shuffling is important for your workflow, please pre-shuffle the dataset."
-                )
-                ds = ds.shuffle(seed=seed + dataloading_host_index)
-            elif isinstance(ds, HuggingFaceSourceIterDataset):
-                ds = ds.shuffle(
+            if hasattr(ds, "shuffle"):
+                try:
+                    ds = ds.shuffle(
+                        seed=seed + dataloading_host_index,
+                        buffer_size=shuffle_buffer_size,
+                    )
+                except TypeError:
+                    ds = ds.shuffle(seed=seed + dataloading_host_index)
+                if isinstance(ds, HuggingFaceSourceMapDataset):
+                    warnings.warn(
+                        "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
+                        "If shuffling is important for your workflow, please pre-shuffle the dataset."
+                    )
+            elif isinstance(ds, grain.IterDataset):
+                ds = grain.experimental.WindowShuffleIterDataset(
+                    ds,
+                    window_size=shuffle_buffer_size,
                     seed=seed + dataloading_host_index,
-                    buffer_size=shuffle_buffer_size,
                 )
             else:
                 raise TypeError(
@@ -183,10 +256,10 @@ def make_dataloader(
                 )
 
         if num_epochs is not None:
-            if isinstance(ds, HuggingFaceSourceMapDataset):
+            if hasattr(ds, "repeat"):
                 ds = ds.repeat(num_epochs)
-            elif isinstance(ds, HuggingFaceSourceIterDataset):
-                ds = ds.repeat(num_epochs)
+            elif isinstance(ds, grain.IterDataset):
+                ds = grain.experimental.RepeatIterDataset(ds, num_epochs=num_epochs)
             else:
                 raise TypeError(
                     f"Repeat requested but unsupported for dataset type {type(ds)}"

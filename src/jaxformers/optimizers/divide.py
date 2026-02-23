@@ -13,7 +13,7 @@ class DivideByState(NamedTuple):
 def divide_every(
     every_k: int = 1,
     *,
-    denom_key: str = "count",
+    denom_key: str = "token_count",
     eps: float = 1e-8,
 ) -> optax.GradientTransformationExtraArgs:
     """Divide updates by an accumulated scalar denominator.
@@ -23,7 +23,8 @@ def divide_every(
     across the k microbatches.
 
     Requirements:
-    - Pass `denom_key` as an extra kwarg to `tx.update(...)` every microstep.
+    - Pass `denom_key` (default: "token_count") as an extra kwarg to
+      `tx.update(...)` every microstep.
     - Use the same `every_k` here as in `optax.apply_every(every_k)` so the
       emit/reset boundaries stay aligned.
     """

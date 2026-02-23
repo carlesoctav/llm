@@ -13,6 +13,7 @@ import orbax.checkpoint as ocp
 import quax._core as qc
 import sws
 from jax.experimental.rnn import PRNGKeyArray
+from jax.sharding import PartitionSpec, reshard
 from rich.themes import DEFAULT
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -23,6 +24,10 @@ from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import loraify
+from jaxformers.kernels.pallas.fused_cross_entropy_loss import (
+    fused_cross_entropy_loss_and_logsumexp_penalty,
+    infer_block_sizes,
+)
 from jaxformers.modeling_utils import Model
 from jaxformers.optimizer_utils import (
     find_grad_norm,
@@ -88,6 +93,8 @@ def get_config():
 
     config.lr_scheduler_name = None
     config.learning_rate = 1e-5
+
+    config.loss_implementation = "xla"
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0
@@ -179,7 +186,9 @@ def load_dataset(config: sws.FinalConfig, data_name: str):
     dataset_module = importlib.import_module(f"jaxformers.data.{data_name}")
 
     train_dataset = dataset_module.load(config.data.load_kwargs)
-    transforms = ntp_transforms(**config.data.transforms.to_dict())
+    transforms = None
+    if data_name != "dummy":
+        transforms = ntp_transforms(**config.data.transforms.to_dict())
     train_ds = make_dataloader(
         train_dataset, transforms, **config.train_loader.to_dict()
     )
@@ -198,19 +207,134 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
 
-        logits = model.forward(weights, **batch["inputs"], rngs=rngs)
-        if config.model.additional_config.remat_loss:
-            ce_loss = jax.remat(optax.softmax_cross_entropy_with_integer_labels)
-        else:
-            ce_loss = optax.softmax_cross_entropy_with_integer_labels
+        if model.embed is None or model.unembed is None:
+            raise ValueError(
+                "Model must define `embed` and `unembed` callables to train NTP."
+            )
 
-        loss = ce_loss(logits, batch["labels"])  # [b,t]
+        forward_dtype_cfg = getattr(config, "forward_dtype", jnp.float32)
+        forward_dtype = (
+            forward_dtype_cfg()
+            if callable(forward_dtype_cfg) and not isinstance(forward_dtype_cfg, type)
+            else forward_dtype_cfg
+        )
+        input_ids = batch["inputs"]["input_ids"]
+        input_embeds = model.embed(
+            weights=weights,
+            input_ids=input_ids,
+            dtype=forward_dtype,
+        )
+
+        forward_inputs = dict(batch["inputs"])
+        forward_inputs.pop("input_ids", None)
+        hidden_states = model.forward(
+            weights=weights,
+            input_embeds=input_embeds,
+            rngs=rngs,
+            **forward_inputs,
+        )
+        # Sequence parallelism may shard the token dimension over TP; the fused
+        # loss path expects the token batch dimension to not share mesh axes with
+        # the vocabulary dimension.
+        hidden_states = reshard(hidden_states, PartitionSpec(None, None, None))
+
+        loss_implementation = str(getattr(config, "loss_implementation", "xla"))
+        impl_map = {
+            "reference": "reference",
+            "xla": "xla",
+            "tpu_pallas": "pallas_tpu",
+            "pallas_tpu": "pallas_tpu",
+        }
+        if loss_implementation not in impl_map:
+            raise ValueError(
+                "config.loss_implementation must be one of "
+                f"{sorted(impl_map.keys())}, got {loss_implementation!r}."
+            )
+        impl = impl_map[loss_implementation]
+
+        attention_mask = batch["inputs"]["attention_mask"].astype(jnp.float32)
         if "assistant_masks" in batch["inputs"]:
-            count = jnp.sum(batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
-            loss = jnp.sum(loss * batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
+            weight = attention_mask * batch["inputs"]["assistant_masks"].astype(
+                jnp.float32
+            )
         else:
-            count = jnp.sum(batch["inputs"]["attention_mask"])
-            loss = jnp.sum(loss * batch["inputs"]["attention_mask"])
+            weight = attention_mask
+
+        count = jnp.sum(weight)
+
+        out_embed = (
+            weights["model.embed_tokens.weight"]
+            if getattr(model.config, "tie_word_embeddings", True)
+            or "lm_head.weight" not in weights
+            else weights["lm_head.weight"]
+        )
+
+        x_flat = hidden_states.reshape((-1, hidden_states.shape[-1]))
+        y_flat = batch["labels"].reshape((-1,)).astype(jnp.int32)
+        w = jnp.swapaxes(out_embed, 0, 1)  # [H, V]
+        w = reshard(w, PartitionSpec(None, None))
+        weight_flat = weight.reshape((-1,))
+
+        logit_soft_cap = getattr(model.config, "final_logit_softcapping", None)
+
+        if impl == "pallas_tpu":
+            block_sizes = infer_block_sizes(
+                x_flat.shape[0], x_flat.shape[1], w.shape[1], dtype=jnp.float32
+            )
+            pad = (-x_flat.shape[0]) % block_sizes.b_block_size
+            if pad:
+                x_flat = jnp.pad(x_flat, ((0, pad), (0, 0)))
+                y_flat = jnp.pad(y_flat, ((0, pad),), constant_values=0)
+                weight_flat = jnp.pad(weight_flat, ((0, pad),), constant_values=0.0)
+
+            def ce_loss_impl(x, labels, w, weight):
+                return fused_cross_entropy_loss_and_logsumexp_penalty(
+                    x,
+                    labels,
+                    w,
+                    reduction="sum",
+                    weight=weight,
+                    logsumexp_weight=0.0,
+                    dtype=jnp.float32,
+                    logit_soft_cap=logit_soft_cap,
+                    implementation=impl,
+                    block_sizes=block_sizes,
+                )
+
+            mesh = jax.sharding.get_abstract_mesh()
+            if mesh is not None and not getattr(mesh, "empty", True):
+                ce_loss = jax.shard_map(
+                    ce_loss_impl,
+                    mesh=mesh,
+                    in_specs=(
+                        PartitionSpec(None, None),
+                        PartitionSpec(None),
+                        PartitionSpec(None, None),
+                        PartitionSpec(None),
+                    ),
+                    out_specs=PartitionSpec(),
+                    check_vma=False,
+                )
+            else:
+                ce_loss = ce_loss_impl
+        else:
+            def ce_loss(x, labels, w, weight):
+                return fused_cross_entropy_loss_and_logsumexp_penalty(
+                    x,
+                    labels,
+                    w,
+                    reduction="sum",
+                    weight=weight,
+                    logsumexp_weight=0.0,
+                    dtype=jnp.float32,
+                    logit_soft_cap=logit_soft_cap,
+                    implementation=impl,
+                )
+
+        if config.model.additional_config.remat_loss:
+            ce_loss = jax.remat(ce_loss)
+
+        loss = ce_loss(x_flat, y_flat, w, weight_flat)
         aux = {"loss": (loss, count), "token_count": count}
 
         return loss, aux
@@ -225,7 +349,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     token_count = aux["token_count"]
 
     updates, nst = model.tx.update(
-        grad, model.opt_state, model.weights, count=token_count
+        grad, model.opt_state, model.weights, token_count=token_count
     )
 
     nst = (nst[0], nst[1]) + jtu.tree_map(

@@ -19,6 +19,36 @@ class AttentionImpl(Protocol):
     ):
         ...
 
+
+def _normalize_mask(
+    mask: Bool[Array, "..."] | None,
+    batch_size: int,
+    num_heads: int,
+    q_length: int,
+    kv_length: int,
+) -> Bool[Array, "B N T S"] | None:
+    if mask is None:
+        return None
+    if mask.ndim == 3:
+        mask = mask[:, None, :, :]
+    if mask.ndim != 4:
+        raise ValueError(f"mask must be rank-3 or rank-4, got shape {mask.shape}.")
+    if mask.shape[0] != batch_size or mask.shape[2] != q_length or mask.shape[3] != kv_length:
+        raise ValueError(
+            "mask shape mismatch. "
+            f"Expected (B, #N, T, S)=({batch_size}, *, {q_length}, {kv_length}), got {mask.shape}."
+        )
+
+    mask = mask.astype(jnp.bool_)
+    if mask.shape[1] == num_heads:
+        return mask
+    if mask.shape[1] == 1:
+        return jnp.broadcast_to(mask, (batch_size, num_heads, q_length, kv_length))
+    raise ValueError(
+        "mask head dimension mismatch. "
+        f"Expected #N=1 or #N={num_heads}, got {mask.shape[1]}."
+    )
+
 def eager_dot_product_attention(
     query: Float[Array, "B T N H"],
     key: Float[Array, "B S K H"],
@@ -66,6 +96,7 @@ def eager_dot_product_attention(
         scores = scores + bias
 
     if mask is not None:
+        mask = _normalize_mask(mask, B, N, T, S)
         neg_inf = jnp.array(jnp.finfo(scores.dtype).min, dtype=scores.dtype)
         scores = jnp.where(mask, scores, neg_inf)
 
@@ -89,7 +120,7 @@ def eager_dot_product_attention(
 class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
-        "sdpa": partial(tokamax.dot_product_attention, precision = jax.lax.Precision.HIGHEST),
+        "sdpa": eager_dot_product_attention,
         "xla_chunked": partial(
             tokamax.dot_product_attention,
             implementation="xla_chunked",

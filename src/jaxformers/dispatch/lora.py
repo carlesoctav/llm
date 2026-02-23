@@ -44,6 +44,44 @@ class LoraArray(quax.ArrayValue):
     alpha: float = eqx.field(static=True)
     allow_materialise: bool = eqx.field(static=True)
 
+    def __init__(
+        self,
+        _w: Shaped[Array, "*batch x y"],
+        a: Shaped[Array, "*batch x z"] | None = None,
+        b: Shaped[Array, "*batch z y"] | None = None,
+        *,
+        rank: int | None = None,
+        alpha: float,
+        key: PRNGKeyArray | None = None,
+        scale: float = 0.01,
+        allow_materialise: bool = False,
+    ):
+        if a is None and b is None:
+            if rank is None or key is None:
+                raise TypeError(
+                    "LoraArray(..., rank=..., key=..., alpha=...) is required when a/b are not provided."
+                )
+            if _w.ndim != 2:
+                raise ValueError(
+                    "rank/key construction currently supports only rank-2 weights; "
+                    f"got shape {_w.shape}."
+                )
+            x_dim, y_dim = _w.shape
+            a = jr.normal(key, (x_dim, int(rank)), dtype=_w.dtype) * jnp.asarray(
+                scale, dtype=_w.dtype
+            )
+            b = jnp.zeros((int(rank), y_dim), dtype=_w.dtype)
+        elif a is None or b is None:
+            raise TypeError("Either provide both `a` and `b`, or neither.")
+        elif rank is not None or key is not None:
+            raise TypeError("Do not pass `rank`/`key` when providing explicit `a` and `b`.")
+
+        object.__setattr__(self, "_w", _w)
+        object.__setattr__(self, "a", a)
+        object.__setattr__(self, "b", b)
+        object.__setattr__(self, "alpha", float(alpha))
+        object.__setattr__(self, "allow_materialise", bool(allow_materialise))
+
     @property
     def w(self):
         return lax.stop_gradient(self._w)

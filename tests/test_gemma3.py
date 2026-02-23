@@ -58,7 +58,20 @@ def test_gemma3_1b_it_cpu():
                 .cpu()
                 .numpy()
             )
-        jax_logits = jax_model.forward(jax_model.weights, input_ids=input_ids)
+        input_ids_jax = jnp.asarray(input_ids)
+        input_embeds = jax_model.embed(
+            weights=jax_model.weights,
+            input_ids=input_ids_jax,
+            dtype=jnp.float32,
+        )
+        hidden_states = jax_model.forward(
+            weights=jax_model.weights,
+            input_embeds=input_embeds,
+        )
+        jax_logits = jax_model.unembed(
+            weights=jax_model.weights,
+            hidden_states=hidden_states,
+        )
         np.testing.assert_allclose(jax_logits, hf_logits, atol=1e-2, rtol=1e-2)
         for_batching.append(input_ids)
 
@@ -74,7 +87,22 @@ def test_gemma3_1b_it_cpu():
             .numpy()
         )
 
-    jax_logits = jax_model.forward(jax_model.weights, input_ids=input_ids , attention_mask = attention_mask)
+    input_ids_jax = jnp.asarray(input_ids)
+    attention_mask_jax = jnp.asarray(attention_mask)
+    input_embeds = jax_model.embed(
+        weights=jax_model.weights,
+        input_ids=input_ids_jax,
+        dtype=jnp.float32,
+    )
+    hidden_states = jax_model.forward(
+        weights=jax_model.weights,
+        input_embeds=input_embeds,
+        attention_mask=attention_mask_jax,
+    )
+    jax_logits = jax_model.unembed(
+        weights=jax_model.weights,
+        hidden_states=hidden_states,
+    )
     np.testing.assert_allclose(jax_logits, hf_logits, atol=1e-2, rtol=1e-2)
 
 
@@ -93,7 +121,19 @@ def test_gemma3_1b_it_tpu_tp():
         param_dtype=jnp.float32,
     )
     jax_token = jnp.ones((1, 13), dtype=jnp.int32)
-    jax_logits = jax_model.forward(jax_token, weights=jax_model.weights)
+    input_embeds = jax_model.embed(
+        weights=jax_model.weights,
+        input_ids=jax_token,
+        dtype=jnp.float32,
+    )
+    hidden_states = jax_model.forward(
+        weights=jax_model.weights,
+        input_embeds=input_embeds,
+    )
+    jax_logits = jax_model.unembed(
+        weights=jax_model.weights,
+        hidden_states=hidden_states,
+    )
 
     assert jax_logits.ndim == 3
     assert jax_logits.shape == (1, 13, jax_model.config.vocab_size)

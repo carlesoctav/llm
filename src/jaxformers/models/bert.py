@@ -449,6 +449,8 @@ def load(
     return Model(
         config=cfg,
         weights=weights,
+        embed=None,
         forward=partial(forward, cfg),
+        unembed=None,
         tokenizer=tokenizer,
     )

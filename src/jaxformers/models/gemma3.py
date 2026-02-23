@@ -263,23 +263,14 @@ def forward_layer(
     return x, kv
 
 
-def forward(
+def embed_tokens(
     config: Config,
     weights: PyTree[Array, "ModelWeights"],
     input_ids: Int[Array, "B T"],
-    kv: None = None,
-    pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
-    attention_mask: Int[Array, "B T"] | None = None,
-    segment_ids: Int[Array, "B T"] | None = None,
-    logits_to_keep: int = 0,
-    **inputs,
-):
+) -> Float[Array, "B T D"]:
     rules = config.sharding_rules
-    model_prefix = "model"
-    embed_key = f"{model_prefix}.embed_tokens.weight"
-    final_norm_key = f"{model_prefix}.norm.weight"
-    lm_head_key = "lm_head.weight"
+    embed_key = "model.embed_tokens.weight"
 
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     x = (
@@ -289,6 +280,25 @@ def forward(
         .astype(dtype)
     )
     x *= jnp.sqrt(jnp.array(config.hidden_size, dtype=dtype))
+    return x
+
+
+def forward(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    input_embeds: Float[Array, "B T D"],
+    kv: None = None,
+    pos: int = 0,
+    attention_mask: Int[Array, "B T"] | None = None,
+    segment_ids: Int[Array, "B T"] | None = None,
+    logits_to_keep: int = 0,
+    **inputs,
+):
+    rules = config.sharding_rules
+    model_prefix = "model"
+    final_norm_key = f"{model_prefix}.norm.weight"
+
+    x = input_embeds
 
     return_kv = kv is not None
     if kv is None:
@@ -353,14 +363,28 @@ def forward(
             **inputs,
         )
 
-    x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
+    hidden_states = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
+
+    if logits_to_keep:
+        hidden_states = hidden_states[:, -int(logits_to_keep) :, :]
+
+    return (hidden_states, kv) if return_kv else hidden_states
+
+
+def unembed(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    hidden_states: Float[Array, "B T D"],
+) -> Float[Array, "B T V"]:
+    rules = config.sharding_rules
+    model_prefix = "model"
+    embed_key = f"{model_prefix}.embed_tokens.weight"
+    lm_head_key = "lm_head.weight"
+
     if getattr(config, "tie_word_embeddings", True) or lm_head_key not in weights:
         out_embed = weights[embed_key]
     else:
         out_embed = weights[lm_head_key]
-
-    if logits_to_keep:
-        x = x[:, -int(logits_to_keep) :, :]
 
     loss_sharding = (
         ("batch", "context", "model")
@@ -369,17 +393,17 @@ def forward(
     )
     logits = einsum(
         "btd,vd->btv",
-        x,
+        hidden_states,
         out_embed,
         out_sharding=logical_to_physical(loss_sharding, rules),
-        preferred_element_type=x.dtype,
+        preferred_element_type=hidden_states.dtype,
     )
 
     softcap = getattr(config, "final_logit_softcapping", None)
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
 
-    return (logits, kv) if return_kv else logits
+    return logits
 
 
 def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
@@ -470,6 +494,8 @@ def load(
     return Model(
         config=cfg,
         weights=weights,
+        embed=partial(embed_tokens, cfg),
         forward=partial(forward, cfg),
+        unembed=partial(unembed, cfg),
         tokenizer=tokenizer,
     )

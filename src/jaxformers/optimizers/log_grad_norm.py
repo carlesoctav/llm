@@ -5,6 +5,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
+import jax.tree_util as jtu
 
 
 class LogGradNormState(NamedTuple):
@@ -35,3 +36,14 @@ def log_grad_norm() -> optax.GradientTransformation:
         return updates, LogGradNormState(grad_norm=grad_norm_next)
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+def get_logged_grad_norm(opt_state):
+    found: list[jax.Array] = []
+
+    def _maybe_collect(leaf):
+        if isinstance(leaf, LogGradNormState):
+            found.append(leaf.grad_norm)
+
+    jtu.tree_map(_maybe_collect, opt_state, is_leaf=lambda x: isinstance(x, LogGradNormState))
+    return found[0] if found else None

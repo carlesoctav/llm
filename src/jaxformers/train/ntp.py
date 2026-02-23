@@ -64,8 +64,9 @@ def get_config():
 
     config.model_name = "qwen3"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
-    config.model.model_id = "Qwen/Qwen3-4B-Instruct-2507"
-    config.model.additional_config.gradient_checkpointing = True
+    config.model.model_id = "Qwen/Qwen3-0.6B"
+    config.model.additional_config.remat_layer = True
+    config.model.additional_config.remat_loss = True
     config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.loss_parallel = False
@@ -95,19 +96,22 @@ def get_config():
     config.data_name = "huggingface"
     config.data.load_kwargs = [
         {
-            "path": "carlesoctav/skripsi_UI_membership_30K",
+            "path": "allenai/Dolci-Instruct-SFT",
             # "name": "GovReport",
             "split": "train",
-            # "streaming": True,
+            "streaming": True,
         }
     ]
-    config.data.transforms.column = "id_title"
-    config.data.transforms.max_length = 512
+    config.data.transforms.column = "messages"
+    config.data.transforms.max_length = 8192
     config.data.transforms.packing = False
     config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
         config.model.model_id
     )
     config.data.transforms.is_tokenized = False
+    config.data.transforms.is_chat = True
+    config.data.transforms.chat_template_path = None
+    config.data.transforms.assistant_loss = True
     config.data.transforms.packing_bins = 64
 
     # total batch size is global_batch_size * config.optimizer.grad_accum
@@ -195,10 +199,18 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
 
         logits = model.forward(weights, **batch["inputs"], rngs=rngs)
-        ce_loss = jax.remat(optax.softmax_cross_entropy_with_integer_labels)
+        if config.model.additional_config.remat_loss:
+            ce_loss = jax.remat(optax.softmax_cross_entropy_with_integer_labels)
+        else:
+            ce_loss = optax.softmax_cross_entropy_with_integer_labels
+
         loss = ce_loss(logits, batch["labels"])  # [b,t]
-        count = jnp.sum(batch["inputs"]["attention_mask"])
-        loss = jnp.sum(loss * batch["inputs"]["attention_mask"])
+        if "assistant_masks" in batch["inputs"]:
+            count = jnp.sum(batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
+            loss = jnp.sum(loss * batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
+        else:
+            count = jnp.sum(batch["inputs"]["attention_mask"])
+            loss = jnp.sum(loss * batch["inputs"]["attention_mask"])
         aux = {"loss": (loss, count), "token_count": count}
 
         return loss, aux
@@ -284,6 +296,7 @@ def train(
 
     ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
+    warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
     if jax.process_index() == 0:
@@ -304,6 +317,16 @@ def train(
 
             try:
                 batch = next(train_iterator)
+                if warn_assitant_loss and "assistant_masks" in batch["inputs"] :
+                    check_ast_token = np.any(batch["inputs"]["assistant_masks"])
+                    if not check_ast_token and jax.process_index() == 0:
+                        raise RuntimeError(
+                            "assistant_loss=True was requested but no assistant token was found. "
+                            "This can occur if the chat template does not distinguish assistant vs user tokens "
+                            "or if truncation (max_length) removed the assistant token. "
+                            "please fix this issue before proceeding"
+                        )
+                    warn_assitant_loss = False
             except StopIteration:
                 if jax.process_index() == 0:
                     print("dataloader is exhausted")

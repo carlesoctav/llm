@@ -113,7 +113,7 @@ def get_rope_theta(cfg: Config, attention_type: str) -> float:
     return float(attn_cfg["rope_theta"])
 
 
-def make_mask_mapping(config, input_embeds, attention_mask=None, segment_ids=None):
+def make_mask_mapping(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
     attn_impl = config.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
         return {
@@ -336,7 +336,7 @@ def forward(
             "down_proj_bias": weights.get(f"{prefix}mlp.down_proj.bias"),
         }
 
-        if config.additional_config["gradient_checkpointing"]:
+        if config.additional_config["remat_layer"]:
             fwd = jax.remat(partial(forward_layer, config))
         else:
             fwd = partial(forward_layer, config)

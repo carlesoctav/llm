@@ -1,3 +1,4 @@
+import os
 import dataclasses as dc
 import typing as tp
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ class TokenizeText(grain_transforms.Map):
     column: str
     tokenizer: PreTrainedTokenizerBase
     packing: bool
+    is_chat: bool
+    chat_template: str | None = None
+    assistant_loss: bool =  False,
     max_length: int | None = None
 
     def map(self, features: dict[str, tp.Any]) -> dict[str, Array]:
@@ -47,17 +51,27 @@ class TokenizeText(grain_transforms.Map):
             raise KeyError(f"Column {self.column!r} not found in element")
         text = features[self.column]
         output = {}
-        encoded = self.tokenizer(
-            text,
-            truncation=self.max_length is not None,
-            padding="max_length" if not self.packing else "do_not_pad",
-            max_length=self.max_length,
-            return_tensors="np",
-            return_attention_mask=True,
-            return_token_type_ids=False,
-        )
-        output["input_ids"] = encoded["input_ids"].squeeze(0)[:-1]
-        output["attention_mask"] = encoded["attention_mask"].squeeze(0)[:-1]
+        if self.is_chat:
+            encoded = self.tokenizer.apply_chat_template(
+                text,
+                truncation=self.max_length is not None,
+                padding="max_length" if not self.packing else "do_not_pad",
+                max_length=self.max_length + 1,
+                chat_template = self.chat_template,
+                return_tensors="np",
+                return_assistant_tokens_mask= self.assistant_loss,
+            )
+        else:
+            encoded = self.tokenizer(
+                text,
+                truncation=self.max_length is not None,
+                padding="max_length" if not self.packing else "do_not_pad",
+                max_length=self.max_length + 1,
+                return_tensors="np",
+                return_attention_mask=True,
+                return_token_type_ids=False,
+            )
+        output = {k:v.squeeze(0)[:-1] for k, v in encoded.items()}
         output["labels"] = encoded["input_ids"].squeeze(0)[1:]
         return output
 
@@ -76,6 +90,9 @@ class NestInputs(grain_transforms.Map):
         }
         if "input_ids_segment_ids" in features:
             inputs["segment_ids"] = features["input_ids_segment_ids"]
+        if "assistant_masks" in features:
+            inputs["assistant_masks"] = features["assistant_masks"]
+
         return {"inputs": inputs, "labels": features["labels"]}
 
 
@@ -84,18 +101,36 @@ def transforms(
     max_length: int,
     tokenizer: PreTrainedTokenizerBase,
     is_tokenized: bool,
+    is_chat: bool = False,
+    chat_template_path: str | None = None,
+    assistant_loss: bool = False,
     packing: bool = False,
     packing_bins: int | None = None,
 ) -> list[grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms]:
     """Build the list of transforms required for next-token prediction."""
 
     transforms = []
+    chat_template = None
+    if chat_template_path:
+        with open(chat_template_path) as f:
+            chat_template = f.read()
+
+    if chat_template:
+        preview = chat_template.replace("\n", "\\n")
+        preview_short = (preview[:120] + "...") if len(preview) > 120 else preview
+        print(f"Using custom chat_template (preview): '{preview_short}'")
+    else:
+        print("No custom chat_template provided; using default chat formatting.")
+
     if not is_tokenized:
         transforms.append(
             TokenizeText(
                 column=column,
                 tokenizer=tokenizer,
-                max_length=max_length + 1,
+                max_length=max_length,
+                is_chat = is_chat,
+                chat_template = chat_template,
+                assistant_loss = assistant_loss,
                 packing=packing,
             )
         )
@@ -104,6 +139,7 @@ def transforms(
             "input_ids": max_length,
             "attention_mask": max_length,
             "labels": max_length,
+            "assistant_mask": max_length,
         }
         transforms.append(
             ApplyFirstFitPacking(
@@ -111,7 +147,7 @@ def transforms(
                 num_packing_bins=packing_bins,
                 # These are redundant with `input_ids_segment_ids` /
                 # `input_ids_positions` and just bloat each batch.
-                meta_features=("attention_mask", "labels"),
+                meta_features=("attention_mask", "labels", "assistant_masks"),
             )
         )
     transforms.append(NestInputs())

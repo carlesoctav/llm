@@ -10,10 +10,6 @@ from jaxtyping import Array, Bool, Float, PyTree
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
 
-
-eqx.Module
-
-
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 

@@ -223,7 +223,7 @@ def forward_layer(
     return x, kv
 
 
-def make_mask(config, input_ids, attention_mask=None, segment_ids=None):
+def make_mask(config, input_ids, attention_mask=None, segment_ids=None, **kwargs):
     attn_implementation = config.additional_config["attn_implementation"]
     if attn_implementation not in ATTENTION_MASK_INTERFACE:
         return None
@@ -282,7 +282,7 @@ def forward(
             "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
         }
 
-        if config.additional_config["gradient_checkpointing"]:
+        if config.additional_config["remat_layer"]:
             fwd = jax.remat(partial(forward_layer, config))
         else:
             fwd = partial(forward_layer, config)

@@ -181,6 +181,7 @@ def make_bidirectional_mask(
     input_embeds: Float[Array, "B T D"],
     attention_mask: Bool[Array, "..."] | None = None,
     segment_ids: Int[Array, "..."] | None = None,
+    **kwargs,
 ) -> Bool[Array, "B T S"] | BlockMask | Bool[Array, "B T N S"]:
     """
     Generates a mask for bidirectional attention.

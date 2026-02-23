@@ -6,6 +6,7 @@ from jaxtyping import Bool, PyTree
 
 from .base import make_opt_base_components
 from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
+import jax
 
 
 def make(

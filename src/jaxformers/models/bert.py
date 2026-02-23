@@ -309,7 +309,7 @@ def forward(
             "ffn_ln_b": weights[f"{prefix}output.LayerNorm.bias"],
         }
 
-        if cfg.additional_config["gradient_checkpointing"]:
+        if cfg.additional_config["remat_layer"]:
             fwd = jax.remat(partial(forward_layer, cfg))
         else:
             fwd = partial(forward_layer, cfg)

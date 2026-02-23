@@ -119,6 +119,8 @@ class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
     _global_mapping = {
         "eager": make_bool_interface,
         "sdpa": make_bool_interface,
+        "xla_chunked": make_bool_interface,
+
     }
 
 

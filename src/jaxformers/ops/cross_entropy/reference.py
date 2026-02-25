@@ -13,7 +13,7 @@ from jaxformers.ops.cross_entropy.config import BlockSizes
 def cross_entropy_reference(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
-    w: Float[Array, "H V"],
+    w: Float[Array, "V H"],
     *,
     block_sizes: BlockSizes | None = None,
     dtype: jnp.dtype | None = None,
@@ -22,10 +22,9 @@ def cross_entropy_reference(
 ):
     del block_sizes  # unused for reference impl
 
-    @jax.checkpoint
     def _inner(x: jax.Array, labels: jax.Array, w: jax.Array):
         logits = einsum(
-            "bh,hv -> bv",
+            "bh,vh -> bv",
             x,
             w,
             precision=precision,

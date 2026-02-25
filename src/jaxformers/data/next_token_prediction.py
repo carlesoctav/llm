@@ -139,7 +139,7 @@ def transforms(
             "input_ids": max_length,
             "attention_mask": max_length,
             "labels": max_length,
-            "assistant_mask": max_length,
+            **({"assistant_masks": max_length} if assistant_loss else {}),
         }
         transforms.append(
             ApplyFirstFitPacking(
@@ -147,7 +147,7 @@ def transforms(
                 num_packing_bins=packing_bins,
                 # These are redundant with `input_ids_segment_ids` /
                 # `input_ids_positions` and just bloat each batch.
-                meta_features=("attention_mask", "labels", "assistant_masks"),
+                meta_features=("attention_mask", "labels") + (("assistant_masks",) if assistant_loss else ()),
             )
         )
     transforms.append(NestInputs())

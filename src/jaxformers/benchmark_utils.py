@@ -16,3 +16,11 @@ def print_compiled_memory_stats(compiled_stats):
       f"Total memory size: {total_gb:.1f} GB, Output size: {output_gb:.1f} GB, Temp size: {temp_gb:.1f} GB, "
       f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB."
   )
+
+  return {
+    "total_gb": round(total_gb, 1),
+    "output_gb": round(output_gb, 1),
+    "temp_gb": round(temp_gb, 1),
+    "argument_gb": round(argument_gb, 1),
+    "host_temp_gb": round(host_temp_gb, 1),
+  }

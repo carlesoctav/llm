@@ -1,5 +1,6 @@
 import dataclasses
 import importlib
+import sys
 import time
 from functools import partial, reduce
 from typing import Any, Callable
@@ -23,7 +24,8 @@ from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import loraify
-from jaxformers.modeling_utils import Model
+from jaxformers.modeling_utils import logical_to_physical, Model
+from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizer_utils import (
     find_grad_norm,
     find_learning_rate,
@@ -35,6 +37,34 @@ DEFAULT_REDUCED = {"loss": "mean", "token_count": "sum"}
 DEFAULT_AUX = {"loss": (0, 0), "token_count": 0}
 
 
+def _preparse_absl_flags() -> None:
+    """Avoid absl.flags crashing on this script's CLI args.
+
+    Some dependencies (e.g. `tokamax`) lazily call `absl.flags.FLAGS(sys.argv)`,
+    which raises `UnrecognizedFlagError` when our program is launched with
+    non-absl flags like `--config` (used by `sws`).
+
+    We pre-parse once with `known_only=True` so absl marks flags as parsed while
+    ignoring unknown args.
+    """
+
+    try:
+        from absl import flags
+    except Exception:
+        return
+
+    if flags.FLAGS.is_parsed():
+        return
+
+    # Ensure tokamax' absl flags are registered before parsing, if available.
+    try:
+        import tokamax._src.config as _tokamax_config  # noqa: F401
+    except Exception:
+        pass
+
+    flags.FLAGS(sys.argv, known_only=True)
+
+
 # orig = qc.Value.default
 # def dbg(prim, values, params):
 #     if any(isinstance(v, LoraArray) for v in values):
@@ -44,111 +74,110 @@ DEFAULT_AUX = {"loss": (0, 0), "token_count": 0}
 
 # qc.Value.default = staticmethod(dbg)
 #
-def get_config():
-    config = sws.Config()
+# def get_config():
+#     config = sws.Config()
 
-    config.resume = False
-    config.random_init = False
-    config.skip_eval = True
+#     config.resume = False
+#     config.random_init = False
+#     config.skip_eval = True
 
-    config.use_lora = True
-    config.random_init_lora = True
+#     config.use_lora = True
+#     config.random_init_lora = True
 
-    config.exp_name = "test1"
-    config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.exp_name}"
-    config.train_seed = 42
-    config.eval_every = None
-    config.max_train_step = 1000
-    config.forward_dtype = lambda: jnp.bfloat16
+#     config.exp_name = "test1"
+#     config.dir = "gs://carles-git-good"
+#     config.ckpt_path = lambda: f"{config.dir}/{config.exp_name}"
+#     config.train_seed = 42
+#     config.eval_every = None
+#     config.max_train_step = 1000
+#     config.forward_dtype = lambda: jnp.bfloat16
+#     config.loss_implementation = "reference"
 
-    config.model_name = "qwen3"
-    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
-    config.model.model_id = "Qwen/Qwen3-0.6B"
-    config.model.additional_config.remat_layer = True
-    config.model.additional_config.remat_loss = True
-    config.model.additional_config.attn_implementation = "sdpa"
-    config.model.additional_config.sequence_parallelism = True
-    config.model.additional_config.loss_parallel = False
+#     config.model_name = "qwen3"
+#     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4}
+#     config.model.model_id = "Qwen/Qwen3-0.6B"
+#     config.model.additional_config.remat_layer = True
+#     config.model.additional_config.attn_implementation = "sdpa"
+#     config.model.additional_config.sequence_parallelism = True
+#     config.model.additional_config.loss_parallel = False
 
-    config.model.devices = jax.devices()
-    config.model.param_dtype = lambda: jnp.bfloat16
+#     config.model.devices = jax.devices()
+#     config.model.param_dtype = lambda: jnp.bfloat16
 
-    config.lora.rank = 64
-    config.lora.alpha = 1
-    config.lora.weights_path = [
-        "*.q_proj.weight",
-        "*.k_proj.weight",
-        "*.v_proj.weight",
-        "*.o_proj.weight",
-        "*.gate_proj.weight",
-        "*.up_proj.weight",
-        "*.down_proj.weight",
-    ]
+#     # config.lora.rank = 64
+#     # config.lora.alpha = 1
+#     # config.lora.weights_path = [
+#     #     "*.q_proj.weight",
+#     #     "*.k_proj.weight",
+#     #     "*.v_proj.weight",
+#     #     "*.o_proj.weight",
+#     #     "*.gate_proj.weight",
+#     #     "*.up_proj.weight",
+#     #     "*.down_proj.weight",
+#     # ]
 
-    config.lr_scheduler_name = None
-    config.learning_rate = 1e-5
+#     config.lr_scheduler_name = None
+#     config.learning_rate = 1e-5
 
-    config.optimizer_name = "adam"
-    config.optimizer.max_grad_norm = 1.0
-    config.optimizer.grad_accum = 1
+#     config.optimizer_name = "adam"
+#     config.optimizer.max_grad_norm = 1.0
+#     config.optimizer.grad_accum = 1
 
-    config.data_name = "huggingface"
-    config.data.load_kwargs = [
-        {
-            "path": "allenai/Dolci-Instruct-SFT",
-            # "name": "GovReport",
-            "split": "train",
-            "streaming": True,
-        }
-    ]
-    config.data.transforms.column = "messages"
-    config.data.transforms.max_length = 8192
-    config.data.transforms.packing = False
-    config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
-        config.model.model_id
-    )
-    config.data.transforms.is_tokenized = False
-    config.data.transforms.is_chat = True
-    config.data.transforms.chat_template_path = None
-    config.data.transforms.assistant_loss = True
-    config.data.transforms.packing_bins = 64
+#     config.data_name = "huggingface"
+#     config.data.load_kwargs = [
+#         {
+#             "path": "allenai/Dolci-Instruct-SFT",
+#             "split": "train",
+#             "streaming": False,
+#         }
+#     ]
+#     config.data.transforms.column = "messages"
+#     config.data.transforms.max_length = 8192
+#     config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
+#         config.model.model_id
+#     )
+#     config.data.transforms.assistant_loss = False
+#     config.data.transforms.is_tokenized = False
+#     config.data.transforms.is_chat = True
+#     config.data.transforms.chat_template_path = None
+#     config.data.transforms.packing = True
+#     config.data.transforms.packing_bins = 64
 
-    # total batch size is global_batch_size * config.optimizer.grad_accum
-    config.train_loader.global_batch_size = 8
-    config.train_loader.seed = 42
+#     # total batch size is global_batch_size * config.optimizer.grad_accum
+#     config.train_loader.global_batch_size = 8
+#     config.train_loader.seed = 42
 
-    # config.train_loader.pspec =
-    # config.train_loader.mesh =
-    # config.train_loader.num_epochs =
-    # config.train_loader.dataset_weights =
-    # config.train_loader.dataloading_host_index =
-    # config.train_loader.dataloading_host_count =
-    # config.train_loader.is_not_sharded =
-    # config.train_loader.read_num_threads =
-    # config.train_loader.read_prefetch_buffer_size =
-    # config.train_loader.shuffle =
-    # config.train_loader.shuffle_buffer_size =
-    # config.train_loader.worker_count =
-    # config.train_loader.worker_buffer_size =
-    # config.train_loader.drop_remainder =
+#     # config.train_loader.pspec =
+#     # config.train_loader.mesh =
+#     # config.train_loader.num_epochs =
+#     # config.train_loader.dataset_weights =
+#     # config.train_loader.dataloading_host_index =
+#     # config.train_loader.dataloading_host_count =
+#     # config.train_loader.is_not_sharded =
+#     # config.train_loader.read_num_threads =
+#     # config.train_loader.read_prefetch_buffer_size =
+#     # config.train_loader.shuffle =
+#     # config.train_loader.shuffle_buffer_size =
+#     # config.train_loader.worker_count =
+#     # config.train_loader.worker_buffer_size =
+#     # config.train_loader.drop_remainder =
 
-    config.log.grad_norm = True
-    config.log.learning_rate = True
+#     config.log.grad_norm = True
+#     config.log.learning_rate = True
 
-    # see orbax checkpointmanager options
-    config.checkpoint_options.save_interval_steps = 100
-    config.checkpoint_options.max_to_keep = 1
+#     # see orbax checkpointmanager options
+#     config.checkpoint_options.save_interval_steps = 10000
+#     config.checkpoint_options.max_to_keep = 1
 
-    config.wandb.project = "test-training"
-    config.wandb.name = lambda: config.exp_name
-    # config.wandb.entity =
-    # config.wandb.dir =
-    # config.wandb.id =
-    # config.wandb.notes =
-    # config.wandb.tags =
+#     config.wandb.project = "test-training"
+#     config.wandb.name = lambda: config.exp_name
+#     # config.wandb.entity =
+#     # config.wandb.dir =
+#     # config.wandb.id =
+#     # config.wandb.notes =
+#     # config.wandb.tags =
 
-    return config
+#     return config
 
 
 def load_model(config: sws.FinalConfig, name: str):
@@ -198,19 +227,38 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
 
-        logits = model.forward(weights, **batch["inputs"], rngs=rngs)
-        if config.model.additional_config.remat_loss:
-            ce_loss = jax.remat(optax.softmax_cross_entropy_with_integer_labels)
-        else:
-            ce_loss = optax.softmax_cross_entropy_with_integer_labels
-
-        loss = ce_loss(logits, batch["labels"])  # [b,t]
+        hidden_states = model.forward(weights, **batch["inputs"], rngs=rngs)
+        hidden_states = hidden_states.reshape(
+            -1,
+            hidden_states.shape[-1],
+            out_sharding=logical_to_physical(
+                ("batch", "context", "none"), model.config.sharding_rules
+            ),
+        )
+        labels = batch["labels"].reshape(-1)
         if "assistant_masks" in batch["inputs"]:
-            count = jnp.sum(batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
-            loss = jnp.sum(loss * batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"])
+            count = jnp.sum(
+                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+            )
+            mask = (
+                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+            ).reshape(-1)
         else:
             count = jnp.sum(batch["inputs"]["attention_mask"])
-            loss = jnp.sum(loss * batch["inputs"]["attention_mask"])
+            mask = (batch["inputs"]["attention_mask"]).reshape(-1)
+
+        loss = cross_entropy_loss(
+            hidden_states,
+            labels,
+            jax.reshard(
+                weights[model.lm_head_key],
+                logical_to_physical(("none", "none"), model.config.sharding_rules),
+            ),
+            reduction="sum",
+            weight=mask,
+            implementation=config.loss_implementation or None,
+        )
+
         aux = {"loss": (loss, count), "token_count": count}
 
         return loss, aux
@@ -296,6 +344,8 @@ def train(
 
     ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
+    to_log_later = {}
+    program_wall_t0 = None
     warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
@@ -317,7 +367,7 @@ def train(
 
             try:
                 batch = next(train_iterator)
-                if warn_assitant_loss and "assistant_masks" in batch["inputs"] :
+                if warn_assitant_loss and "assistant_masks" in batch["inputs"]:
                     check_ast_token = np.any(batch["inputs"]["assistant_masks"])
                     if not check_ast_token and jax.process_index() == 0:
                         raise RuntimeError(
@@ -342,11 +392,14 @@ def train(
                         .compile()
                     )
                     first_compile_time = time.monotonic() - start_time
+
+                    program_wall_t0 = time.monotonic()
                     model, aux = train_step_fn(model, batch, loop_rngs)
                     if jax.process_index() == 0:
                         print("compile time: ", first_compile_time)
                         compiled_analysis = train_step_fn.memory_analysis()
-                        print_compiled_memory_stats(compiled_analysis)
+                        memory_stats = print_compiled_memory_stats(compiled_analysis)
+                        to_log_later.update(memory_stats)
                     first_step = False
             else:
                 with (
@@ -386,14 +439,20 @@ def train(
             mini_step = (mini_step + 1) % config.optimizer.grad_accum
             step = emit * (step + 1) + (1 - emit) * step
     finally:
+        if program_wall_t0 is not None:
+            to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        if jax.process_index() == 0:
+            logger.config.update(to_log_later)
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()
 
+    print("DEBUGPRINT {to_log_later}:", to_log_later)
     return model
 
 
 def main(config: sws.FinalConfig):
+    _preparse_absl_flags()
     rngs = jax.random.key(config.train_seed) if config.train_seed else None
 
     if not config.random_init and not config.resume:

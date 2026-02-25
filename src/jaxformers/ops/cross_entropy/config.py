@@ -1,19 +1,30 @@
 import jax.numpy as jnp
 from typing import NamedTuple
 
+
 class BlockSizes(NamedTuple):
     v: int | None
     h: int | None
     b: int | None
 
 
-def infer_block_sizes(impl, b, h, v, *, dtype = None, device_kind = None):
+def infer_block_sizes(impl, b, h, v, *, dtype=None, device_kind=None):
     if impl == "xla_chunked":
-        return infer_xla_chunked_block_size(b, h, v, dtype = dtype, device_kind = device_kind)
+        return infer_xla_chunked_block_size(
+            b, h, v, dtype=dtype, device_kind=device_kind
+        )
     elif impl == "reference":
         return None
     else:
         raise NotImplementedError
+
+
+def _largest_divisor_leq(n: int, limit: int) -> int:
+    limit = min(n, limit)
+    for d in range(limit, 0, -1):
+        if n % d == 0:
+            return d
+    return 1
 
 
 def infer_xla_chunked_block_size(
@@ -23,12 +34,19 @@ def infer_xla_chunked_block_size(
     *,
     dtype: jnp.dtype | None = None,
     device_kind: str | None = None,
-) -> int:
-    del dtype, device_kind # not used for now
-    target = min(v, 32768)
-    if target <= 0:
-        return 1
-    if target == v:
-        return target
+) -> BlockSizes:
+    del dtype, device_kind  # not used for now
+    if b <= 0 or h <= 0 or v <= 0:
+        raise ValueError(f"b, h, v must all be > 0, got b={b}, h={h}, v={v}.")
 
-    return BlockSizes(b = b, v=max(128, 128 * (target // 128)), h = h)
+    # Avoid pathological defaults like b=b and v=32768, which materializes a massive
+    # [b_block, v_block] logits tile (and corresponding backward buffers).
+    # b_block = _largest_divisor_leq(b, 1024)
+    # h_block = _largest_divisor_leq(h, 512)
+    h_block = h
+    b_block = b
+
+    v_target = min(v, 32768)
+    v_block = max(128, 128 * (v_target // 128))
+
+    return BlockSizes(v=v_block, h=h_block, b=b_block)

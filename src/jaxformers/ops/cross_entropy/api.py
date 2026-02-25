@@ -47,7 +47,7 @@ def _validate_inputs(x: jax.Array, labels: jax.Array, w: jax.Array) -> None:
         raise ValueError(
             f"Batch mismatch: x has B={x.shape[0]}, labels has B={labels.shape[0]}."
         )
-    if x.shape[1] != w.shape[0]:
+    if x.shape[1] != w.shape[1]:
         raise ValueError(
             f"Hidden mismatch: x has H={x.shape[1]}, w has H={w.shape[0]}."
         )
@@ -77,7 +77,7 @@ def _apply_reduction(
 def cross_entropy_loss(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
-    w: Float[Array, "H V"],
+    w: Float[Array, "V H"],
     block_sizes: BlockSizes | None = None,
     *,
     reduction: Reduction = "sum",
@@ -105,7 +105,7 @@ def cross_entropy_loss(
 
     errors: list[Exception] = []
     B, H = x.shape
-    _, V = w.shape
+    V, H = w.shape
     for impl in impls:
         fn = IMPLEMENTATIONS.get(impl)
         if fn is None:

@@ -248,7 +248,6 @@ def forward(
     rngs: PRNGKeyArray | None = None,
     **inputs,
 ):
-    B, T = input_ids.shape
     rules = config.sharding_rules
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     input_ids = (
@@ -261,7 +260,6 @@ def forward(
     return_kv = kv is not None
     if kv is None:
         kv = defaultdict(lambda: None)
-
     inputs["attention_mask"] = make_mask(config, input_ids, **inputs)
 
     for layer_idx in range(config.num_hidden_layers):
@@ -291,33 +289,65 @@ def forward(
             input_ids, layer_weights, layer_idx, kv[layer_idx], pos, **inputs
         )  # sharding: (batch, seq, None)
 
-    out_embed = (
-        weights["model.embed_tokens.weight"]
-        if config.tie_word_embeddings
-        else weights["lm_head.weight"]
-    )
+
     input_ids = rms_norm(
         input_ids, weights["model.norm.weight"], config.rms_norm_eps
     )  # (batch, "seq", "None")
 
-    # btd (batch, seq, none), vd (model, none) -> btv (batch, seq, vocab)
-    # If TP is enabled, keep the vocabulary dimension sharded so we don't
-    # materialize a full (vocab, hidden) gradient on every shard.
-    loss_sharding = (
-        ("batch", "context", "model")
-        if config.additional_config.get("loss_parallel")
-        else ("batch", "context", "none")
+    return (input_ids, kv) if return_kv else input_ids
+
+
+def embed(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    input_ids: Int[Array, "B T"],
+    dtype: jnp.dtype = jnp.float32,
+    *,
+    rngs: PRNGKeyArray | None = None,
+    **inputs,
+):
+    rules = config.sharding_rules
+    input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
+    input_ids = (
+        weights["model.embed_tokens.weight"]
+        .at[input_ids, :]
+        .get(out_sharding=logical_to_physical(("batch", "sequence", "none"), rules))
+        .astype(dtype)
+    )
+    return input_ids
+
+def unembed(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    input_ids: Int[Array, "B T H"],
+    dtype: jnp.dtype = jnp.float32,
+    *,
+    rngs: PRNGKeyArray | None = None,
+    **inputs,
+):
+    rules = config.sharding_rules
+
+    # loss_sharding = (
+    #     ("batch", "context", "model")
+    #     if config.additional_config.get("loss_parallel")
+    #     else ("batch", "context", "none")
+    # )
+
+    out_embed = (
+        weights["model.embed_tokens.weight"]
+        if config.tie_word_embeddings
+        else weights["lm_head.weight"]
     )
 
     logits = einsum(
         "btd,vd-> btv",
         input_ids,
         out_embed,
-        out_sharding=logical_to_physical(loss_sharding, rules),
+        out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         preferred_element_type=jnp.float32,
     )
 
-    return (logits, kv) if return_kv else logits
+    return logits
 
 
 def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
@@ -414,4 +444,7 @@ def load(
         weights=weights,
         forward=partial(forward, cfg),
         tokenizer=tokenizer,
+        embed = partial(embed, cfg),
+        unembed = partial(unembed, cfg),
+        lm_head_key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm.head.weight"
     )

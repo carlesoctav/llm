@@ -180,7 +180,6 @@ def loraify(
         # Don't wrap the whole forward pass in `quaxify`, as some implementations
         # (e.g. shard_map-based attention) are not compatible with Quax's custom trace.
         # Instead, quaxify only the specific ops that touch `LoraArray` weights.
-        forward=model.forward,
     )
 
 

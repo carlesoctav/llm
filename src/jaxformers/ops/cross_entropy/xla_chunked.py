@@ -15,7 +15,7 @@ def _apply_logit_soft_cap(logits: Float[Array, "B V"], logit_soft_cap: float | N
 def fused_cross_entropy_chunked_xla(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
-    w: Float[Array, "H V"],
+    w: Float[Array, "V H"],
     *,
     block_sizes: BlockSizes,
     dtype: jnp.dtype = jnp.float32,
@@ -23,7 +23,7 @@ def fused_cross_entropy_chunked_xla(
     precision: jax.lax.PrecisionLike = None,
 ):
     B, H = x.shape
-    _, V = w.shape
+    V, _ = w.shape
     b_block = block_sizes.b
     v_block = block_sizes.v
     h_block = block_sizes.h
@@ -34,7 +34,7 @@ def fused_cross_entropy_chunked_xla(
         raise ValueError(f"H={H} must be divisible by h_block={h_block}")
 
     Vpad = (-V) % v_block
-    w_pad = jnp.pad(w, ((0, 0), (0, Vpad)))
+    w_pad = jnp.pad(w, ((0, Vpad), (0, 0)))
 
     num_b = B // b_block
     num_h = H // h_block
@@ -48,17 +48,17 @@ def fused_cross_entropy_chunked_xla(
         lse_b = jnp.full((b_block,), -jnp.inf, dtype=dtype)
         label_logits_b = jnp.full((b_block,), -jnp.inf, dtype=dtype)
 
-        @jax.remat
+        @jax.checkpoint
         def v_body(vi, val):
             lse_b, label_logits_b = val
             v0 = vi * v_block
 
-            @jax.remat
+
             def h_body(hi, acc):
                 h0 = h_block * hi
                 x_bh = jax.lax.dynamic_slice(x, (b0, h0), (b_block, h_block))
-                w_hv = jax.lax.dynamic_slice(w_pad, (h0, v0), (h_block, v_block))
-                return acc + jax.lax.dot_general(x_bh, w_hv, (((1,), (0,)), ((), ())), precision, preferred_element_type = dtype)
+                w_hv = jax.lax.dynamic_slice(w_pad, (v0, h0), (v_block, h_block))
+                return acc + jax.lax.dot_general(x_bh, w_hv, (((1,), (1,)), ((), ())), precision, preferred_element_type = dtype)
 
             logits = jax.lax.fori_loop(
                 0, num_h, h_body, jnp.zeros((b_block, v_block), dtype = dtype)

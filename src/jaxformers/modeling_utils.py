@@ -2,11 +2,10 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
-import equinox as eqx
 import jax.tree_util as jtu
 import optax
 from jax import P
-from jaxtyping import Array, Bool, Float, PyTree
+from jaxtyping import Bool, Float, PyTree
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
 
@@ -46,14 +45,27 @@ DEFAULT_ADDITIONAL_CONFIG = {
 @partial(
     jtu.register_dataclass,
     data_fields=["weights", "opt_state", "step"],
-    meta_fields=["tokenizer", "forward", "config", "tx", "is_lora", "train_mask"],
+    meta_fields=[
+        "tokenizer",
+        "forward",
+        "config",
+        "tx",
+        "is_lora",
+        "train_mask",
+        "embed",
+        "unembed",
+        "lm_head_key",
+    ],
 )
 @dataclass
 class Model:
     config: PreTrainedConfig
     weights: PyTree[Float, "ModelWeights"]
     forward: Callable
+    embed: Callable
+    unembed: Callable
     tokenizer: PreTrainedTokenizerFast
+    lm_head_key: str
 
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None

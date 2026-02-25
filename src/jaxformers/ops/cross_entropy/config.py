@@ -43,10 +43,12 @@ def infer_xla_chunked_block_size(
     # [b_block, v_block] logits tile (and corresponding backward buffers).
     # b_block = _largest_divisor_leq(b, 1024)
     # h_block = _largest_divisor_leq(h, 512)
-    h_block = h
-    b_block = b
+    # h_block = h
+    # b_block = b
+    max_v = min(v, 8192)
 
-    v_target = min(v, 32768)
-    v_block = max(128, 128 * (v_target // 128))
+    b_block = 1024
+    h_block = 512
+    v_block = max(128, 128 * (max_v // 128))
 
     return BlockSizes(v=v_block, h=h_block, b=b_block)

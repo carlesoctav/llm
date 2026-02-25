@@ -86,7 +86,7 @@ def get_config():
     # config.train_loader.is_not_sharded =
     # config.train_loader.read_num_threads =
     # config.train_loader.read_prefetch_buffer_size =
-    # config.train_loader.shuffle =
+    config.train_loader.shuffle = False
     # config.train_loader.shuffle_buffer_size =
     config.train_loader.worker_count = 8
     config.train_loader.worker_buffer_size = 100

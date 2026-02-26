@@ -11,11 +11,15 @@ NTP config.
 
 import gc
 import json
+import multiprocessing as mp
 import os
-import subprocess
 import sys
+import traceback
 from contextlib import contextmanager
+from contextlib import redirect_stderr
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from io import StringIO
 from typing import Any
 
 import sws
@@ -101,20 +105,78 @@ def _run_one(
     overrides: dict[str, Any],
     hf_home: str | None,
 ) -> dict[str, Any]:
-    env = os.environ.copy()
-    if hf_home:
-        env["HF_HOME"] = hf_home
+    ctx = mp.get_context("spawn")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
 
-    ntp_script = os.path.abspath("src/jaxformers/train/ntp.py")
-    cmd = [sys.executable, ntp_script, "--config", ntp_config_path]
-    for key, value in overrides.items():
-        cmd.append(f"{key}:={format_cli_value(value)}")
-
-    proc = subprocess.run(cmd, env=env, text=True, capture_output=True)
-    out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    proc = ctx.Process(
+        target=_run_ntp_worker,
+        kwargs={
+            "send_conn": send_conn,
+            "ntp_config_path": ntp_config_path,
+            "overrides": overrides,
+            "hf_home": hf_home,
+        },
+    )
+    proc.start()
+    send_conn.close()
+    proc.join()
 
     parsed: dict[str, Any] | None = None
-    for line in out.splitlines():
+    if recv_conn.poll():
+        try:
+            parsed = recv_conn.recv()
+        except Exception:
+            parsed = None
+    recv_conn.close()
+
+    if parsed is None:
+        parsed = {
+            "status": "error",
+            "error": f"no NTP_RESULT line (exit_code={proc.exitcode})",
+            "log_tail": "",
+        }
+
+    parsed["exit_code"] = proc.exitcode
+    if proc.exitcode not in (0, None) and parsed.get("status") == "ok":
+        parsed["status"] = "error"
+        parsed["error"] = f"child process exited with code {proc.exitcode}"
+
+    _cleanup_after_run()
+    return parsed
+
+
+def _run_ntp_worker(
+    *,
+    send_conn,
+    ntp_config_path: str,
+    overrides: dict[str, Any],
+    hf_home: str | None,
+) -> None:
+    out_stream = StringIO()
+    err_stream = StringIO()
+    exit_code = 0
+
+    if hf_home:
+        os.environ["HF_HOME"] = hf_home
+
+    with redirect_stdout(out_stream), redirect_stderr(err_stream):
+        try:
+            from jaxformers.train import ntp as ntp_train
+
+            builder = load_config_builder(ntp_config_path)
+            tokens = [f"{k}:={format_cli_value(v)}" for k, v in overrides.items()]
+            config = builder.finalize(tokens)
+            ntp_train.main(config)
+        except BaseException:
+            exit_code = 1
+            traceback.print_exc()
+
+    out = out_stream.getvalue()
+    err = err_stream.getvalue()
+    combined = out + ("\n" + err if err else "")
+
+    parsed: dict[str, Any] | None = None
+    for line in combined.splitlines():
         if line.startswith("NTP_RESULT "):
             try:
                 parsed = json.loads(line.removeprefix("NTP_RESULT ").strip())
@@ -124,13 +186,16 @@ def _run_one(
     if parsed is None:
         parsed = {
             "status": "error",
-            "error": f"no NTP_RESULT line (exit_code={proc.returncode})",
+            "error": f"no NTP_RESULT line (exit_code={exit_code})",
         }
 
-    parsed["exit_code"] = proc.returncode
-    parsed["log_tail"] = "\n".join(out.splitlines()[-80:])
-    _cleanup_after_run()
-    return parsed
+    parsed["exit_code"] = exit_code
+    parsed["log_tail"] = "\n".join(combined.splitlines()[-80:])
+
+    try:
+        send_conn.send(parsed)
+    finally:
+        send_conn.close()
 
 
 def _format_float(value: Any) -> str:

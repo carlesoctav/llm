@@ -1,5 +1,6 @@
 import dataclasses
 import importlib
+import json
 import sys
 import time
 from functools import partial, reduce
@@ -35,6 +36,22 @@ from jaxformers.optimizer_utils import (
 
 DEFAULT_REDUCED = {"loss": "mean", "token_count": "sum"}
 DEFAULT_AUX = {"loss": (0, 0), "token_count": 0}
+
+
+class _NoopLoggerConfig:
+    def update(self, values: dict[str, Any]) -> None:
+        _ = values
+
+
+class NoopLogger:
+    def __init__(self):
+        self.config = _NoopLoggerConfig()
+
+    def log(self, values: dict[str, Any], *, step: int) -> None:
+        _ = (values, step)
+
+    def finish(self) -> None:
+        return
 
 
 def _preparse_absl_flags() -> None:
@@ -326,6 +343,21 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
     return {k: to_py(v) for k, v in metrics.items()}
 
 
+def _jsonable(value: Any) -> Any:
+    value = jax.device_get(value)
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return value.item()
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
 def train(
     config,
     model: Model,
@@ -346,6 +378,7 @@ def train(
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
     to_log_later = {}
     program_wall_t0 = None
+    first_compile_time = None
     warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
@@ -441,6 +474,13 @@ def train(
     finally:
         if program_wall_t0 is not None:
             to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        if first_compile_time is not None:
+            to_log_later["compile_time"] = first_compile_time
+        final_cum = pbar_display(process_aux(global_aux, "cum"))
+        to_log_later.update(final_cum)
+        token_count = final_cum.get("cum/token_count")
+        if token_count is not None and to_log_later.get("program_time"):
+            to_log_later["tokens_per_s"] = token_count / to_log_later["program_time"]
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
         if pbar is not None:
@@ -448,37 +488,71 @@ def train(
         ckpt_manager.close()
 
     print("DEBUGPRINT {to_log_later}:", to_log_later)
-    return model
+    return model, to_log_later
+
+
+def _create_logger(config: sws.FinalConfig):
+    log_name = getattr(config, "log_name", "wandb")
+    if log_name == "noop":
+        return NoopLogger()
+    if log_name == "wandb":
+        log_config = config.to_dict()
+        log_config.pop("wandb", None)
+        return wandb.init(**config.wandb.to_dict(), config=log_config)
+    raise ValueError("log_name must be either 'wandb' or 'noop'")
 
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    rngs = jax.random.key(config.train_seed) if config.train_seed else None
+    result: dict[str, Any] = {
+        "status": "error",
+        "error": None,
+        "exp_name": getattr(config, "exp_name", None),
+        "optimizer_name": getattr(config, "optimizer_name", None),
+        "loss_implementation": getattr(config, "loss_implementation", None),
+        "max_length": None,
+    }
+    logger = None
+    try:
+        try:
+            result["max_length"] = config.data.transforms.max_length
+        except Exception:
+            result["max_length"] = None
 
-    if not config.random_init and not config.resume:
-        # reinventing flax lol
-        model = load_model(config, config.model_name)
-        scheduler = load_scheduler(config, config.lr_scheduler_name)
-        if config.use_lora:
-            if config.random_init_lora:
-                rngs, lora_rngs = jax.random.split(rngs, 2)
-                model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
-            else:
-                raise NotImplementedError
-        t0 = time.monotonic()
-        model = load_optimizer(config, model, config.optimizer_name, scheduler)
-        diff = time.monotonic() - t0
-        print(f"Created optimizer and its state in {diff:.2f} seconds.")
-    else:
-        raise NotImplementedError
+        rngs = jax.random.key(config.train_seed) if config.train_seed else None
 
-    train_ds, eval_ds = load_dataset(config, config.data_name)
+        if not config.random_init and not config.resume:
+            model = load_model(config, config.model_name)
+            scheduler = load_scheduler(config, config.lr_scheduler_name)
+            if config.use_lora:
+                if config.random_init_lora:
+                    rngs, lora_rngs = jax.random.split(rngs, 2)
+                    model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
+                else:
+                    raise NotImplementedError
+            t0 = time.monotonic()
+            model = load_optimizer(config, model, config.optimizer_name, scheduler)
+            diff = time.monotonic() - t0
+            print(f"Created optimizer and its state in {diff:.2f} seconds.")
+        else:
+            raise NotImplementedError
 
-    log_config_wandb = config.to_dict()
-    del log_config_wandb["wandb"]
-    logger = wandb.init(**config.wandb.to_dict(), config=log_config_wandb)
-
-    train(config, model, train_ds, eval_ds, logger, rngs)
+        train_ds, eval_ds = load_dataset(config, config.data_name)
+        logger = _create_logger(config)
+        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs)
+        result["status"] = "ok"
+        result["metrics"] = _jsonable(metrics)
+    except BaseException as exc:
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if logger is not None and hasattr(logger, "finish"):
+            try:
+                logger.finish()
+            except Exception:
+                pass
+        print("NTP_RESULT", json.dumps(_jsonable(result), sort_keys=True))
 
 
 if __name__ == "__main__":

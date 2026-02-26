@@ -95,6 +95,7 @@ def get_config():
 
     config.log.grad_norm = True
     config.log.learning_rate = True
+    config.log_name = "noop"
 
     # see orbax checkpointmanager options
     config.checkpoint_options.save_interval_steps = 10000

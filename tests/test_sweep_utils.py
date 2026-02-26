@@ -1,6 +1,6 @@
 import pytest
 
-from jaxformers.bench.sweep_utils import (
+from jaxformers.sweep_utils import (
     build_sweep_space,
     SweepConfigError,
 )
@@ -13,9 +13,10 @@ def test_build_sweep_space_keeps_singleton_dimension():
     }
     space = build_sweep_space(overrides=overrides, group=[])
 
-    assert space.dimensions["learning_rate"] == [1e-5]
-    assert space.dimensions["loss_implementation"] == ["xla_chunked", "reference"]
-    assert space.run_count == 2
+    assert len(space) == 2
+    runs = [run for _, run in space]
+    assert all(run["learning_rate"] == 1e-5 for run in runs)
+    assert {run["loss_implementation"] for run in runs} == {"xla_chunked", "reference"}
 
 
 def test_build_sweep_space_group_multiplies_by_free_dimensions():
@@ -27,9 +28,10 @@ def test_build_sweep_space_group_multiplies_by_free_dimensions():
         ],
     )
 
-    assert space.run_count == 4
-    runs = list(space.iter_runs())
-    assert len(runs) == 4
+    assert len(space) == 4
+    groups = [group_idx for group_idx, _ in space]
+    assert groups.count(0) == 2
+    assert groups.count(1) == 2
 
 
 def test_build_sweep_space_allows_any_key_name():
@@ -38,7 +40,8 @@ def test_build_sweep_space_allows_any_key_name():
         group=[],
     )
 
-    assert space.dimensions["optmizer.b1"] == [0.9, 0.95]
+    values = [run["optmizer.b1"] for _, run in space]
+    assert values == [0.9, 0.95]
 
 
 def test_build_sweep_space_rejects_overlap_between_group_and_free_dims():
@@ -55,8 +58,11 @@ def test_build_sweep_space_accepts_c_prefix():
         group=[{"c.optimizer.b1": 0.8}],
     )
 
-    assert space.dimensions["c.learning_rate"] == [1e-5]
-    assert space.groups == [{"c.optimizer.b1": 0.8}]
+    assert len(space) == 1
+    group_idx, run = space[0]
+    assert group_idx == 0
+    assert run["c.learning_rate"] == 1e-5
+    assert run["c.optimizer.b1"] == 0.8
 
 def test_build_sweep_space_list_values_are_dimensions():
     space = build_sweep_space(
@@ -64,8 +70,6 @@ def test_build_sweep_space_list_values_are_dimensions():
         group=[],
     )
 
-    assert "lora.weights_path" in space.dimensions
-    assert space.dimensions["lora.weights_path"] == [
-        "*.q_proj.weight",
-        "*.k_proj.weight",
-    ]
+    assert len(space) == 2
+    values = [run["lora.weights_path"] for _, run in space]
+    assert values == ["*.q_proj.weight", "*.k_proj.weight"]

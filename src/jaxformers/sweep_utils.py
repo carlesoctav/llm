@@ -1,7 +1,6 @@
 import os
 import runpy
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from itertools import product
 from typing import Any
 
@@ -32,41 +31,11 @@ def load_config_builder(config_path: str, *, default_func: str = "get_config") -
     return builder
 
 
-def format_cli_value(value: Any) -> str:
-    return repr(value)
-
-
-@dataclass(frozen=True)
-class SweepSpace:
-    dimensions: dict[str, list[Any]]
-    groups: list[dict[str, Any]]
-
-    @property
-    def run_count(self) -> int:
-        runs = len(self.groups) if self.groups else 1
-        for values in self.dimensions.values():
-            runs *= len(values)
-        return runs
-
-    def iter_runs(self) -> Iterable[tuple[int | None, dict[str, Any]]]:
-        dims: list[list[tuple[str, Any]]] = []
-        for key, values in self.dimensions.items():
-            dims.append([(key, value) for value in values])
-
-        group_choices = self.groups if self.groups else [{}]
-        for group_idx, group_item in enumerate(group_choices):
-            for combo in product(*dims) if dims else [()]:
-                run: dict[str, Any] = dict(group_item)
-                for key, value in combo:
-                    run[key] = value
-                yield (group_idx if self.groups else None), run
-
-
 def build_sweep_space(
     *,
     overrides: Mapping[str, Any],
     group: list[Mapping[str, Any]] | None,
-) -> SweepSpace:
+) -> list[tuple[int | None, dict[str, Any]]]:
     dims: dict[str, list[Any]] = {}
     for raw_key, raw_value in overrides.items():
         key = str(raw_key)
@@ -99,4 +68,19 @@ def build_sweep_space(
             + ", ".join(overlap)
         )
 
-    return SweepSpace(dimensions=dims, groups=groups)
+    runs: list[tuple[int | None, dict[str, Any]]] = []
+    dims_for_product: list[list[tuple[str, Any]]] = []
+    for key, values in dims.items():
+        dims_for_product.append([(key, value) for value in values])
+
+    group_choices = groups if groups else [{}]
+    for group_idx, group_item in enumerate(group_choices):
+        combos: Iterable[tuple[tuple[str, Any], ...]]
+        combos = product(*dims_for_product) if dims_for_product else [()]
+        for combo in combos:
+            run: dict[str, Any] = dict(group_item)
+            for key, value in combo:
+                run[key] = value
+            runs.append((group_idx if groups else None, run))
+
+    return runs

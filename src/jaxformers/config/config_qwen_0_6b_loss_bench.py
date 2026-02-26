@@ -29,7 +29,6 @@ def get_config():
     config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_implementation = "xla_chunked"
     config.model.additional_config.sequence_parallelism = True
-    config.model.additional_config.loss_parallel = False
 
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
@@ -95,18 +94,18 @@ def get_config():
 
     config.log.grad_norm = True
     config.log.learning_rate = True
-    config.log_name = "noop"
+    config.logger_name = "noop"
 
     # see orbax checkpointmanager options
     config.checkpoint_options.save_interval_steps = 10000
     config.checkpoint_options.max_to_keep = 1
 
-    config.wandb.project = "bench-loss-impl"
-    config.wandb.name = lambda: config.exp_name
-    # config.wandb.entity =
-    # config.wandb.dir =
-    # config.wandb.id =
-    # config.wandb.notes =
-    # config.wandb.tags =
+    # config.logger.project = "bench-loss-impl"
+    # config.logger.name = lambda: config.exp_name
+    # config.logger.entity =
+    # config.logger.dir =
+    # config.logger.id =
+    # config.logger.notes =
+    # config.logger.tags =
 
     return config

@@ -1,6 +1,5 @@
-import warnings
 from collections.abc import Callable, Sequence
-from typing import cast, Literal, Optional, TypeAlias
+from typing import cast, Literal, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +10,7 @@ from .reference import cross_entropy_reference
 from .xla_chunked import fused_cross_entropy_chunked_xla
 
 
-Implementation: TypeAlias = Literal["xla_chunked", "reference"]
+Implementation: TypeAlias = Literal["pallas_tpu", "xla_chunked", "reference"]
 Reduction: TypeAlias = Literal["sum", "mean"] | None
 
 
@@ -24,13 +23,14 @@ IMPLEMENTATIONS: dict[str, ArrayImpl] = {
 }
 
 _DEFAULT_IMPLEMENTATION: tuple[Implementation, ...] = ("xla_chunked", "reference")
-# try:
-#     from .pallas_tpu import PallasUnsupportedError, linear_softmax_cross_entropy_loss_pallas
+try:
+    from .pallas_tpu import PallasUnsupportedError, linear_softmax_cross_entropy_loss_pallas
 
-#     IMPLEMENTATIONS["pallas_tpu"] = linear_softmax_cross_entropy_loss_pallas
-#     _DEFAULT_IMPLEMENTATION = ("pallas_tpu",) + _DEFAULT_IMPLEMENTATION
-# except ImportError:
-#     PallasUnsupportedError = NotImplementedError  # type: ignore[assignment]
+    IMPLEMENTATIONS["pallas_tpu"] = linear_softmax_cross_entropy_loss_pallas
+    if jax.default_backend() == "tpu":
+        _DEFAULT_IMPLEMENTATION = ("pallas_tpu",) + _DEFAULT_IMPLEMENTATION
+except Exception:
+    PallasUnsupportedError = NotImplementedError  # type: ignore[assignment]
 
 
 def _validate_inputs(x: jax.Array, labels: jax.Array, w: jax.Array) -> None:
@@ -39,17 +39,14 @@ def _validate_inputs(x: jax.Array, labels: jax.Array, w: jax.Array) -> None:
     if labels.ndim != 1:
         raise ValueError(f"labels must be rank-1 [B], got shape {labels.shape}.")
     if w.ndim != 2:
-        raise ValueError(f"w must be rank-2 [H, V], got shape {w.shape}.")
+        raise ValueError(f"w must be rank-2 [V, H], got shape {w.shape}.")
     if x.shape[0] != labels.shape[0]:
-        raise ValueError(
-            f"Batch mismatch: x has B={x.shape[0]}, labels has B={labels.shape[0]}."
-        )
         raise ValueError(
             f"Batch mismatch: x has B={x.shape[0]}, labels has B={labels.shape[0]}."
         )
     if x.shape[1] != w.shape[1]:
         raise ValueError(
-            f"Hidden mismatch: x has H={x.shape[1]}, w has H={w.shape[0]}."
+            f"Hidden mismatch: x has H={x.shape[1]}, w has H={w.shape[1]}."
         )
     if not jnp.issubdtype(labels.dtype, jnp.integer):
         raise ValueError(f"labels must be integer dtype, got {labels.dtype}.")

@@ -31,7 +31,7 @@ def get_config():
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.loss_parallel = False
 
-    config.model.devices = jax.devices()
+    config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
     # config.lora.rank = 64

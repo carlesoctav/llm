@@ -503,6 +503,8 @@ def _create_logger(config: sws.FinalConfig):
 
 
 def main(config: sws.FinalConfig):
+    print(config.learning_rate)
+    print(type(config.learning_rate))
     _preparse_absl_flags()
     result: dict[str, Any] = {
         "status": "error",

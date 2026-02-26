@@ -15,7 +15,6 @@ import multiprocessing as mp
 import os
 import sys
 import traceback
-from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -26,11 +25,10 @@ import sws
 from etils import epath
 
 from jaxformers.bench.sweep_utils import (
+    SweepConfigError,
     build_sweep_space,
     format_cli_value,
     load_config_builder,
-    parse_maybe_expr,
-    SweepConfigError,
 )
 
 
@@ -38,6 +36,7 @@ _SWEEP_KEYS = {
     "ntp_config_path",
     "sweep_path",
     "sweep_name",
+    "range",
     "group",
     "dry_run",
     "max_runs",
@@ -50,6 +49,7 @@ def get_config() -> sws.Config:
     c.ntp_config_path = "src/jaxformers/config/config_qwen_0_6b_loss_bench.py"
     c.sweep_path = "/mnt/carles/llm/.agents/reports"
     c.sweep_name = "loss_impl_bench"
+    c.range = None
     c.group = []
     c.dry_run = False
     c.max_runs = None
@@ -78,25 +78,6 @@ def _cleanup_after_run() -> None:
         pass
     except OSError:
         pass
-
-
-@contextmanager
-def _cpu_probe_backend():
-    old_platforms = os.environ.get("JAX_PLATFORMS")
-    old_platform_name = os.environ.get("JAX_PLATFORM_NAME")
-    os.environ["JAX_PLATFORMS"] = "cpu"
-    os.environ["JAX_PLATFORM_NAME"] = "cpu"
-    try:
-        yield
-    finally:
-        if old_platforms is None:
-            os.environ.pop("JAX_PLATFORMS", None)
-        else:
-            os.environ["JAX_PLATFORMS"] = old_platforms
-        if old_platform_name is None:
-            os.environ.pop("JAX_PLATFORM_NAME", None)
-        else:
-            os.environ["JAX_PLATFORM_NAME"] = old_platform_name
 
 
 def _run_one(
@@ -208,15 +189,69 @@ def _format_float(value: Any) -> str:
 
 
 def _extract_group(raw_group: Any) -> list[dict[str, Any]]:
-    parsed = parse_maybe_expr(raw_group)
-    if parsed is None:
+    if raw_group is None:
         return []
-    if not isinstance(parsed, list):
+    if not isinstance(raw_group, list):
         raise SweepConfigError(
             "Expected `group` to be a list of dicts. "
             "Tip: group keys should be flat dotted keys like {'optimizer.b1': 0.9}."
         )
-    return parsed
+    return raw_group
+
+
+def _extract_raw_token_value(argv: list[str], key: str) -> str | None:
+    prefixes = (
+        f"{key}:=",
+        f"{key}=",
+        f"c.{key}:=",
+        f"c.{key}=",
+    )
+    for tok in reversed(argv):
+        for prefix in prefixes:
+            if tok.startswith(prefix):
+                return tok[len(prefix) :]
+    return None
+
+
+def _parse_run_range(raw_value: Any, argv: list[str]) -> tuple[int, int] | None:
+    source = _extract_raw_token_value(argv, "range")
+    value = source if source is not None else raw_value
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value, value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if "--" in text:
+        start_txt, end_txt = text.split("--", 1)
+    elif "-" in text:
+        start_txt, end_txt = text.split("-", 1)
+    else:
+        idx = int(text)
+        return idx, idx
+
+    start = int(start_txt)
+    end = int(end_txt)
+    if end < start:
+        raise ValueError(f"Invalid range {text!r}: end must be >= start.")
+    return start, end
+
+
+def _count_runs_in_range(total_runs: int, run_range: tuple[int, int] | None) -> int:
+    if total_runs <= 0:
+        return 0
+    if run_range is None:
+        return total_runs
+    start, end = run_range
+    start = max(start, 0)
+    end = min(end, total_runs - 1)
+    if end < start:
+        return 0
+    return end - start + 1
 
 
 def _write_report(
@@ -289,27 +324,25 @@ def _write_report(
 
 
 def main(config: sws.FinalConfig) -> None:
-    with _cpu_probe_backend():
-        base_builder = load_config_builder(os.path.abspath(config.ntp_config_path))
-        base_store = base_builder._store  # noqa: SLF001
-
+    argv = sys.argv[1:]
     sweep_flat = config.to_flat_dict()
     group = _extract_group(sweep_flat.get("group"))
+    run_range = _parse_run_range(sweep_flat.get("range"), argv)
     overrides = {
-        key: parse_maybe_expr(value)
+        key: value
         for key, value in sweep_flat.items()
         if key not in _SWEEP_KEYS
     }
 
-    space = build_sweep_space(base_store=base_store, overrides=overrides, group=group)
+    space = build_sweep_space(overrides=overrides, group=group)
 
-    max_runs = parse_maybe_expr(sweep_flat.get("max_runs"))
+    max_runs = sweep_flat.get("max_runs")
     max_runs = None if max_runs is None else int(max_runs)
-    planned_runs = (
-        space.run_count if max_runs is None else min(space.run_count, max_runs)
-    )
+    planned_runs = _count_runs_in_range(space.run_count, run_range)
+    if max_runs is not None:
+        planned_runs = min(planned_runs, max_runs)
 
-    if bool(parse_maybe_expr(sweep_flat.get("dry_run", False))):
+    if bool(sweep_flat.get("dry_run", False)):
         print(
             "Planned runs:",
             planned_runs,
@@ -321,20 +354,22 @@ def main(config: sws.FinalConfig) -> None:
         return
 
     results: list[dict[str, Any]] = []
-    run_idx = 0
-    for group_idx, run_overrides in space.iter_runs():
-        if max_runs is not None and run_idx >= max_runs:
+    exec_count = 0
+    for full_idx, (group_idx, run_overrides) in enumerate(space.iter_runs()):
+        if run_range is not None and not (run_range[0] <= full_idx <= run_range[1]):
+            continue
+        if max_runs is not None and exec_count >= max_runs:
             break
         run_result = _run_one(
             ntp_config_path=os.path.abspath(config.ntp_config_path),
             overrides=run_overrides,
             hf_home=getattr(config, "hf_home", None),
         )
-        run_result["run_idx"] = run_idx
+        run_result["run_idx"] = full_idx
         run_result["group_idx"] = group_idx
         run_result["sweep_overrides"] = dict(run_overrides)
         results.append(run_result)
-        run_idx += 1
+        exec_count += 1
 
     if _process_index() != 0:
         print("Skipping report write on non-zero process index.")

@@ -35,6 +35,11 @@
       "grad_norm": true,
       "learning_rate": true
     },
+    "logger": {
+      "name": "",
+      "project": "bench-loss-impl",
+      "resume": "never"
+    },
     "logger_name": "noop",
     "loss_implementation": "xla_chunked",
     "lr_scheduler_name": null,
@@ -104,15 +109,14 @@
   "proc_exit_code": 0,
   "result": {
     "argument_gb": 0.7,
-    "compile_time": 27.350048901047558,
-    "cum/loss": 1.5772064924240112,
+    "compile_time": 27.880357487127185,
+    "cum/loss": 1.5771881341934204,
     "cum/token_count": 483163,
     "host_temp_gb": 0.0,
     "output_gb": 0.7,
-    "program_time": 63.96627755044028,
-    "systems/tok_s": 7553.401862708117,
+    "program_time": 48.79761101491749,
+    "systems/tok_s": 9901.365865068608,
     "temp_gb": 7.2,
-    "tokens_per_s": 7553.401862708117,
     "total_gb": 8.6
   },
   "run_config_path": "config/sweep/loss_impl_fix_length_inc_batch/0.py",

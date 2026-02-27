@@ -193,11 +193,12 @@ def main() -> None:
             )
             prompts.append(prompt)
 
-    warmup_prompts = prompts[: min(args.num_prompts, args.max_num_seqs)]
+    # Warm up: run the same workload once to ensure compilation doesn't occur
+    # inside the timed window. On TPU, compilation can dominate short runs.
     llm.generate(
-        warmup_prompts,
-        max_tokens=min(int(output_lens[0]), 2),
-        ignore_eos=True,
+        prompts,
+        max_tokens=int(output_lens[0]),
+        ignore_eos=not args.respect_eos,
         temperature=args.temperature,
     )
 

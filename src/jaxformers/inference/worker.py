@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxformers.inference.kv_cache import PagedKVCacheConfig, make_kv_cache, make_page_indices
 from jaxformers.inference.model_runner import JaxModelRunner
@@ -44,16 +45,20 @@ class JaxWorker:
         self.kv_cfg = kv_cfg
 
         self.page_indices = make_page_indices(kv_cfg)
+        self.page_indices_host = np.array(jax.device_get(self.page_indices))
         self.kv_cache = make_kv_cache(kv_cfg, dtype=config.dtype)
 
         self.runner = JaxModelRunner(
             model=model,
             max_num_seqs=config.max_num_seqs,
+            max_model_len=config.max_model_len,
             dtype=config.dtype,
         )
         self.runner.compile(max_num_batched_tokens=config.max_num_batched_tokens)
 
         self.rng = jax.random.PRNGKey(config.seed)
+        mesh = jax.sharding.get_mesh()
+        self.replicated = jax.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     def add_request(self, request: Request) -> None:
         self.scheduler.add_request(request)
@@ -71,11 +76,6 @@ class JaxWorker:
 
             bucket_tokens = self.runner.pick_bucket(total_q_tokens)
 
-            token_ids = jnp.zeros((bucket_tokens,), dtype=jnp.int32)
-            positions = jnp.zeros((bucket_tokens,), dtype=jnp.int32)
-            page_ids = jnp.full((bucket_tokens,), -1, dtype=jnp.int32)
-            page_offsets = jnp.full((bucket_tokens,), -1, dtype=jnp.int32)
-
             packed_slots = [
                 slot_id
                 for slot_id in range(self.config.max_num_seqs)
@@ -85,53 +85,63 @@ class JaxWorker:
             if num_packed == 0:
                 raise RuntimeError("total_q_tokens > 0 but no packed slots found")
 
-            if total_q_tokens > 0:
-                token_ids = token_ids.at[:total_q_tokens].set(
-                    jnp.array(step.token_ids, dtype=jnp.int32)
-                )
-                positions = positions.at[:total_q_tokens].set(
-                    jnp.array(step.positions, dtype=jnp.int32)
-                )
+            token_ids_host = np.zeros((bucket_tokens,), dtype=np.int32)
+            positions_host = np.zeros((bucket_tokens,), dtype=np.int32)
+            page_ids_host = np.full((bucket_tokens,), -1, dtype=np.int32)
+            page_offsets_host = np.full((bucket_tokens,), -1, dtype=np.int32)
 
-                slot_ids: list[int] = []
-                for slot_id in range(self.config.max_num_seqs):
-                    slot_ids.extend([slot_id for _ in range(step.q_lens[slot_id])])
-                if len(slot_ids) != total_q_tokens:
-                    raise RuntimeError("slot_ids length mismatch")
-                slot_ids_arr = jnp.array(slot_ids, dtype=jnp.int32)
-                pos_arr = positions[:total_q_tokens]
-                pages_per_seq = self.kv_cfg.pages_per_seq
-                page_ids_live = slot_ids_arr * pages_per_seq + (pos_arr // self.config.page_size)
-                page_offsets_live = pos_arr % self.config.page_size
-                page_ids = page_ids.at[:total_q_tokens].set(page_ids_live)
-                page_offsets = page_offsets.at[:total_q_tokens].set(page_offsets_live)
+            token_ids_host[:total_q_tokens] = np.array(step.token_ids, dtype=np.int32)
+            positions_host[:total_q_tokens] = np.array(step.positions, dtype=np.int32)
 
-            slot_ids_packed = jnp.zeros((self.config.max_num_seqs,), dtype=jnp.int32)
-            slot_ids_packed = slot_ids_packed.at[:num_packed].set(
-                jnp.array(packed_slots, dtype=jnp.int32)
+            slot_ids: list[int] = []
+            for slot_id in range(self.config.max_num_seqs):
+                slot_ids.extend([slot_id for _ in range(step.q_lens[slot_id])])
+            if len(slot_ids) != total_q_tokens:
+                raise RuntimeError("slot_ids length mismatch")
+
+            slot_ids_arr = np.array(slot_ids, dtype=np.int32)
+            pos_arr = positions_host[:total_q_tokens]
+            pages_per_seq = self.kv_cfg.pages_per_seq
+            page_ids_host[:total_q_tokens] = slot_ids_arr * pages_per_seq + (
+                pos_arr // self.config.page_size
             )
-            page_indices = self.page_indices[slot_ids_packed]
+            page_offsets_host[:total_q_tokens] = pos_arr % self.config.page_size
 
-            kv_lens_list = [step.kv_lens[slot_id] for slot_id in packed_slots]
-            kv_lens = jnp.zeros((self.config.max_num_seqs,), dtype=jnp.int32)
-            kv_lens = kv_lens.at[:num_packed].set(jnp.array(kv_lens_list, dtype=jnp.int32))
+            kv_lens_host = np.zeros((self.config.max_num_seqs,), dtype=np.int32)
+            kv_lens_host[:num_packed] = np.array(
+                [step.kv_lens[slot_id] for slot_id in packed_slots],
+                dtype=np.int32,
+            )
 
             q_lens_list = [step.q_lens[slot_id] for slot_id in packed_slots]
-            cu_q_lens_list = [0]
-            for q_len in q_lens_list:
-                cu_q_lens_list.append(cu_q_lens_list[-1] + int(q_len))
-            while len(cu_q_lens_list) < self.config.max_num_seqs + 1:
-                cu_q_lens_list.append(cu_q_lens_list[-1])
-            cu_q_lens = jnp.array(cu_q_lens_list, dtype=jnp.int32)
+            cu_q_lens_host = np.zeros((self.config.max_num_seqs + 1,), dtype=np.int32)
+            for i, q_len in enumerate(q_lens_list):
+                cu_q_lens_host[i + 1] = cu_q_lens_host[i] + int(q_len)
+            if num_packed + 1 < self.config.max_num_seqs + 1:
+                cu_q_lens_host[num_packed + 1 :] = cu_q_lens_host[num_packed]
 
-            num_seqs = jnp.array([num_packed], dtype=jnp.int32)
+            num_seqs_host = np.array([num_packed], dtype=np.int32)
 
-            sample_mask_list = [step.sample_mask[slot_id] for slot_id in packed_slots]
-            sample_mask = jnp.zeros((self.config.max_num_seqs,), dtype=jnp.bool_)
-            if sample_mask_list:
-                sample_mask = sample_mask.at[:num_packed].set(
-                    jnp.array(sample_mask_list, dtype=jnp.bool_)
-                )
+            sample_mask_host = np.zeros((self.config.max_num_seqs,), dtype=np.bool_)
+            sample_mask_host[:num_packed] = np.array(
+                [step.sample_mask[slot_id] for slot_id in packed_slots],
+                dtype=np.bool_,
+            )
+
+            page_indices_host = np.zeros(
+                (self.config.max_num_seqs, self.kv_cfg.pages_per_seq), dtype=np.int32
+            )
+            page_indices_host[:num_packed] = self.page_indices_host[packed_slots]
+
+            token_ids = jax.device_put(token_ids_host, self.replicated)
+            positions = jax.device_put(positions_host, self.replicated)
+            page_ids = jax.device_put(page_ids_host, self.replicated)
+            page_offsets = jax.device_put(page_offsets_host, self.replicated)
+            kv_lens = jax.device_put(kv_lens_host, self.replicated)
+            page_indices = jax.device_put(page_indices_host, self.replicated)
+            cu_q_lens = jax.device_put(cu_q_lens_host, self.replicated)
+            num_seqs = jax.device_put(num_seqs_host, self.replicated)
+            sample_mask = jax.device_put(sample_mask_host, self.replicated)
 
             self.rng, step_rng = jax.random.split(self.rng, 2)
             self.kv_cache, next_token_ids, next_rng = self.runner.step(

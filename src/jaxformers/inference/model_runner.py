@@ -23,10 +23,12 @@ class JaxModelRunner:
         *,
         model: Model,
         max_num_seqs: int,
+        max_model_len: int,
         dtype: jnp.dtype,
     ) -> None:
         self.model = model
         self.max_num_seqs = max_num_seqs
+        self.max_model_len = max_model_len
         self.dtype = dtype
 
         self._compiled: dict[int, CompiledStep] = {}
@@ -34,6 +36,18 @@ class JaxModelRunner:
         model_type = model.config.model_type
         if model_type != "qwen3":
             raise ValueError(f"Only model_type='qwen3' supported, got {model_type!r}")
+
+        mesh = jax.sharding.get_mesh()
+        replicated = jax.NamedSharding(mesh, P())
+        rope_theta = qwen3.get_rope_theta(model.config)
+        rope_sin, rope_cos = qwen3.make_rope_cache(
+            max_model_len=max_model_len,
+            head_dim=model.config.head_dim,
+            theta=rope_theta,
+            dtype=dtype,
+        )
+        self.rope_sin = jax.device_put(rope_sin, replicated)
+        self.rope_cos = jax.device_put(rope_cos, replicated)
 
     def compile(self, *, max_num_batched_tokens: int, min_bucket_tokens: int = 16) -> None:
         buckets: list[int] = []
@@ -162,6 +176,8 @@ class JaxModelRunner:
                 page_indices,
                 cu_q_lens,
                 num_seqs,
+                self.rope_sin,
+                self.rope_cos,
                 dtype=dtype,
                 ragged_attention=ragged_attention,
             )
@@ -175,6 +191,7 @@ class JaxModelRunner:
                 model.weights,
                 last_hidden[:, None, :],
                 dtype=jnp.float32,
+                compute_dtype=dtype,
             )[:, 0, :]
 
             if temperature == 0.0:

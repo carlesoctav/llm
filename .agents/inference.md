@@ -88,3 +88,9 @@ Goal: build a simple, vLLM-like continuous batching engine for JAX models (start
    - compiled shape set (token count buckets),
    - sampling cost (option: greedy vs categorical).
 
+## Phase 8 — Benchmark fairness (compile vs steady-state)
+1. Ensure throughput timing excludes JIT compilation:
+   - run the same `generate()` workload once (warmup) before starting the timer,
+   - then time the second run (this matches the “steady-state” throughput people care about on TPU).
+2. Keep KV cache capacity matched when comparing vs vLLM-TPU:
+   - set vLLM `--num-gpu-blocks-override` to match our KV capacity tokens.

@@ -315,6 +315,7 @@ def unembed(
     weights: PyTree[Array, "ModelWeights"],
     input_ids: Int[Array, "B T H"],
     dtype: jnp.dtype = jnp.float32,
+    compute_dtype: jnp.dtype = jnp.float32,
     *,
     rngs: PRNGKeyArray | None = None,
     **inputs,
@@ -338,10 +339,10 @@ def unembed(
         input_ids,
         out_embed,
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
-        preferred_element_type=jnp.float32,
+        preferred_element_type=compute_dtype,
     )
 
-    return logits
+    return logits.astype(dtype)
 
 
 def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
@@ -462,6 +463,43 @@ def apply_rope_ragged(x: jax.Array, theta: float, positions: jax.Array) -> jax.A
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
+def make_rope_cache(
+    *,
+    max_model_len: int,
+    head_dim: int,
+    theta: float,
+    dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE head_dim must be even")
+    if max_model_len < 1:
+        raise ValueError("max_model_len must be >= 1")
+
+    pos = jnp.arange(max_model_len, dtype=jnp.float32)[:, None]
+    freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    inp = pos * freq[None, :]
+    sin = jnp.sin(inp).astype(dtype)
+    cos = jnp.cos(inp).astype(dtype)
+    return sin, cos
+
+
+def apply_rope_ragged_cached(
+    x: jax.Array,
+    rope_sin: jax.Array,
+    rope_cos: jax.Array,
+    positions: jax.Array,
+) -> jax.Array:
+    T, N, H = x.shape
+    if H % 2 != 0:
+        raise ValueError("RoPE head_dim must be even")
+
+    sin = rope_sin[positions][:, None, :].astype(x.dtype)
+    cos = rope_cos[positions][:, None, :].astype(x.dtype)
+
+    x1, x2 = x[:, :, : H // 2], x[:, :, H // 2 :]
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+
 def forward_layer_inference_ragged(
     config: Config,
     x: Float[Array, "T D"],
@@ -475,6 +513,8 @@ def forward_layer_inference_ragged(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
+    rope_sin: jax.Array,
+    rope_cos: jax.Array,
     *,
     dtype: jnp.dtype,
 ):
@@ -527,9 +567,8 @@ def forward_layer_inference_ragged(
     q = rms_norm(q, w["q_norm"], config.rms_norm_eps)
     k = rms_norm(k, w["k_norm"], config.rms_norm_eps)
 
-    rope_theta = get_rope_theta(config)
-    q = apply_rope_ragged(q, rope_theta, positions)
-    k = apply_rope_ragged(k, rope_theta, positions)
+    q = apply_rope_ragged_cached(q, rope_sin, rope_cos, positions)
+    k = apply_rope_ragged_cached(k, rope_sin, rope_cos, positions)
 
     kv = jnp.stack([k, v], axis=2).reshape(
         k.shape[0], config.num_key_value_heads * 2, config.head_dim
@@ -560,7 +599,7 @@ def forward_layer_inference_ragged(
             "td,fd->tf",
             x_norm,
             w["gate_proj"],
-            preferred_element_type=jnp.float32,
+            preferred_element_type=dtype,
             out_sharding=logical_to_physical(("batch", "model"), rules),
         )
     )
@@ -594,6 +633,8 @@ def forward_inference_ragged_paged(
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
     num_seqs: jax.Array,
+    rope_sin: jax.Array,
+    rope_cos: jax.Array,
     *,
     dtype: jnp.dtype,
     ragged_attention,
@@ -638,6 +679,8 @@ def forward_inference_ragged_paged(
             page_indices,
             cu_q_lens,
             num_seqs,
+            rope_sin,
+            rope_cos,
             dtype=dtype,
         )
         new_kv_cache.append(kv_pages)

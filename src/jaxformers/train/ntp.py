@@ -18,12 +18,12 @@ from rich.themes import DEFAULT
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-import wandb
 from jaxformers import tree_util
 from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import loraify
+from jaxformers.logger import load as load_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizer_utils import (
@@ -346,6 +346,7 @@ def train(
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
     to_log_later = {}
     program_wall_t0 = None
+    first_compile_time = None
     warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
@@ -383,7 +384,7 @@ def train(
                 break
 
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
-            if step == 0 and first_step:
+            if first_step:
                 with jax.named_scope("compile train step"):
                     start_time = time.monotonic()
                     train_step_fn = (
@@ -441,44 +442,59 @@ def train(
     finally:
         if program_wall_t0 is not None:
             to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        if first_compile_time is not None:
+            to_log_later["compile_time"] = first_compile_time
+        final_cum = process_aux(global_aux, "cum")
+        final_cum = pbar_display(final_cum)
+        to_log_later.update(final_cum)
+        token_count = to_log_later.get("cum/token_count")
+        program_time = to_log_later.get("program_time")
+        if token_count is not None and program_time:
+            to_log_later["systems/tok_s"] = token_count / program_time
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()
 
-    print("DEBUGPRINT {to_log_later}:", to_log_later)
-    return model
+    return model, to_log_later
+
+
+def create_logger(config: sws.FinalConfig):
+    if jax.process_index() != 0:
+        return load_logger(config, "noop")
+    logger_name = getattr(config, "logger_name", "noop")
+    return load_logger(config, logger_name)
 
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    rngs = jax.random.key(config.train_seed) if config.train_seed else None
+    logger = create_logger(config)
+    try:
+        rngs = jax.random.key(config.train_seed) if config.train_seed else None
 
-    if not config.random_init and not config.resume:
-        # reinventing flax lol
-        model = load_model(config, config.model_name)
-        scheduler = load_scheduler(config, config.lr_scheduler_name)
-        if config.use_lora:
-            if config.random_init_lora:
-                rngs, lora_rngs = jax.random.split(rngs, 2)
-                model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
-            else:
-                raise NotImplementedError
-        t0 = time.monotonic()
-        model = load_optimizer(config, model, config.optimizer_name, scheduler)
-        diff = time.monotonic() - t0
-        print(f"Created optimizer and its state in {diff:.2f} seconds.")
-    else:
-        raise NotImplementedError
+        if not config.random_init and not config.resume:
+            model = load_model(config, config.model_name)
+            scheduler = load_scheduler(config, config.lr_scheduler_name)
+            if config.use_lora:
+                if config.random_init_lora:
+                    rngs, lora_rngs = jax.random.split(rngs, 2)
+                    model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
+                else:
+                    raise NotImplementedError
+            t0 = time.monotonic()
+            model = load_optimizer(config, model, config.optimizer_name, scheduler)
+            diff = time.monotonic() - t0
+            print(f"Created optimizer and its state in {diff:.2f} seconds.")
+        else:
+            raise NotImplementedError
 
-    train_ds, eval_ds = load_dataset(config, config.data_name)
-
-    log_config_wandb = config.to_dict()
-    del log_config_wandb["wandb"]
-    logger = wandb.init(**config.wandb.to_dict(), config=log_config_wandb)
-
-    train(config, model, train_ds, eval_ds, logger, rngs)
+        train_ds, eval_ds = load_dataset(config, config.data_name)
+        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs)
+        return metrics
+    finally:
+        if jax.process_index() == 0:
+            logger.finish()
 
 
 if __name__ == "__main__":

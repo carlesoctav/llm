@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+from jax.experimental.pallas.ops.tpu.ragged_paged_attention import ragged_paged_attention
 from safetensors import safe_open
 from transformers import (
     AddedToken,
@@ -388,6 +390,8 @@ def load(
             for k, v in tokenizer_config["added_tokens_decoder"].items()
         },
     )
+    if "chat_template" in tokenizer_config:
+        tokenizer.chat_template = tokenizer_config["chat_template"]
 
     cfg = AutoConfig.from_pretrained(model_ckpt_dir)
     if not isinstance(cfg, PreTrainedConfig):
@@ -448,3 +452,203 @@ def load(
         unembed = partial(unembed, cfg),
         lm_head_key = "model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm.head.weight"
     )
+
+
+def apply_rope_ragged(x: jax.Array, theta: float, positions: jax.Array) -> jax.Array:
+    # x: [T, N, H]
+    T, N, H = x.shape
+    if H % 2 != 0:
+        raise ValueError("RoPE head_dim must be even")
+
+    pos = positions.astype(jnp.float32)
+    freq = 1.0 / (theta ** (jnp.arange(0, H, 2, dtype=jnp.float32) / H))  # (H/2,)
+    inp = einsum("t,h->th", pos, freq, precision=jax.lax.Precision.HIGHEST)  # (T,H/2)
+
+    x1, x2 = x[:, :, : H // 2], x[:, :, H // 2 :]
+    sin = jnp.sin(inp).astype(x.dtype)[:, None, :]
+    cos = jnp.cos(inp).astype(x.dtype)[:, None, :]
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+
+def forward_layer_inference_ragged(
+    config: Config,
+    x: Float[Array, "T D"],
+    w: dict[str, Array],
+    ragged_attention,
+    kv_pages: jax.Array,
+    positions: jax.Array,
+    page_ids: jax.Array,
+    page_offsets: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    dtype: jnp.dtype,
+):
+    rules = config.sharding_rules
+
+    x_norm = rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
+    x_norm = reshard(x_norm, logical_to_physical(("batch", "none"), rules))
+
+    q = einsum(
+        "td,md->tm",
+        x_norm,
+        w["q_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "model"), rules),
+    )
+    k = einsum(
+        "td,md->tm",
+        x_norm,
+        w["k_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "model"), rules),
+    )
+    v = einsum(
+        "td,md->tm",
+        x_norm,
+        w["v_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "model"), rules),
+    )
+
+    q = rearrange(
+        q,
+        "t (n h) -> t n h",
+        n=config.num_attention_heads,
+        h=config.head_dim,
+    )
+    k = rearrange(
+        k,
+        "t (k h) -> t k h",
+        k=config.num_key_value_heads,
+        h=config.head_dim,
+    )
+    v = rearrange(
+        v,
+        "t (k h) -> t k h",
+        k=config.num_key_value_heads,
+        h=config.head_dim,
+    )
+
+    q = rms_norm(q, w["q_norm"], config.rms_norm_eps)
+    k = rms_norm(k, w["k_norm"], config.rms_norm_eps)
+
+    rope_theta = get_rope_theta(config)
+    q = apply_rope_ragged(q, rope_theta, positions)
+    k = apply_rope_ragged(k, rope_theta, positions)
+
+    kv = jnp.stack([k, v], axis=2).reshape(
+        k.shape[0], config.num_key_value_heads * 2, config.head_dim
+    )
+    kv_pages = kv_pages.at[page_ids, page_offsets].set(
+        kv,
+        mode=jax.lax.GatherScatterMode.FILL_OR_DROP,
+        wrap_negative_indices=False,
+    )
+
+    attn_out = ragged_attention(q, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs)
+
+    attn_out = rearrange(attn_out, "t n h -> t (n h)")
+    o = einsum(
+        "td,ed->te",
+        attn_out,
+        w["o_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "none"), rules),
+    )
+    x = x + o
+
+    x_norm = rms_norm(x, w["post_attention_layernorm"], config.rms_norm_eps)
+    x_norm = reshard(x_norm, logical_to_physical(("batch", "none"), rules))
+
+    gate = jax.nn.silu(
+        einsum(
+            "td,fd->tf",
+            x_norm,
+            w["gate_proj"],
+            preferred_element_type=jnp.float32,
+            out_sharding=logical_to_physical(("batch", "model"), rules),
+        )
+    )
+    up = einsum(
+        "td,fd->tf",
+        x_norm,
+        w["up_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "model"), rules),
+    )
+    x = x + einsum(
+        "tf,df->td",
+        gate * up,
+        w["down_proj"],
+        preferred_element_type=dtype,
+        out_sharding=logical_to_physical(("batch", "none"), rules),
+    )
+
+    return x, kv_pages
+
+
+def forward_inference_ragged_paged(
+    config: Config,
+    weights: PyTree[Array, "ModelWeights"],
+    kv_cache: tuple[jax.Array, ...],
+    token_ids: jax.Array,
+    positions: jax.Array,
+    page_ids: jax.Array,
+    page_offsets: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    num_seqs: jax.Array,
+    *,
+    dtype: jnp.dtype,
+    ragged_attention,
+):
+    rules = config.sharding_rules
+    x = (
+        weights["model.embed_tokens.weight"]
+        .at[token_ids, :]
+        .get(out_sharding=logical_to_physical(("batch", "none"), rules))
+        .astype(dtype)
+    )
+
+    new_kv_cache: list[jax.Array] = []
+    for layer_idx in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer_idx}."
+        layer_weights = {
+            "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
+            "post_attention_layernorm": weights[
+                f"{prefix}post_attention_layernorm.weight"
+            ],
+            "q_proj": weights[f"{prefix}self_attn.q_proj.weight"],
+            "k_proj": weights[f"{prefix}self_attn.k_proj.weight"],
+            "v_proj": weights[f"{prefix}self_attn.v_proj.weight"],
+            "o_proj": weights[f"{prefix}self_attn.o_proj.weight"],
+            "q_norm": weights[f"{prefix}self_attn.q_norm.weight"],
+            "k_norm": weights[f"{prefix}self_attn.k_norm.weight"],
+            "gate_proj": weights[f"{prefix}mlp.gate_proj.weight"],
+            "up_proj": weights[f"{prefix}mlp.up_proj.weight"],
+            "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
+        }
+
+        x, kv_pages = forward_layer_inference_ragged(
+            config,
+            x,
+            layer_weights,
+            ragged_attention,
+            kv_cache[layer_idx],
+            positions,
+            page_ids,
+            page_offsets,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            num_seqs,
+            dtype=dtype,
+        )
+        new_kv_cache.append(kv_pages)
+
+    x = rms_norm(x, weights["model.norm.weight"], config.rms_norm_eps).astype(dtype)
+    return x, tuple(new_kv_cache)

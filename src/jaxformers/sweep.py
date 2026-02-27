@@ -224,16 +224,6 @@ def main(argv: list[str]) -> int:
             train_script_path=train_script,
             run_config_path=str(cfg_path),
         )
-        result = payload.get("result")
-        if isinstance(result, dict):
-            token_count = result.get("cum/token_count")
-            program_time = result.get("program_time")
-            if (
-                result.get("tokens_per_s") is None
-                and token_count is not None
-                and program_time
-            ):
-                result["tokens_per_s"] = token_count / program_time
         payload["run_idx"] = idx
         payload["config_path"] = str(cfg_path)
         out_path = output_dir / f"{idx}.json"

@@ -107,7 +107,7 @@ def run_worker(
             raise ConfigLoadError(f"`get_config` function not found in {run_config_path}")
         builder = factory()
         config = builder.finalize([])
-        payload["config_json"] = config.to_json()
+        payload["config_json"] = json.loads(config.to_json())
         train_main = load_train_main(train_script_path)
         result = train_main(config)
         payload["ok"] = True

@@ -1,0 +1,120 @@
+{
+  "config_json": {
+    "checkpoint_options": {
+      "max_to_keep": 1,
+      "save_interval_steps": 10000
+    },
+    "ckpt_path": "gs://carles-git-good/",
+    "data": {
+      "load_kwargs": [
+        {
+          "path": "allenai/Dolci-Instruct-SFT",
+          "split": "train",
+          "streaming": false
+        }
+      ],
+      "transforms": {
+        "assistant_loss": false,
+        "chat_template_path": null,
+        "column": "messages",
+        "is_chat": true,
+        "is_tokenized": false,
+        "max_length": 2048,
+        "packing": true,
+        "packing_bins": 64,
+        "tokenizer": "<non-jsonable object of type Qwen2Tokenizer; repr: Qwen2Tokenizer(name_or_path='Qwen/Qwen3-0.6B', vocab_size=151643, model_max_length=131072, padding_side='right', truncation_side='right', special_tokens={'eos_token': '<|im_end|>', 'pad_token': '<|endoftext|>'}, added_tokens_decoder={\n\t151643: AddedToken(\"<|endoftext|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151644: AddedToken(\"<|im_start|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151645: AddedToken(\"<|im_end|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151646: AddedToken(\"<|object_ref_start|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151647: AddedToken(\"<|object_ref_end|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151648: AddedToken(\"<|box_start|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151649: AddedToken(\"<|box_end|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151650: AddedToken(\"<|quad_start|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151651: AddedToken(\"<|quad_end|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151652: AddedToken(\"<|vision_start|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151653: AddedToken(\"<|vision_end|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151654: AddedToken(\"<|vision_pad|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151655: AddedToken(\"<|image_pad|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151656: AddedToken(\"<|video_pad|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),\n\t151657: AddedToken(\"<tool_call>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151658: AddedToken(\"</tool_call>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151659: AddedToken(\"<|fim_prefix|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151660: AddedToken(\"<|fim_middle|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151661: AddedToken(\"<|fim_suffix|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151662: AddedToken(\"<|fim_pad|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151663: AddedToken(\"<|repo_name|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151664: AddedToken(\"<|file_sep|>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151665: AddedToken(\"<tool_response>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151666: AddedToken(\"</tool_response>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151667: AddedToken(\"<think>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n\t151668: AddedToken(\"</think>\", rstrip=False, lstrip=False, single_word=False, normalized=False, special=False),\n}\n)>"
+      }
+    },
+    "data_name": "huggingface",
+    "dir": "gs://carles-git-good",
+    "eval_every": null,
+    "exp_name": "",
+    "forward_dtype": "<non-jsonable object of type _ScalarMeta; repr: <class 'jax.numpy.bfloat16'>>",
+    "learning_rate": 1e-05,
+    "log": {
+      "grad_norm": true,
+      "learning_rate": true
+    },
+    "logger_name": "noop",
+    "loss_implementation": "xla_chunked",
+    "lr_scheduler_name": null,
+    "max_train_step": 30,
+    "model": {
+      "additional_config": {
+        "attn_implementation": "xla_chunked",
+        "remat_layer": true,
+        "sequence_parallelism": true
+      },
+      "devices": [
+        "<non-jsonable object of type Device; repr: TpuDevice(id=0, process_index=0, coords=(0,0,0), core_on_chip=0)>",
+        "<non-jsonable object of type Device; repr: TpuDevice(id=1, process_index=0, coords=(1,0,0), core_on_chip=0)>",
+        "<non-jsonable object of type Device; repr: TpuDevice(id=2, process_index=0, coords=(0,1,0), core_on_chip=0)>",
+        "<non-jsonable object of type Device; repr: TpuDevice(id=3, process_index=0, coords=(1,1,0), core_on_chip=0)>"
+      ],
+      "model_id": "Qwen/Qwen3-0.6B",
+      "parallel_dims": {
+        "cp": 1,
+        "dp_replicate": 1,
+        "dp_shard": 1,
+        "tp": 4
+      },
+      "param_dtype": "<non-jsonable object of type _ScalarMeta; repr: <class 'jax.numpy.bfloat16'>>"
+    },
+    "model_name": "qwen3",
+    "optimizer": {
+      "grad_accum": 1,
+      "max_grad_norm": 1.0
+    },
+    "optimizer_name": "sgd",
+    "random_init": false,
+    "resume": false,
+    "skip_eval": true,
+    "train_loader": {
+      "drop_remainder": true,
+      "global_batch_size": 32,
+      "seed": 42,
+      "shuffle": false,
+      "worker_buffer_size": 100,
+      "worker_count": 8
+    },
+    "train_seed": 42,
+    "use_lora": false
+  },
+  "config_path": "config/sweep/loss_impl_fix_length_inc_batch/2.py",
+  "error": null,
+  "ok": true,
+  "overrides": [
+    [
+      "data.transforms.max_length",
+      2048
+    ],
+    [
+      "optimizer_name",
+      "sgd"
+    ],
+    [
+      "loss_implementation",
+      "xla_chunked"
+    ],
+    [
+      "train_loader.global_batch_size",
+      32
+    ]
+  ],
+  "proc_exit_code": 0,
+  "result": {
+    "argument_gb": 0.7,
+    "compile_time": 26.451331065036356,
+    "cum/loss": 1.604984164237976,
+    "cum/token_count": 1921127,
+    "host_temp_gb": 0.0,
+    "output_gb": 0.7,
+    "program_time": 290.42697051819414,
+    "systems/tok_s": 6614.836757661419,
+    "temp_gb": 27.0,
+    "tokens_per_s": 6614.836757661419,
+    "total_gb": 28.4
+  },
+  "run_config_path": "config/sweep/loss_impl_fix_length_inc_batch/2.py",
+  "run_idx": 2
+}

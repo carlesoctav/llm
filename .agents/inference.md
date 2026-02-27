@@ -29,7 +29,7 @@ Goal: build a simple, vLLM-like continuous batching engine for JAX models (start
    - mark `"assistant"` segments as generated when configured (default `["last", "assistant"]`).
 
 ## Phase 2 — Paged KV cache layout + metadata
-1. Choose `page_size` (start with 32; sweep {16, 32, 64} later).
+1. Choose `page_size` (start with 64; sweep {16, 32, 64} on TPU).
 2. Allocate KV pages per layer:
    - layout required by `jax.experimental.pallas.ops.tpu.ragged_paged_attention`:
      `[num_pages, page_size, num_combined_kv_heads, head_dim]`

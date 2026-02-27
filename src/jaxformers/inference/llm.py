@@ -21,7 +21,7 @@ class LLM:
         max_num_batched_tokens: int,
         max_num_seqs: int,
         max_model_len: int,
-        page_size: int = 32,
+        page_size: int = 64,
         dtype=None,
         seed: int = 0,
         generation_mask_modes: list[str] | None = None,

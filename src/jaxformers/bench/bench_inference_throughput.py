@@ -65,7 +65,7 @@ def main() -> None:
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--page-size", type=int, default=32)
+    parser.add_argument("--page-size", type=int, default=64)
 
     parser.add_argument(
         "--prompt-format",

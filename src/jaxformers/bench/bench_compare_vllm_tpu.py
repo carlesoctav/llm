@@ -52,7 +52,7 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    page_sizes = args.page_size if args.page_size is not None else [32]
+    page_sizes = args.page_size if args.page_size is not None else [64]
 
     results_summary: list[dict] = []
 

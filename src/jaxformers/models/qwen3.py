@@ -68,15 +68,7 @@ Config: TypeAlias = PreTrainedConfig
 
 
 def get_rope_theta(cfg: Config) -> float:
-    rope_parameters = getattr(cfg, "rope_parameters", None)
-    if (
-        not isinstance(rope_parameters, dict)
-        or rope_parameters.get("rope_theta") is None
-    ):
-        raise TypeError(
-            "Qwen-3 config must define `rope_parameters` as a dict with a `rope_theta` key "
-            "(e.g. {'rope_theta': 1000000, ...})."
-        )
+    rope_parameters = cfg.rope_parameters
     return float(rope_parameters["rope_theta"])
 
 

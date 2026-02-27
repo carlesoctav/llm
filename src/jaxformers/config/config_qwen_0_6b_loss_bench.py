@@ -100,12 +100,15 @@ def get_config():
     config.checkpoint_options.save_interval_steps = 10000
     config.checkpoint_options.max_to_keep = 1
 
-    # config.logger.project = "bench-loss-impl"
-    # config.logger.name = lambda: config.exp_name
+    config.logger.project = "bench-loss-impl"
+    config.logger.name = lambda: config.exp_name
+
+    config.logger.resume = lambda: "allow" if config.resume else "never"
+
     # config.logger.entity =
     # config.logger.dir =
-    # config.logger.id =
     # config.logger.notes =
     # config.logger.tags =
 
     return config
+

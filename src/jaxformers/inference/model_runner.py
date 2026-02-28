@@ -12,8 +12,26 @@ from jaxformers.models import qwen3
 
 
 @dataclass(frozen=True)
-class CompiledStep:
+class CompiledBackbone:
     max_tokens: int
+    fn: callable
+
+
+@dataclass(frozen=True)
+class CompiledSelect:
+    padded_num_seqs: int
+    fn: callable
+
+
+@dataclass(frozen=True)
+class CompiledLogits:
+    padded_num_seqs: int
+    fn: callable
+
+
+@dataclass(frozen=True)
+class CompiledSample:
+    padded_num_seqs: int
     fn: callable
 
 
@@ -31,7 +49,10 @@ class JaxModelRunner:
         self.max_model_len = max_model_len
         self.dtype = dtype
 
-        self._compiled: dict[int, CompiledStep] = {}
+        self._backbone: dict[int, CompiledBackbone] = {}
+        self._select: dict[int, CompiledSelect] = {}
+        self._logits: dict[int, CompiledLogits] = {}
+        self._sample: dict[tuple[int, bool], CompiledSample] = {}
 
         model_type = model.config.model_type
         if model_type != "qwen3":
@@ -49,37 +70,79 @@ class JaxModelRunner:
         self.rope_sin = jax.device_put(rope_sin, replicated)
         self.rope_cos = jax.device_put(rope_cos, replicated)
 
-    def compile(self, *, max_num_batched_tokens: int, min_bucket_tokens: int = 16) -> None:
-        buckets: list[int] = []
-        n = min_bucket_tokens
+    def compile(
+        self,
+        *,
+        max_num_batched_tokens: int,
+        min_token_bucket: int = 16,
+        min_seq_bucket: int = 8,
+    ) -> None:
+        token_buckets: list[int] = []
+        n = int(min_token_bucket)
         if n < 1:
-            raise ValueError("min_bucket_tokens must be >= 1")
+            raise ValueError("min_token_bucket must be >= 1")
         while n < max_num_batched_tokens:
-            buckets.append(n)
+            token_buckets.append(n)
             n *= 2
-        buckets.append(max_num_batched_tokens)
+        token_buckets.append(int(max_num_batched_tokens))
 
-        for max_tokens in buckets:
-            self._compiled[max_tokens] = CompiledStep(
+        for max_tokens in token_buckets:
+            self._backbone[max_tokens] = CompiledBackbone(
                 max_tokens=max_tokens,
-                fn=self._compile_one(max_tokens=max_tokens),
+                fn=self._compile_backbone(max_tokens=max_tokens),
             )
 
-    def pick_bucket(self, total_q_tokens: int) -> int:
+        seq_buckets: list[int] = []
+        m = int(min_seq_bucket)
+        if m < 1:
+            raise ValueError("min_seq_bucket must be >= 1")
+        while m < self.max_num_seqs:
+            seq_buckets.append(m)
+            m *= 2
+        seq_buckets.append(self.max_num_seqs)
+
+        for padded_num_seqs in seq_buckets:
+            self._select[padded_num_seqs] = CompiledSelect(
+                padded_num_seqs=padded_num_seqs,
+                fn=self._compile_select(padded_num_seqs=padded_num_seqs),
+            )
+            self._logits[padded_num_seqs] = CompiledLogits(
+                padded_num_seqs=padded_num_seqs,
+                fn=self._compile_logits(padded_num_seqs=padded_num_seqs),
+            )
+            for do_sampling in (False, True):
+                self._sample[(padded_num_seqs, do_sampling)] = CompiledSample(
+                    padded_num_seqs=padded_num_seqs,
+                    fn=self._compile_sample(
+                        padded_num_seqs=padded_num_seqs, do_sampling=do_sampling
+                    ),
+                )
+
+    def pick_token_bucket(self, total_q_tokens: int) -> int:
         if total_q_tokens < 0:
             raise ValueError("total_q_tokens must be >= 0")
         if total_q_tokens == 0:
-            return min(self._compiled)
+            return min(self._backbone)
         want = 1 << int(math.ceil(math.log2(total_q_tokens)))
-        if want in self._compiled:
+        if want in self._backbone:
             return want
-        # Fallback: smallest bucket that fits.
-        for k in sorted(self._compiled):
+        for k in sorted(self._backbone):
             if k >= total_q_tokens:
                 return k
         raise ValueError("total_q_tokens exceeds compiled max_num_batched_tokens")
 
-    def step(
+    def pick_seq_bucket(self, num_sampled: int) -> int:
+        if num_sampled < 1:
+            raise ValueError("num_sampled must be >= 1")
+        want = 1 << int(math.ceil(math.log2(num_sampled)))
+        if want in self._select:
+            return want
+        for k in sorted(self._select):
+            if k >= num_sampled:
+                return k
+        raise ValueError("num_sampled exceeds compiled max_num_seqs")
+
+    def backbone(
         self,
         *,
         max_tokens: int,
@@ -92,11 +155,8 @@ class JaxModelRunner:
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
         num_seqs: jax.Array,
-        sample_mask: jax.Array,
-        rng: jax.Array,
-        temperature: float,
-    ) -> tuple[tuple[jax.Array, ...], jax.Array, jax.Array]:
-        compiled = self._compiled[max_tokens]
+    ) -> tuple[tuple[jax.Array, ...], jax.Array]:
+        compiled = self._backbone[max_tokens]
         return compiled.fn(
             kv_cache,
             token_ids,
@@ -107,15 +167,40 @@ class JaxModelRunner:
             page_indices,
             cu_q_lens,
             num_seqs,
-            sample_mask,
-            rng,
-            temperature,
         )
 
-    def _compile_one(self, *, max_tokens: int):
+    def select(
+        self,
+        *,
+        padded_num_seqs: int,
+        last_hidden: jax.Array,
+        indices: jax.Array,
+    ) -> jax.Array:
+        compiled = self._select[padded_num_seqs]
+        return compiled.fn(last_hidden, indices)
+
+    def compute_logits(
+        self, *, padded_num_seqs: int, hidden: jax.Array
+    ) -> jax.Array:
+        compiled = self._logits[padded_num_seqs]
+        return compiled.fn(hidden)
+
+    def sample(
+        self,
+        *,
+        padded_num_seqs: int,
+        rng: jax.Array,
+        logits: jax.Array,
+        temperature: float,
+        do_sampling: bool,
+    ) -> jax.Array:
+        compiled = self._sample[(padded_num_seqs, do_sampling)]
+        return compiled.fn(rng, logits, temperature)
+
+    def _compile_backbone(self, *, max_tokens: int):
         model = self.model
-        max_num_seqs = self.max_num_seqs
         dtype = self.dtype
+        max_num_seqs = self.max_num_seqs
         mesh = jax.sharding.get_mesh()
 
         in_specs = (
@@ -150,7 +235,7 @@ class JaxModelRunner:
             )
         )
 
-        def _step(
+        def _backbone(
             kv_cache: tuple[jax.Array, ...],
             token_ids: jax.Array,  # [max_tokens]
             positions: jax.Array,  # [max_tokens]
@@ -160,9 +245,6 @@ class JaxModelRunner:
             page_indices: jax.Array,  # [max_num_seqs, pages_per_seq]
             cu_q_lens: jax.Array,  # [max_num_seqs + 1]
             num_seqs: jax.Array,  # [1]
-            sample_mask: jax.Array,  # [max_num_seqs]
-            rng: jax.Array,
-            temperature: float,
         ):
             hidden, new_kv_cache = qwen3.forward_inference_ragged_paged(
                 model.config,
@@ -186,27 +268,42 @@ class JaxModelRunner:
             has_q = q_lens > 0
             last_idx = jnp.where(has_q, cu_q_lens[1:] - 1, 0)
             last_hidden = hidden[last_idx]  # [max_num_seqs, hidden]
+            return new_kv_cache, last_hidden
 
+        return jax.jit(
+            _backbone,
+            donate_argnums=(0,),
+        )
+
+    def _compile_select(self, *, padded_num_seqs: int):
+        def _select(last_hidden: jax.Array, indices: jax.Array) -> jax.Array:
+            safe = jnp.where(indices >= 0, indices, 0)
+            return last_hidden[safe]
+
+        return jax.jit(_select)
+
+    def _compile_logits(self, *, padded_num_seqs: int):
+        model = self.model
+        dtype = self.dtype
+
+        def _logits(hidden: jax.Array) -> jax.Array:
             logits = model.unembed(
                 model.weights,
-                last_hidden[:, None, :],
+                hidden[:, None, :],
                 dtype=jnp.float32,
                 compute_dtype=dtype,
             )[:, 0, :]
+            return logits
 
-            if temperature == 0.0:
-                sampled = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            else:
+        return jax.jit(_logits)
+
+    def _compile_sample(self, *, padded_num_seqs: int, do_sampling: bool):
+        def _sample(rng: jax.Array, logits: jax.Array, temperature: float) -> jax.Array:
+            if do_sampling:
                 sampled = jax.random.categorical(
                     rng, logits / temperature, axis=-1
                 ).astype(jnp.int32)
+                return sampled
+            return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
-            next_token_ids = jnp.where(sample_mask, sampled, jnp.zeros_like(sampled))
-            next_rng = jax.random.split(rng, 2)[1]
-            return new_kv_cache, next_token_ids, next_rng
-
-        return jax.jit(
-            _step,
-            donate_argnums=(0,),
-            static_argnames=("temperature",),
-        )
+        return jax.jit(_sample)

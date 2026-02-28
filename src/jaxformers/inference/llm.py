@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from jaxformers.inference.scheduler import Request
+from jaxformers.inference.sampling import SamplingParams
 from jaxformers.inference.worker import EngineConfig, JaxWorker
 from jaxformers.modeling_utils import Model
 
@@ -102,6 +103,14 @@ class LLM:
             eos_token_id = -1
         eos_token_id = int(eos_token_id)
 
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=float(temperature),
+            top_p=1.0,
+            top_k=0,
+            ignore_eos=ignore_eos,
+        )
+
         requests: list[Request] = []
         if prompts:
             if isinstance(prompts[0], str):
@@ -112,9 +121,8 @@ class LLM:
                             request_id=i,
                             prompt_token_ids=prompt_token_ids,
                             prompt_generation_mask=prompt_mask,
-                            max_tokens=max_tokens,
                             eos_token_id=eos_token_id,
-                            ignore_eos=ignore_eos,
+                            sampling_params=sampling_params,
                         )
                     )
             elif isinstance(prompts[0], list) and prompts[0] and isinstance(prompts[0][0], int):
@@ -124,9 +132,8 @@ class LLM:
                             request_id=i,
                             prompt_token_ids=token_ids,
                             prompt_generation_mask=[False for _ in range(len(token_ids))],
-                            max_tokens=max_tokens,
                             eos_token_id=eos_token_id,
-                            ignore_eos=ignore_eos,
+                            sampling_params=sampling_params,
                         )
                     )
             else:
@@ -139,28 +146,17 @@ class LLM:
                             request_id=i,
                             prompt_token_ids=prompt_token_ids,
                             prompt_generation_mask=prompt_mask,
-                            max_tokens=max_tokens,
                             eos_token_id=eos_token_id,
-                            ignore_eos=ignore_eos,
+                            sampling_params=sampling_params,
                         )
                     )
 
         for req in requests:
             self.worker.add_request(req)
 
-        finished = self.worker.run(temperature=temperature)
-
         outputs: list[GenerateOutput] = []
+        finished = self.worker.run(temperature=float(temperature))
         for i in range(len(requests)):
-            seq = finished[i]
-            token_ids = seq.request.prompt_token_ids + seq.generated_token_ids
-            generation_mask = seq.request.prompt_generation_mask + [
-                True for _ in range(len(seq.generated_token_ids))
-            ]
-            outputs.append(
-                GenerateOutput(
-                    token_ids=token_ids,
-                    generation_mask=generation_mask,
-                )
-            )
+            token_ids, generation_mask = finished[i]
+            outputs.append(GenerateOutput(token_ids=token_ids, generation_mask=generation_mask))
         return outputs

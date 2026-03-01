@@ -20,6 +20,7 @@ class EngineConfig:
     page_size: int
     dtype: jnp.dtype
     seed: int
+    prefill_chunk_size: int | None = None
 
 
 class JaxWorker:
@@ -31,6 +32,7 @@ class JaxWorker:
             max_num_seqs=config.max_num_seqs,
             max_model_len=config.max_model_len,
             max_num_batched_tokens=config.max_num_batched_tokens,
+            prefill_chunk_size=config.prefill_chunk_size,
         )
 
         cfg = model.config

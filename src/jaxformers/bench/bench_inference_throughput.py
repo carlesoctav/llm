@@ -63,6 +63,7 @@ def main() -> None:
     parser.add_argument("--output-len", type=int, default=None)
 
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--prefill-chunk-size", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--page-size", type=int, default=64)
@@ -134,6 +135,7 @@ def main() -> None:
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
+        prefill_chunk_size=args.prefill_chunk_size,
         page_size=args.page_size,
         seed=args.seed,
     )
@@ -167,6 +169,7 @@ def main() -> None:
     )
 
     prompts: list[str] | list[list[int]]
+
     if args.prompt_format == "tokens":
         prompts = []
         for i in range(args.num_prompts):

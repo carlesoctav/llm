@@ -22,6 +22,7 @@ class LLM:
         max_num_batched_tokens: int,
         max_num_seqs: int,
         max_model_len: int,
+        prefill_chunk_size: int | None = None,
         page_size: int = 64,
         dtype=None,
         seed: int = 0,
@@ -43,6 +44,7 @@ class LLM:
                 page_size=page_size,
                 dtype=dtype,
                 seed=seed,
+                prefill_chunk_size=prefill_chunk_size,
             ),
         )
 

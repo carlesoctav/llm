@@ -59,10 +59,20 @@ class Scheduler:
         max_num_seqs: int,
         max_model_len: int,
         max_num_batched_tokens: int,
+        prefill_chunk_size: int | None = None,
     ) -> None:
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
+        if prefill_chunk_size is not None:
+            if prefill_chunk_size < 1:
+                raise ValueError("prefill_chunk_size must be >= 1")
+            if prefill_chunk_size > max_num_batched_tokens:
+                raise ValueError(
+                    "prefill_chunk_size must be <= max_num_batched_tokens "
+                    f"({prefill_chunk_size} > {max_num_batched_tokens})"
+                )
+        self.prefill_chunk_size = prefill_chunk_size
 
         self.pending: list[Request] = []
         self.slots: list[Sequence | None] = [None for _ in range(max_num_seqs)]
@@ -169,7 +179,10 @@ class Scheduler:
             if seq.cached_len >= seq.prompt_len:
                 continue
             remaining = seq.prompt_len - seq.cached_len
-            chunk = remaining if remaining <= token_budget else token_budget
+            cap = remaining
+            if self.prefill_chunk_size is not None:
+                cap = min(cap, int(self.prefill_chunk_size))
+            chunk = min(cap, token_budget)
             q_lens[slot_id] = chunk
             kv_lens[slot_id] = seq.cached_len + chunk
             # Only sample when we finish the prompt in this step.

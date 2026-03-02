@@ -290,10 +290,17 @@ def eval(model, eval_ds):
 
 
 def process_aux(accum_aux: dict[str, Any], namespace=""):
-    return {
-        f"{namespace}/{k}": v[0] / v[1] if isinstance(v, tuple) else v
-        for k, v in accum_aux.items()
-    }
+    def finalize(v: Any) -> Any:
+        if not isinstance(v, tuple):
+            return v
+        num, denom = v
+        denom_is_zero = denom == 0
+        # `denom` may be a python scalar (e.g. after an early failure) or an array.
+        if isinstance(denom_is_zero, (bool, np.bool_)):
+            return (num / denom) if not denom_is_zero else jnp.nan
+        return jnp.where(denom_is_zero, jnp.nan, num / denom)
+
+    return {f"{namespace}/{k}": finalize(v) for k, v in accum_aux.items()}
 
 
 def add_aux(accum_aux, aux):
@@ -388,7 +395,7 @@ def train(
                 with jax.named_scope("compile train step"):
                     start_time = time.monotonic()
                     train_step_fn = (
-                        jax.jit(partial(train_step, config))
+                        jax.jit(partial(train_step, config), donate_argnums=(0,)
                         .lower(model, batch, loop_rngs)
                         .compile()
                     )
@@ -400,6 +407,8 @@ def train(
                         print("compile time: ", first_compile_time)
                         compiled_analysis = train_step_fn.memory_analysis()
                         memory_stats = print_compiled_memory_stats(compiled_analysis)
+                        cost = train_step_fn.cost_analysis()
+                        print("tflops", cost.get("flops") /1e12)
                         to_log_later.update(memory_stats)
                     first_step = False
             else:

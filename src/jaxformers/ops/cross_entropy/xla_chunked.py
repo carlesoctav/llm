@@ -11,8 +11,36 @@ def _apply_logit_soft_cap(logits: Float[Array, "B V"], logit_soft_cap: float | N
     return jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
 
-@partial(jax.jit, static_argnames = ["block_sizes", "dtype", "precision"])
-def fused_cross_entropy_chunked_xla(
+def _infer_named_sharding(x):
+    # Works for both eager jax.Arrays (x.sharding) and some tracers (x.aval.sharding).
+    sharding = getattr(x, "sharding", None)
+    if sharding is None:
+        aval = getattr(x, "aval", None)
+        sharding = getattr(aval, "sharding", None) if aval is not None else None
+    return (
+        sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
+    )
+
+
+def _named_sharding_is_nontrivial(named_sharding: jax.sharding.NamedSharding, shape) -> bool:
+    # Consider it non-trivial if any non-broadcasted dim is partitioned across an axis
+    # with size > 1.
+    mesh = named_sharding.mesh
+    spec = tuple(named_sharding.spec)
+    spec = spec + (None,) * (len(shape) - len(spec))
+    for axis_spec, dim in zip(spec, shape):
+        if dim == 1 or axis_spec is None:
+            continue
+        if isinstance(axis_spec, tuple):
+            if any(mesh.shape.get(a, 1) > 1 for a in axis_spec):
+                return True
+        else:
+            if mesh.shape.get(axis_spec, 1) > 1:
+                return True
+    return False
+
+
+def _fused_cross_entropy_chunked_xla_body(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
     w: Float[Array, "V H"],
@@ -89,3 +117,86 @@ def fused_cross_entropy_chunked_xla(
     (lse, loss) = jax.lax.fori_loop(0, num_b, b_body, (lse0, loss0))
 
     return loss, lse
+
+
+_fused_cross_entropy_chunked_xla_direct = partial(
+    jax.jit,
+    static_argnames=["block_sizes", "dtype", "precision"],
+)(_fused_cross_entropy_chunked_xla_body)
+
+
+def fused_cross_entropy_chunked_xla(
+    x: Float[Array, "B H"],
+    labels: Int[Array, " B"],
+    w: Float[Array, "V H"],
+    *,
+    block_sizes: BlockSizes,
+    dtype: jnp.dtype = jnp.float32,
+    logit_soft_cap: float | None = None,
+    precision: jax.lax.PrecisionLike = None,
+):
+    """Chunked CE kernel.
+
+    If inputs are sharded on the batch axis, run the kernel under `shard_map` so
+    internal loop carries remain type-stable (JAX includes sharding in carry types).
+    """
+    # Prefer label sharding (what the caller likely intends). If labels are replicated
+    # but activations are sharded, fall back to x so we still avoid carry type changes.
+    labels_sharding = _infer_named_sharding(labels)
+    x_sharding = _infer_named_sharding(x)
+    batch_sharding = None
+    if labels_sharding is not None and _named_sharding_is_nontrivial(
+        labels_sharding, labels.shape
+    ):
+        batch_sharding = labels_sharding
+    elif x_sharding is not None and _named_sharding_is_nontrivial(x_sharding, x.shape):
+        batch_sharding = x_sharding
+
+    if batch_sharding is None:
+        return _fused_cross_entropy_chunked_xla_direct(
+            x,
+            labels,
+            w,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    from jax.experimental import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    mesh = batch_sharding.mesh
+    spec = tuple(batch_sharding.spec) + (None,) * (labels.ndim - len(batch_sharding.spec))
+    batch_axis = spec[0]  # labels is [B]
+    if batch_axis is None:
+        return _fused_cross_entropy_chunked_xla_direct(
+            x,
+            labels,
+            w,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    def per_shard(x_local, labels_local, w_rep):
+        return _fused_cross_entropy_chunked_xla_body(
+            x_local,
+            labels_local,
+            w_rep,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    per_shard_mapped = shard_map.shard_map(
+        per_shard,
+        mesh,
+        (P(batch_axis, None), P(batch_axis), P(None, None)),
+        (P(batch_axis), P(batch_axis)),
+        check_rep=False,
+    )
+
+    return per_shard_mapped(x, labels, w)

@@ -28,6 +28,9 @@ def get_config():
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True
+    # Tunix uses attention-block remat (not full-layer remat). Keep default off
+    # here so existing runs are unchanged; override via CLI when comparing.
+    config.model.additional_config.remat_attention = False
     config.model.additional_config.attn_implementation = "xla_chunked"
     config.model.additional_config.sequence_parallelism = True
 

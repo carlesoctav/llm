@@ -28,6 +28,10 @@ class AdditionalConfig(TypedDict):
     # training
     gradient_checkpointing: bool = True
 
+    # Rematerialization / checkpointing
+    remat_layer: bool
+    remat_attention: bool
+
     # training and inference
     attn_implementation: str = "sdpa"
     sequence_parallelism: bool = True
@@ -36,6 +40,8 @@ class AdditionalConfig(TypedDict):
 
 DEFAULT_ADDITIONAL_CONFIG = {
     "gradient_checkpointing": True,
+    "remat_layer": False,
+    "remat_attention": False,
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
     "loss_parallel": True,

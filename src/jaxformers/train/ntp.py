@@ -227,7 +227,18 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
 
-        hidden_states = model.forward(weights, **batch["inputs"], rngs=rngs)
+        forward_dtype = getattr(config, "forward_dtype", None)
+        # `sws` may materialize callables in the config into concrete values. A JAX
+        # dtype (e.g. `jnp.bfloat16`) is itself callable, so only call non-type
+        # callables here.
+        if callable(forward_dtype) and not isinstance(forward_dtype, type):
+            forward_dtype = forward_dtype()
+        if forward_dtype is None:
+            forward_dtype = jnp.float32
+
+        hidden_states = model.forward(
+            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
+        )
         hidden_states = hidden_states.reshape(
             -1,
             hidden_states.shape[-1],
@@ -247,16 +258,26 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
             count = jnp.sum(batch["inputs"]["attention_mask"])
             mask = (batch["inputs"]["attention_mask"]).reshape(-1)
 
+        loss_impl = config.loss_implementation or None
+        loss_dtype = hidden_states.dtype if loss_impl == "reference" else jnp.float32
         loss = cross_entropy_loss(
             hidden_states,
             labels,
-            jax.reshard(
-                weights[model.lm_head_key],
-                logical_to_physical(("none", "none"), model.config.sharding_rules),
+            (
+                # The fused XLA chunked CE kernel currently assumes replicated
+                # vocab weights; avoid forcing replication for the reference
+                # implementation to match Tunix's fsdp-sharded embed/lm_head.
+                jax.reshard(
+                    weights[model.lm_head_key],
+                    logical_to_physical(("none", "none"), model.config.sharding_rules),
+                )
+                if (config.loss_implementation or None) != "reference"
+                else weights[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
-            implementation=config.loss_implementation or None,
+            implementation=loss_impl,
+            dtype=loss_dtype,
         )
 
         aux = {"loss": (loss, count), "token_count": count}
@@ -395,7 +416,7 @@ def train(
                 with jax.named_scope("compile train step"):
                     start_time = time.monotonic()
                     train_step_fn = (
-                        jax.jit(partial(train_step, config), donate_argnums=(0,)
+                        jax.jit(partial(train_step, config), donate_argnums=(0,))
                         .lower(model, batch, loop_rngs)
                         .compile()
                     )

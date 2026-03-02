@@ -440,7 +440,9 @@ def train(
                     model, aux = train_step_fn(model, batch, loop_rngs)
 
             accum_aux = add_aux(accum_aux, aux)
-            global_aux = add_aux(global_aux, accum_aux)
+            # Accumulate global stats per microstep; don't add the running window
+            # (accum_aux) each time, or we double-count.
+            global_aux = add_aux(global_aux, aux)
             emit = mini_step == (config.optimizer.grad_accum - 1)
             if emit:
                 processed_aux = process_aux(accum_aux, "step")
@@ -483,6 +485,10 @@ def train(
             to_log_later["systems/tok_s"] = token_count / program_time
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
+            if "program_time" in to_log_later:
+                print(f"program_time: {to_log_later['program_time']:.3f}s")
+            if "systems/tok_s" in to_log_later:
+                print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()

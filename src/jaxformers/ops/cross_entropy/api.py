@@ -111,21 +111,37 @@ def cross_entropy_loss(
             block_sizes_for_impl = infer_block_sizes(impl, B, H, V, dtype = dtype)
         else:
             block_sizes_for_impl = block_sizes
+        need_lse = logsumexp_weight is not None and logsumexp_weight != 0.0
         try:
-            loss, lse = fn(
-                x,
-                labels,
-                w,
-                logit_soft_cap=logit_soft_cap,
-                block_sizes=block_sizes_for_impl,
-                dtype=dtype,
-                precision=precision,
+            # Only compute logsumexp when actually used, to avoid forcing
+            # materialization of [B, V] logits in the reference implementation.
+            loss, lse = (
+                fn(
+                    x,
+                    labels,
+                    w,
+                    logit_soft_cap=logit_soft_cap,
+                    block_sizes=block_sizes_for_impl,
+                    dtype=dtype,
+                    precision=precision,
+                    return_lse=need_lse,
+                )
+                if impl == "reference"
+                else fn(
+                    x,
+                    labels,
+                    w,
+                    logit_soft_cap=logit_soft_cap,
+                    block_sizes=block_sizes_for_impl,
+                    dtype=dtype,
+                    precision=precision,
+                )
             )
         except Exception as e:
             errors.append(e)
             continue
 
-        if logsumexp_weight is not None and logsumexp_weight != 0.0:
+        if need_lse:
             loss = loss + logsumexp_weight * (lse**2)
         return _apply_reduction(loss, reduction, weight)
     raise ExceptionGroup("all implementations failed", errors)

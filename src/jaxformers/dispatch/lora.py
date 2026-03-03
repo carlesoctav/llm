@@ -147,6 +147,33 @@ def loraify(
     counter = 0
     loraify_weight = []
     t0 = time.monotonic()
+
+    def _infer_lora_shardings(weight: ArrayLike):
+        """Infer sharding for LoRA A/B from the base weight sharding.
+
+        We shard only along the corresponding base-weight dimension and keep the
+        rank dimension replicated. This keeps LoRA params and optimizer state
+        sharded (avoids full replication), aligning with Tunix' resharded LoRA.
+        """
+
+        base_sharding = getattr(weight, "sharding", None)
+        if not isinstance(base_sharding, jax.sharding.NamedSharding):
+            return None, None
+
+        spec = tuple(base_sharding.spec)
+        if len(spec) != 2:
+            return None, None
+
+        s0, s1 = spec
+        mesh = base_sharding.mesh
+        a_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(s0, None)
+        )
+        b_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(None, s1)
+        )
+        return a_sharding, b_sharding
+
     def _loraify(path, weight):
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
@@ -154,8 +181,15 @@ def loraify(
             X, Y = weight.shape
             lora_key = jax.random.fold_in(rngs, counter)
             counter += 1
-            a = jax.random.normal(lora_key, (X, rank))
-            b = jnp.zeros((rank, Y))
+            dtype = getattr(weight, "dtype", jnp.float32)
+            a = jax.random.normal(lora_key, (X, rank), dtype=dtype) * scale
+            b = jnp.zeros((rank, Y), dtype=dtype)
+
+            a_sharding, b_sharding = _infer_lora_shardings(weight)
+            if a_sharding is not None:
+                a = jax.device_put(a, a_sharding)
+            if b_sharding is not None:
+                b = jax.device_put(b, b_sharding)
 
             lora_weight = LoraArray(
                 _w =weight,

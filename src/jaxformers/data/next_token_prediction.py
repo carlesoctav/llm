@@ -1,5 +1,5 @@
-import os
 import dataclasses as dc
+import os
 import typing as tp
 from dataclasses import dataclass
 
@@ -43,7 +43,7 @@ class TokenizeText(grain_transforms.Map):
     packing: bool
     is_chat: bool
     chat_template: str | None = None
-    assistant_loss: bool =  False,
+    assistant_loss: bool = (False,)
     max_length: int | None = None
 
     def map(self, features: dict[str, tp.Any]) -> dict[str, Array]:
@@ -57,9 +57,9 @@ class TokenizeText(grain_transforms.Map):
                 truncation=self.max_length is not None,
                 padding="max_length" if not self.packing else "do_not_pad",
                 max_length=self.max_length + 1,
-                chat_template = self.chat_template,
+                chat_template=self.chat_template,
                 return_tensors="np",
-                return_assistant_tokens_mask= self.assistant_loss,
+                return_assistant_tokens_mask=self.assistant_loss,
             )
         else:
             encoded = self.tokenizer(
@@ -71,7 +71,7 @@ class TokenizeText(grain_transforms.Map):
                 return_attention_mask=True,
                 return_token_type_ids=False,
             )
-        output = {k:v.squeeze(0)[:-1] for k, v in encoded.items()}
+        output = {k: v.squeeze(0)[:-1] for k, v in encoded.items()}
         output["labels"] = encoded["input_ids"].squeeze(0)[1:]
         return output
 
@@ -128,9 +128,9 @@ def transforms(
                 column=column,
                 tokenizer=tokenizer,
                 max_length=max_length,
-                is_chat = is_chat,
-                chat_template = chat_template,
-                assistant_loss = assistant_loss,
+                is_chat=is_chat,
+                chat_template=chat_template,
+                assistant_loss=assistant_loss,
                 packing=packing,
             )
         )
@@ -147,7 +147,8 @@ def transforms(
                 num_packing_bins=packing_bins,
                 # These are redundant with `input_ids_segment_ids` /
                 # `input_ids_positions` and just bloat each batch.
-                meta_features=("attention_mask", "labels") + (("assistant_masks",) if assistant_loss else ()),
+                meta_features=("attention_mask", "labels")
+                + (("assistant_masks",) if assistant_loss else ()),
             )
         )
     transforms.append(NestInputs())

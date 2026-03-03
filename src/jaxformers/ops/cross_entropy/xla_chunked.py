@@ -11,25 +11,36 @@ def _apply_logit_soft_cap(logits: Float[Array, "B V"], logit_soft_cap: float | N
     return jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
 
-def _materialize_cotangent(
-    cotangent: jax.Array | jax.custom_derivatives.SymbolicZero, reference: jax.Array
-) -> jax.Array:
-    if isinstance(cotangent, jax.custom_derivatives.SymbolicZero):
-        return jnp.zeros_like(reference)
-    return jnp.asarray(cotangent, dtype=reference.dtype)
+def _infer_named_sharding(x):
+    # Works for both eager jax.Arrays (x.sharding) and some tracers (x.aval.sharding).
+    sharding = getattr(x, "sharding", None)
+    if sharding is None:
+        aval = getattr(x, "aval", None)
+        sharding = getattr(aval, "sharding", None) if aval is not None else None
+    return (
+        sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
+    )
 
 
-def _apply_logit_soft_cap_with_deriv(
-    logits: jax.Array, logit_soft_cap: float | None
-) -> tuple[jax.Array, jax.Array]:
-    if logit_soft_cap is None:
-        return logits, jnp.asarray(1.0, dtype=logits.dtype)
-    tanh_arg = logits / logit_soft_cap
-    tanh_val = jnp.tanh(tanh_arg)
-    return tanh_val * logit_soft_cap, (1.0 - tanh_val**2).astype(logits.dtype)
+def _named_sharding_is_nontrivial(named_sharding: jax.sharding.NamedSharding, shape) -> bool:
+    # Consider it non-trivial if any non-broadcasted dim is partitioned across an axis
+    # with size > 1.
+    mesh = named_sharding.mesh
+    spec = tuple(named_sharding.spec)
+    spec = spec + (None,) * (len(shape) - len(spec))
+    for axis_spec, dim in zip(spec, shape):
+        if dim == 1 or axis_spec is None:
+            continue
+        if isinstance(axis_spec, tuple):
+            if any(mesh.shape.get(a, 1) > 1 for a in axis_spec):
+                return True
+        else:
+            if mesh.shape.get(axis_spec, 1) > 1:
+                return True
+    return False
 
 
-def _fused_cross_entropy_chunked_xla_fwd_impl(
+def _fused_cross_entropy_chunked_xla_body(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
     w: Float[Array, "V H"],
@@ -108,232 +119,12 @@ def _fused_cross_entropy_chunked_xla_fwd_impl(
     return loss, lse
 
 
-def _fused_cross_entropy_chunked_xla_bwd_impl(
-    x: jax.Array,
-    labels: jax.Array,
-    w: jax.Array,
-    lse: jax.Array,
-    dout_loss: jax.Array,
-    dout_lse: jax.Array,
-    *,
-    block_sizes: BlockSizes,
-    dtype: jnp.dtype,
-    logit_soft_cap: float | None,
-    precision: jax.lax.PrecisionLike,
-) -> tuple[jax.Array, jax.Array]:
-    B, H = x.shape
-    V, _ = w.shape
-    b_block = block_sizes.b
-    v_block = block_sizes.v
-    h_block = block_sizes.h
-
-    if b_block is None or v_block is None or h_block is None:
-        raise ValueError(f"xla_chunked requires non-None block sizes, got {block_sizes}")
-    if B % b_block != 0:
-        raise ValueError(f"B={B} must be divisible by b_block={b_block}")
-    if H % h_block != 0:
-        raise ValueError(f"H={H} must be divisible by h_block={h_block}")
-
-    Vpad = (-V) % v_block
-    w_pad = jnp.pad(w, ((0, Vpad), (0, 0)))
-
-    num_b = B // b_block
-    num_h = H // h_block
-    num_v = (V + Vpad) // v_block
-
-    # Accumulate in fp32, cast to bf16 at the end (matches observed grad dtypes).
-    dx = jnp.zeros((B, H), dtype=jnp.float32)
-    dw = jnp.zeros((V + Vpad, H), dtype=jnp.float32)
-
-    row_indices = jnp.arange(b_block, dtype=labels.dtype)
-    v_ids = jnp.arange(v_block, dtype=labels.dtype)
-
-    def v_body(vi, state):
-        dx, dw = state
-        v0 = vi * v_block
-        dw_block = jnp.zeros((v_block, H), dtype=jnp.float32)
-
-        def b_body(bi, b_state):
-            dx, dw_block = b_state
-            b0 = bi * b_block
-
-            yb = jax.lax.dynamic_slice(labels, (b0,), (b_block,))
-            lse_b = jax.lax.dynamic_slice(lse, (b0,), (b_block,))
-            dout_loss_b = jax.lax.dynamic_slice(dout_loss, (b0,), (b_block,))
-            dout_lse_b = jax.lax.dynamic_slice(dout_lse, (b0,), (b_block,))
-
-            # logits tile: [b_block, v_block]
-            if num_h == 1:
-                x_b = jax.lax.dynamic_slice(x, (b0, 0), (b_block, H))
-                w_v = jax.lax.dynamic_slice(w_pad, (v0, 0), (v_block, H))
-                logits = jax.lax.dot_general(
-                    x_b,
-                    w_v,
-                    (((1,), (1,)), ((), ())),
-                    precision=precision,
-                    preferred_element_type=dtype,
-                )
-            else:
-                def h_body(hi, acc):
-                    h0 = h_block * hi
-                    x_bh = jax.lax.dynamic_slice(x, (b0, h0), (b_block, h_block))
-                    w_vh = jax.lax.dynamic_slice(w_pad, (v0, h0), (v_block, h_block))
-                    return acc + jax.lax.dot_general(
-                        x_bh,
-                        w_vh,
-                        (((1,), (1,)), ((), ())),
-                        precision=precision,
-                        preferred_element_type=dtype,
-                    )
-
-                logits = jax.lax.fori_loop(0, num_h, h_body, jnp.zeros((b_block, v_block), dtype=dtype))
-
-            logits, cap_deriv = _apply_logit_soft_cap_with_deriv(logits, logit_soft_cap)
-            valid = (v0 + v_ids) < V
-            logits = jnp.where(valid, logits, -jnp.inf)
-
-            # Match the forward's blockwise logsumexp structure for better numerical agreement:
-            #   lse = logaddexp(..., block_lse, ...)
-            # so p(block) = exp(block_lse - lse) and softmax within-block is exp(logits - block_lse).
-            block_lse = jax.nn.logsumexp(logits, axis=-1)
-            block_weight = jnp.exp(block_lse - lse_b.astype(block_lse.dtype))
-            probs = jnp.exp(logits - block_lse[:, None]) * block_weight[:, None]
-            delta = (dout_loss_b[:, None].astype(logits.dtype) + dout_lse_b[:, None].astype(logits.dtype)) * probs
-
-            in_block = (yb >= v0) & (yb < v0 + v_block)
-            label_idx = yb - v0
-            safe_idx = jnp.where(in_block, label_idx, 0)
-            delta = delta.at[row_indices, safe_idx].add(jnp.where(in_block, -dout_loss_b.astype(logits.dtype), 0.0))
-            delta = (delta * cap_deriv).astype(logits.dtype)
-
-            # dx update for this (b,v) tile
-            dx_slice = jax.lax.dynamic_slice(dx, (b0, 0), (b_block, H))
-            if num_h == 1:
-                dx_contrib = jax.lax.dot_general(
-                    delta,
-                    w_v,
-                    (((1,), (0,)), ((), ())),
-                    precision=precision,
-                    preferred_element_type=jnp.float32,
-                )
-            else:
-                def h_dx_body(hi, acc):
-                    h0 = h_block * hi
-                    w_vh = jax.lax.dynamic_slice(w_pad, (v0, h0), (v_block, h_block))
-                    dx_h = jax.lax.dot_general(
-                        delta,
-                        w_vh,
-                        (((1,), (0,)), ((), ())),
-                        precision=precision,
-                        preferred_element_type=jnp.float32,
-                    )
-                    acc_h = jax.lax.dynamic_slice(acc, (0, h0), (b_block, h_block))
-                    return jax.lax.dynamic_update_slice(acc, acc_h + dx_h.astype(acc.dtype), (0, h0))
-
-                dx_contrib = jax.lax.fori_loop(0, num_h, h_dx_body, jnp.zeros((b_block, H), dtype=dx_slice.dtype))
-
-            dx = jax.lax.dynamic_update_slice(dx, dx_slice + dx_contrib.astype(dx_slice.dtype), (b0, 0))
-
-            # dw accumulation for this v-block (sum over b blocks)
-            if num_h != 1:
-                x_b = jax.lax.dynamic_slice(x, (b0, 0), (b_block, H))
-            dw_contrib = jax.lax.dot_general(
-                delta,
-                x_b,
-                (((0,), (0,)), ((), ())),
-                precision=precision,
-                preferred_element_type=jnp.float32,
-            )
-            dw_block = dw_block + dw_contrib.astype(dw_block.dtype)
-            return dx, dw_block
-
-        dx, dw_block = jax.lax.fori_loop(0, num_b, b_body, (dx, dw_block))
-        dw = jax.lax.dynamic_update_slice(dw, dw_block, (v0, 0))
-        return dx, dw
-
-    dx, dw = jax.lax.fori_loop(0, num_v, v_body, (dx, dw))
-    return dx.astype(x.dtype), dw[:V, :].astype(w.dtype)
+_fused_cross_entropy_chunked_xla_direct = partial(
+    jax.jit,
+    static_argnames=["block_sizes", "dtype", "precision"],
+)(_fused_cross_entropy_chunked_xla_body)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
-def _fused_cross_entropy_chunked_xla_custom_vjp(
-    block_sizes: BlockSizes,
-    dtype: jnp.dtype,
-    logit_soft_cap: float | None,
-    precision: jax.lax.PrecisionLike,
-    x: jax.Array,
-    labels: jax.Array,
-    w: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    return _fused_cross_entropy_chunked_xla_fwd_impl(
-        x,
-        labels,
-        w,
-        block_sizes=block_sizes,
-        dtype=dtype,
-        logit_soft_cap=logit_soft_cap,
-        precision=precision,
-    )
-
-
-def _fused_cross_entropy_chunked_xla_custom_vjp_fwd(
-    block_sizes: BlockSizes,
-    dtype: jnp.dtype,
-    logit_soft_cap: float | None,
-    precision: jax.lax.PrecisionLike,
-    x: jax.Array,
-    labels: jax.Array,
-    w: jax.Array,
-):
-    loss, lse = _fused_cross_entropy_chunked_xla_fwd_impl(
-        x,
-        labels,
-        w,
-        block_sizes=block_sizes,
-        dtype=dtype,
-        logit_soft_cap=logit_soft_cap,
-        precision=precision,
-    )
-    return (loss, lse), (x, labels, w, lse)
-
-
-def _fused_cross_entropy_chunked_xla_custom_vjp_bwd(
-    block_sizes: BlockSizes,
-    dtype: jnp.dtype,
-    logit_soft_cap: float | None,
-    precision: jax.lax.PrecisionLike,
-    residuals,
-    cotangents,
-):
-    x, labels, w, lse = residuals
-    dout_loss, dout_lse = cotangents
-    dout_loss_arr = _materialize_cotangent(dout_loss, lse)
-    dout_lse_arr = _materialize_cotangent(dout_lse, lse)
-    dout_loss_arr = dout_loss_arr.astype(lse.dtype)
-    dout_lse_arr = dout_lse_arr.astype(lse.dtype)
-
-    dx, dw = _fused_cross_entropy_chunked_xla_bwd_impl(
-        x,
-        labels,
-        w,
-        lse,
-        dout_loss_arr,
-        dout_lse_arr,
-        block_sizes=block_sizes,
-        dtype=dtype,
-        logit_soft_cap=logit_soft_cap,
-        precision=precision,
-    )
-    return dx, None, dw
-
-
-_fused_cross_entropy_chunked_xla_custom_vjp.defvjp(
-    _fused_cross_entropy_chunked_xla_custom_vjp_fwd,
-    _fused_cross_entropy_chunked_xla_custom_vjp_bwd,
-)
-
-
-@partial(jax.jit, static_argnames = ["block_sizes", "dtype", "logit_soft_cap", "precision"])
 def fused_cross_entropy_chunked_xla(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
@@ -344,12 +135,68 @@ def fused_cross_entropy_chunked_xla(
     logit_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
 ):
-    return _fused_cross_entropy_chunked_xla_custom_vjp(
-        block_sizes,
-        dtype,
-        logit_soft_cap,
-        precision,
-        x,
-        labels,
-        w,
+    """Chunked CE kernel.
+
+    If inputs are sharded on the batch axis, run the kernel under `shard_map` so
+    internal loop carries remain type-stable (JAX includes sharding in carry types).
+    """
+    # Prefer label sharding (what the caller likely intends). If labels are replicated
+    # but activations are sharded, fall back to x so we still avoid carry type changes.
+    labels_sharding = _infer_named_sharding(labels)
+    x_sharding = _infer_named_sharding(x)
+    batch_sharding = None
+    if labels_sharding is not None and _named_sharding_is_nontrivial(
+        labels_sharding, labels.shape
+    ):
+        batch_sharding = labels_sharding
+    elif x_sharding is not None and _named_sharding_is_nontrivial(x_sharding, x.shape):
+        batch_sharding = x_sharding
+
+    if batch_sharding is None:
+        return _fused_cross_entropy_chunked_xla_direct(
+            x,
+            labels,
+            w,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    from jax.experimental import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    mesh = batch_sharding.mesh
+    spec = tuple(batch_sharding.spec) + (None,) * (labels.ndim - len(batch_sharding.spec))
+    batch_axis = spec[0]  # labels is [B]
+    if batch_axis is None:
+        return _fused_cross_entropy_chunked_xla_direct(
+            x,
+            labels,
+            w,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    def per_shard(x_local, labels_local, w_rep):
+        return _fused_cross_entropy_chunked_xla_body(
+            x_local,
+            labels_local,
+            w_rep,
+            block_sizes=block_sizes,
+            dtype=dtype,
+            logit_soft_cap=logit_soft_cap,
+            precision=precision,
+        )
+
+    per_shard_mapped = shard_map.shard_map(
+        per_shard,
+        mesh,
+        (P(batch_axis, None), P(batch_axis), P(None, None)),
+        (P(batch_axis), P(batch_axis)),
+        check_rep=False,
     )
+
+    return per_shard_mapped(x, labels, w)

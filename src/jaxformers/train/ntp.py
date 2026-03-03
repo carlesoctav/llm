@@ -227,7 +227,18 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
 
-        hidden_states = model.forward(weights, **batch["inputs"], rngs=rngs)
+        forward_dtype = getattr(config, "forward_dtype", None)
+        # `sws` may materialize callables in the config into concrete values. A JAX
+        # dtype (e.g. `jnp.bfloat16`) is itself callable, so only call non-type
+        # callables here.
+        if callable(forward_dtype) and not isinstance(forward_dtype, type):
+            forward_dtype = forward_dtype()
+        if forward_dtype is None:
+            forward_dtype = jnp.float32
+
+        hidden_states = model.forward(
+            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
+        )
         hidden_states = hidden_states.reshape(
             -1,
             hidden_states.shape[-1],
@@ -247,16 +258,26 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
             count = jnp.sum(batch["inputs"]["attention_mask"])
             mask = (batch["inputs"]["attention_mask"]).reshape(-1)
 
+        loss_impl = config.loss_implementation or None
+        loss_dtype = hidden_states.dtype if loss_impl == "reference" else jnp.float32
         loss = cross_entropy_loss(
             hidden_states,
             labels,
-            jax.reshard(
-                weights[model.lm_head_key],
-                logical_to_physical(("none", "none"), model.config.sharding_rules),
+            (
+                # The fused XLA chunked CE kernel currently assumes replicated
+                # vocab weights; avoid forcing replication for the reference
+                # implementation to match Tunix's fsdp-sharded embed/lm_head.
+                jax.reshard(
+                    weights[model.lm_head_key],
+                    logical_to_physical(("none", "none"), model.config.sharding_rules),
+                )
+                if (config.loss_implementation or None) != "reference"
+                else weights[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
-            implementation=config.loss_implementation or None,
+            implementation=loss_impl,
+            dtype=loss_dtype,
         )
 
         aux = {"loss": (loss, count), "token_count": count}
@@ -290,10 +311,17 @@ def eval(model, eval_ds):
 
 
 def process_aux(accum_aux: dict[str, Any], namespace=""):
-    return {
-        f"{namespace}/{k}": v[0] / v[1] if isinstance(v, tuple) else v
-        for k, v in accum_aux.items()
-    }
+    def finalize(v: Any) -> Any:
+        if not isinstance(v, tuple):
+            return v
+        num, denom = v
+        denom_is_zero = denom == 0
+        # `denom` may be a python scalar (e.g. after an early failure) or an array.
+        if isinstance(denom_is_zero, (bool, np.bool_)):
+            return (num / denom) if not denom_is_zero else jnp.nan
+        return jnp.where(denom_is_zero, jnp.nan, num / denom)
+
+    return {f"{namespace}/{k}": finalize(v) for k, v in accum_aux.items()}
 
 
 def add_aux(accum_aux, aux):
@@ -388,7 +416,7 @@ def train(
                 with jax.named_scope("compile train step"):
                     start_time = time.monotonic()
                     train_step_fn = (
-                        jax.jit(partial(train_step, config))
+                        jax.jit(partial(train_step, config), donate_argnums=(0,))
                         .lower(model, batch, loop_rngs)
                         .compile()
                     )
@@ -400,6 +428,8 @@ def train(
                         print("compile time: ", first_compile_time)
                         compiled_analysis = train_step_fn.memory_analysis()
                         memory_stats = print_compiled_memory_stats(compiled_analysis)
+                        cost = train_step_fn.cost_analysis()
+                        print("tflops", cost.get("flops") /1e12)
                         to_log_later.update(memory_stats)
                     first_step = False
             else:
@@ -410,7 +440,9 @@ def train(
                     model, aux = train_step_fn(model, batch, loop_rngs)
 
             accum_aux = add_aux(accum_aux, aux)
-            global_aux = add_aux(global_aux, accum_aux)
+            # Accumulate global stats per microstep; don't add the running window
+            # (accum_aux) each time, or we double-count.
+            global_aux = add_aux(global_aux, aux)
             emit = mini_step == (config.optimizer.grad_accum - 1)
             if emit:
                 processed_aux = process_aux(accum_aux, "step")
@@ -453,6 +485,10 @@ def train(
             to_log_later["systems/tok_s"] = token_count / program_time
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
+            if "program_time" in to_log_later:
+                print(f"program_time: {to_log_later['program_time']:.3f}s")
+            if "systems/tok_s" in to_log_later:
+                print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()

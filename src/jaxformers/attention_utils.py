@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
 import tokamax
+from jaxformers.ops.attention import chunked_manual_dot_product_attention
 from typing import Protocol
 from functools import partial
 
@@ -95,6 +96,7 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
             implementation="xla_chunked",
             precision=jax.lax.Precision.HIGHEST,
         ),
+        "chunked_manual": chunked_manual_dot_product_attention,
     }
 
 ATTENTION_INTERFACE = AttentionInterface()

@@ -9,7 +9,7 @@ class BlockSizes(NamedTuple):
 
 
 def infer_block_sizes(impl, b, h, v, *, dtype=None, device_kind=None):
-    if impl == "xla_chunked":
+    if impl in ("xla_chunked", "xla_chunked_custom_vjp"):
         return infer_xla_chunked_block_size(
             b, h, v, dtype=dtype, device_kind=device_kind
         )

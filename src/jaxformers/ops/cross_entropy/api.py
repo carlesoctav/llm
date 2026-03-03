@@ -9,9 +9,10 @@ from jaxtyping import Array, Float, Int
 from .config import BlockSizes, infer_block_sizes
 from .reference import cross_entropy_reference
 from .xla_chunked import fused_cross_entropy_chunked_xla
+from .xla_chunked_custom_vjp import fused_cross_entropy_chunked_xla_custom_vjp
 
 
-Implementation: TypeAlias = Literal["xla_chunked", "reference"]
+Implementation: TypeAlias = Literal["xla_chunked", "xla_chunked_custom_vjp", "reference"]
 Reduction: TypeAlias = Literal["sum", "mean"] | None
 
 
@@ -20,6 +21,7 @@ ArrayImpl = Callable[..., tuple[jax.Array, jax.Array]]
 
 IMPLEMENTATIONS: dict[str, ArrayImpl] = {
     "xla_chunked": fused_cross_entropy_chunked_xla,
+    "xla_chunked_custom_vjp": fused_cross_entropy_chunked_xla_custom_vjp,
     "reference": cross_entropy_reference,
 }
 

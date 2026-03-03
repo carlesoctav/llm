@@ -120,6 +120,7 @@ class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
         "eager": make_bool_interface,
         "sdpa": make_bool_interface,
         "xla_chunked": make_bool_interface,
+        "chunked_manual": make_bool_interface,
 
     }
 

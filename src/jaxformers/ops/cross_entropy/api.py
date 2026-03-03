@@ -83,6 +83,7 @@ def cross_entropy_loss(
     dtype: jnp.dtype | None = jnp.float32,
     logit_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
+    q_sharding: jax.sharding.NamedSharding | None = None,
     implementation: Implementation | Sequence[Implementation | ArrayImpl] | None = None,
 ) -> jax.Array:
 
@@ -135,6 +136,7 @@ def cross_entropy_loss(
                     block_sizes=block_sizes_for_impl,
                     dtype=dtype,
                     precision=precision,
+                    q_sharding=q_sharding,
                 )
             )
         except Exception as e:

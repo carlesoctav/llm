@@ -34,6 +34,7 @@ def main() -> None:
     num_q_heads = _env_int("Q_HEADS", 4)
     num_kv_heads = _env_int("KV_HEADS", 1)
     head_dim = _env_int("HEAD_DIM", 256)
+    layers = _env_int("LAYERS", 1)
 
     # Implementation passed to tokamax.
     # - unset / "auto": let tokamax pick (mosaic -> triton -> xla on TPU).
@@ -89,6 +90,7 @@ def main() -> None:
     print("tokamax_impl", impl or "auto")
     print("mask_mode", mask_mode)
     print("use_q_sharding", use_q_sharding)
+    print("layers", layers)
 
     def attn_fn(q_in, k_in, v_in, mask_in):
         return tokamax.dot_product_attention(
@@ -102,11 +104,26 @@ def main() -> None:
             q_sharding=q_sharding,
         )
 
+    def stacked_attn_fn(q_in, k_in, v_in, mask_in):
+        # Stack multiple attention calls to mimic per-layer activation saving.
+        x = attn_fn(q_in, k_in, v_in, mask_in)
+        if layers <= 1:
+            return x
+
+        # Residual-style stack. After the first layer, derive K/V from X to keep
+        # shapes consistent for MQA/GQA settings.
+        x = x + q_in
+        for _ in range(layers - 1):
+            k_x = x[:, :, :num_kv_heads, :]
+            v_x = x[:, :, :num_kv_heads, :]
+            x = x + attn_fn(x, k_x, v_x, mask_in)
+        return x
+
     def loss_fn(q_in, k_in, v_in, mask_in):
-        out = attn_fn(q_in, k_in, v_in, mask_in)
+        out = stacked_attn_fn(q_in, k_in, v_in, mask_in)
         return jnp.sum(out, dtype=jnp.float32)
 
-    fwd_jit = jax.jit(attn_fn)
+    fwd_jit = jax.jit(stacked_attn_fn)
     bwd_jit = jax.jit(jax.grad(loss_fn, argnums=(0, 1, 2)))
 
     # Forward compile + memory.

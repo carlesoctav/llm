@@ -272,8 +272,11 @@ def chunked_manual_dot_product_attention(
     if head_dim_k != head_dim or head_dim_v != head_dim:
         raise ValueError("Query/key/value head-dim mismatch")
 
-    # Expand MQA/GQA heads: [B,S,K,H] -> [B,S,N,H].
-    if num_kv_heads != num_q_heads:
+    # Expand GQA heads: [B,S,K,H] -> [B,S,N,H].
+    #
+    # For MQA (`num_kv_heads==1`), `einsum` broadcasts the head axis, so we
+    # avoid an explicit `repeat` to keep the kernel closer to tokamax behavior.
+    if num_kv_heads not in (1, num_q_heads):
         if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
             raise ValueError(
                 "Number of query heads must be a positive multiple of key/value heads"
@@ -281,7 +284,6 @@ def chunked_manual_dot_product_attention(
         repeat_factor = num_q_heads // num_kv_heads
         key = jnp.repeat(key, repeat_factor, axis=-2)
         value = jnp.repeat(value, repeat_factor, axis=-2)
-        num_kv_heads = num_q_heads
 
     # If the caller provides an explicit `q_sharding`, run the batch dimension under
     # `shard_map` to avoid `vmap`'s requirement that all mapped inputs have identical

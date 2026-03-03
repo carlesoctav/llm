@@ -134,23 +134,35 @@ def fused_cross_entropy_chunked_xla(
     dtype: jnp.dtype = jnp.float32,
     logit_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
+    q_sharding: jax.sharding.NamedSharding | None = None,
 ):
     """Chunked CE kernel.
 
     If inputs are sharded on the batch axis, run the kernel under `shard_map` so
     internal loop carries remain type-stable (JAX includes sharding in carry types).
     """
-    # Prefer label sharding (what the caller likely intends). If labels are replicated
-    # but activations are sharded, fall back to x so we still avoid carry type changes.
-    labels_sharding = _infer_named_sharding(labels)
-    x_sharding = _infer_named_sharding(x)
-    batch_sharding = None
-    if labels_sharding is not None and _named_sharding_is_nontrivial(
-        labels_sharding, labels.shape
-    ):
-        batch_sharding = labels_sharding
-    elif x_sharding is not None and _named_sharding_is_nontrivial(x_sharding, x.shape):
-        batch_sharding = x_sharding
+    def axis_spec_is_nontrivial(mesh, axis_spec) -> bool:
+        if axis_spec is None:
+            return False
+        if isinstance(axis_spec, tuple):
+            return any(mesh.shape.get(a, 1) > 1 for a in axis_spec)
+        return mesh.shape.get(axis_spec, 1) > 1
+
+    # Explicit sharding (preferred): mirror tokamax's `q_sharding` API so callers can
+    # force `shard_map` even if sharding metadata isn't available on tracers.
+    batch_sharding = q_sharding
+    if batch_sharding is None:
+        # Infer sharding from inputs. Prefer label sharding (what the caller likely
+        # intends). If labels are replicated but activations are sharded, fall back
+        # to x so we still avoid carry type changes.
+        labels_sharding = _infer_named_sharding(labels)
+        x_sharding = _infer_named_sharding(x)
+        if labels_sharding is not None and _named_sharding_is_nontrivial(
+            labels_sharding, labels.shape
+        ):
+            batch_sharding = labels_sharding
+        elif x_sharding is not None and _named_sharding_is_nontrivial(x_sharding, x.shape):
+            batch_sharding = x_sharding
 
     if batch_sharding is None:
         return _fused_cross_entropy_chunked_xla_direct(
@@ -167,9 +179,9 @@ def fused_cross_entropy_chunked_xla(
     from jax.sharding import PartitionSpec as P
 
     mesh = batch_sharding.mesh
-    spec = tuple(batch_sharding.spec) + (None,) * (labels.ndim - len(batch_sharding.spec))
-    batch_axis = spec[0]  # labels is [B]
-    if batch_axis is None:
+    spec = tuple(batch_sharding.spec)
+    batch_axis = spec[0] if len(spec) >= 1 else None
+    if batch_axis is None or not axis_spec_is_nontrivial(mesh, batch_axis):
         return _fused_cross_entropy_chunked_xla_direct(
             x,
             labels,
@@ -178,6 +190,15 @@ def fused_cross_entropy_chunked_xla(
             dtype=dtype,
             logit_soft_cap=logit_soft_cap,
             precision=precision,
+        )
+
+    # We currently only support sharding along the batch axis. If the activation
+    # hidden dimension is sharded, this kernel would need an all-reduce over H.
+    hidden_axis = spec[1] if len(spec) >= 2 else None
+    if axis_spec_is_nontrivial(mesh, hidden_axis):
+        raise NotImplementedError(
+            "fused_cross_entropy_chunked_xla does not support sharding x on the hidden axis; "
+            "use implementation='reference' or a vocab-sharded CE kernel."
         )
 
     def per_shard(x_local, labels_local, w_rep):

@@ -1,3 +1,4 @@
+from jaxformers.print_utils import tree_pformat
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
@@ -79,3 +80,6 @@ class Model:
 
     train_mask: PyTree[Bool] | None = None
     is_lora: bool = False
+
+    def __repr__(self):
+        return tree_pformat(self.weights)

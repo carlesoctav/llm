@@ -228,5 +228,4 @@ def make_dataloader(
     mixed = mixed.mp_prefetch(mp_options)
     if mesh:
         return IterDatasetWithInputSpec(mixed, pspec=pspec, mesh=mesh)
-    print("DEBUGPRINT {typeof(mixed)}:", type(mixed))
     return mixed

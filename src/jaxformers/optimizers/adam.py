@@ -16,7 +16,6 @@ def make(
     b1: float = 0.9,
     b2: float = 0.95,
     eps: float = 1e-8,
-    **kwargs,
 ):
 
     components = make_opt_base_components(grad_accum)

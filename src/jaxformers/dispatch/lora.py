@@ -1,6 +1,7 @@
 """
 copied from quax.examples.lora
 """
+from jaxformers.print_utils import tree_pformat
 
 import fnmatch
 import time
@@ -205,7 +206,7 @@ def loraify(
 
     weights = jtu.tree_map_with_path(_loraify, model.weights)
     diff = time.monotonic() - t0
-    print("Model weights converted to LoRA:", *loraify_weight)
+    print("Model weights converted to LoRA:", tree_pformat(loraify_weight))
     print(f"loraify takes {diff}s")
     return replace(
         model,

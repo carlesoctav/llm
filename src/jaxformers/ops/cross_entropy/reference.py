@@ -9,7 +9,7 @@ from jaxformers.dispatch import einsum
 from jaxformers.ops.cross_entropy.config import BlockSizes
 
 
-@partial(jax.jit, static_argnames=["block_sizes", "dtype", "precision", "return_lse"])
+@partial(jax.jit, static_argnames=["block_sizes", "dtype", "precision"])
 def cross_entropy_reference(
     x: Float[Array, "B H"],
     labels: Int[Array, " B"],
@@ -19,7 +19,6 @@ def cross_entropy_reference(
     dtype: jnp.dtype | None = None,
     logit_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
-    return_lse: bool = True,
 ):
     del block_sizes  # unused for reference impl
 

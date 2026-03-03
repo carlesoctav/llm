@@ -137,11 +137,6 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
             segment_ids=segment_ids,
         )
 
-    if attn_impl == "sdpa":
-        if full_mask is not None and full_mask.ndim == 3:
-            full_mask = full_mask[:, None, :, :]
-        if sliding_mask is not None and sliding_mask.ndim == 3:
-            sliding_mask = sliding_mask[:, None, :, :]
 
     return {
         "full_attention": full_mask,
@@ -151,7 +146,7 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
 
 def linear_3d(x, w, b=None, *, out_sharding=None):
     y = einsum(
-        "btd,md->btm",
+        "btf,df->btd",
         x,
         w,
         preferred_element_type=x.dtype,
@@ -190,65 +185,59 @@ def forward_layer(
     attn_impl = config.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
 
-    def attention_block(x_norm: Float[Array, "B T D"]) -> Float[Array, "B T D"]:
-        q = linear_3d(
-            x_norm,
-            w["q_proj"],
-            w.get("q_proj_bias"),
-            out_sharding=logical_to_physical(("batch", "context", "none"), rules),
-        )
-        k = linear_3d(
-            x_norm,
-            w["k_proj"],
-            w.get("k_proj_bias"),
-            out_sharding=logical_to_physical(("batch", "context", "none"), rules),
-        )
-        v = linear_3d(
-            x_norm,
-            w["v_proj"],
-            w.get("v_proj_bias"),
-            out_sharding=logical_to_physical(("batch", "context", "none"), rules),
-        )
+    q = linear_3d(
+        x_norm,
+        w["q_proj"],
+        w.get("q_proj_bias"),
+        out_sharding=logical_to_physical(("batch", "context", "none"), rules),
+    )
+    k = linear_3d(
+        x_norm,
+        w["k_proj"],
+        w.get("k_proj_bias"),
+        out_sharding=logical_to_physical(("batch", "context", "none"), rules),
+    )
+    v = linear_3d(
+        x_norm,
+        w["v_proj"],
+        w.get("v_proj_bias"),
+        out_sharding=logical_to_physical(("batch", "context", "none"), rules),
+    )
 
-        q = rearrange(
-            q, "b t (n h) -> b t n h", n=config.num_attention_heads, h=head_dim
-        )
-        k = rearrange(
-            k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
-        )
-        v = rearrange(
-            v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
-        )
+    q = rearrange(
+        q, "b t (n h) -> b t n h", n=config.num_attention_heads, h=head_dim
+    )
+    k = rearrange(
+        k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
+    )
+    v = rearrange(
+        v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
+    )
 
-        q = gemma_rms_norm(q, w["q_norm"], config.rms_norm_eps)
-        k = gemma_rms_norm(k, w["k_norm"], config.rms_norm_eps)
+    q = gemma_rms_norm(q, w["q_norm"], config.rms_norm_eps)
+    k = gemma_rms_norm(k, w["k_norm"], config.rms_norm_eps)
 
-        query_pre_attn_scalar = float(
-            getattr(config, "query_pre_attn_scalar", config.head_dim)
-        )
-        q = q * jnp.sqrt(
-            jnp.array(config.head_dim / query_pre_attn_scalar, dtype=q.dtype)
-        )
+    query_pre_attn_scalar = float(
+        getattr(config, "query_pre_attn_scalar", config.head_dim)
+    )
+    q = q * jnp.sqrt(
+        jnp.array(config.head_dim / query_pre_attn_scalar, dtype=q.dtype)
+    )
 
-        q = apply_rope(q, rope_theta, pos)
-        k = apply_rope(k, rope_theta, pos)
+    q = apply_rope(q, rope_theta, pos)
+    k = apply_rope(k, rope_theta, pos)
 
-        attn_output = attention_interface(
-            q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
-        )
-        attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
-        attn_output = linear_3d(
-            attn_output,
-            w["o_proj"],
-            w.get("o_proj_bias"),
-            out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
-        )
-        return attn_output
+    attn_output = attention_interface(
+        q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
+    )
 
-    if config.additional_config.get("remat_attention", False):
-        attention_block = jax.remat(attention_block)
-
-    attn_output = attention_block(x_norm)
+    attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
+    attn_output = linear_3d(
+        attn_output,
+        w["o_proj"],
+        w.get("o_proj_bias"),
+        out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
+    )
 
     attn_output = gemma_rms_norm(
         attn_output,
@@ -275,6 +264,7 @@ def forward_layer(
         w.get("up_proj_bias"),
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
+
     ffw = einsum(
         "btf,df->btd",
         gate * up,
@@ -377,6 +367,13 @@ def forward(
         )
 
     x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
+    # Note: x[1] are sharded across the tensor-parallel (TP) axis.
+    # To compute the loss we must all_gather those shards into a full sequence.
+    # The sharded-token approach should enable loss parallelism, but here we rely on
+    # xla_chunked cross-entropy instead. Ideally the cross-entropy op would
+    # infer loss parallelism from sharding annotations, but that is not yet
+    # supported in this implementation.
+    x = reshard(x, logical_to_physical(("batch", "context", "none"), config.sharding_rules))
 
     return (x, kv) if return_kv else x
 
@@ -487,12 +484,8 @@ def load(
         if "mlp.down_proj" in key:
             return logical_to_physical(("fsdp", "model"), sharding_rules)
         if "embed_tokens" in key:
-            # Match Tunix's Gemma3 sharding: shard embedding hidden dim across FSDP
-            # and vocab across TP (if TP>1). This avoids fully replicating the
-            # (vocab, hidden) matrix on dp_shard when tp==1.
             return logical_to_physical(("model", "fsdp"), sharding_rules)
         if "lm_head" in key:
-            # Keep lm_head sharding consistent with embeddings for tied weights.
             return logical_to_physical(("model", "fsdp"), sharding_rules)
         return P()
 

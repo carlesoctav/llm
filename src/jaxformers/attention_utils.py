@@ -91,11 +91,10 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
         "sdpa": partial(tokamax.dot_product_attention, precision = jax.lax.Precision.HIGHEST),
-        "xla_chunked": partial(
-            tokamax.dot_product_attention,
-            implementation="xla_chunked",
-            precision=jax.lax.Precision.HIGHEST,
-        ),
+        # Historically, "xla_chunked" referred to Tokamax's chunked XLA attention.
+        # In this codebase we instead map it to the manual chunked implementation,
+        # because Tokamax's xla_chunked backward can have very large temp memory.
+        "xla_chunked": chunked_manual_dot_product_attention,
         "chunked_manual": chunked_manual_dot_product_attention,
     }
 

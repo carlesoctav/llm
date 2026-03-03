@@ -237,10 +237,16 @@ def chunked_manual_dot_product_attention(
     """Manual chunked attention for debugging activation memory.
 
     Notes:
-      - This ignores `q_sharding` beyond using it for `jnp.repeat` output sharding.
+      - When `q_sharding` is provided, we run under `shard_map` on the batch axis to
+        avoid `vmap` sharding restrictions (masks are often replicated).
       - `bias` is supported for completeness, but most model paths pass `None`.
     """
-    del q_sharding  # Only used for `jnp.repeat(out_sharding=...)` below.
+    def axis_spec_is_nontrivial(mesh, axis_spec) -> bool:
+        if axis_spec is None:
+            return False
+        if isinstance(axis_spec, tuple):
+            return any(mesh.shape.get(a, 1) > 1 for a in axis_spec)
+        return mesh.shape.get(axis_spec, 1) > 1
 
     precision = kwargs.pop("precision", jax.lax.Precision.HIGHEST)
     query_chunk_size = int(kwargs.pop("query_chunk_size", 1024))
@@ -276,6 +282,130 @@ def chunked_manual_dot_product_attention(
         key = jnp.repeat(key, repeat_factor, axis=-2)
         value = jnp.repeat(value, repeat_factor, axis=-2)
         num_kv_heads = num_q_heads
+
+    # If the caller provides an explicit `q_sharding`, run the batch dimension under
+    # `shard_map` to avoid `vmap`'s requirement that all mapped inputs have identical
+    # sharding on the mapped axis. (In practice, our causal mask is often replicated.)
+    if q_sharding is not None:
+        mesh = q_sharding.mesh
+        q_spec = tuple(q_sharding.spec)
+        batch_axis = q_spec[0] if len(q_spec) >= 1 else None
+        seq_axis = q_spec[1] if len(q_spec) >= 2 else None
+        heads_axis = q_spec[2] if len(q_spec) >= 3 else None
+        dim_axis = q_spec[3] if len(q_spec) >= 4 else None
+
+        if batch_axis is not None and axis_spec_is_nontrivial(mesh, batch_axis):
+            # Only support batch sharding for now.
+            if axis_spec_is_nontrivial(mesh, seq_axis) or axis_spec_is_nontrivial(
+                mesh, heads_axis
+            ) or axis_spec_is_nontrivial(mesh, dim_axis):
+                raise NotImplementedError(
+                    "chunked_manual attention only supports sharding on the batch axis."
+                )
+
+            from jax.experimental import shard_map
+            from jax.sharding import PartitionSpec as P
+
+            # Always shard on the batch axis only. Any additional axes in `q_sharding`
+            # are treated as replicated.
+            qkv_spec = P(batch_axis, None, None, None)
+            mask_spec = P(batch_axis, None, None, None)
+
+            if bias is None and mask is None:
+
+                def per_shard(q_local, k_local, v_local):
+                    return chunked_manual_dot_product_attention(
+                        q_local,
+                        k_local,
+                        v_local,
+                        bias=None,
+                        mask=None,
+                        q_sharding=None,
+                        precision=precision,
+                        query_chunk_size=query_chunk_size,
+                        key_chunk_size=key_chunk_size,
+                    )
+
+                per_shard_mapped = shard_map.shard_map(
+                    per_shard,
+                    mesh,
+                    in_specs=(qkv_spec, qkv_spec, qkv_spec),
+                    out_specs=qkv_spec,
+                    check_rep=False,
+                )
+                return per_shard_mapped(query, key, value)
+
+            if bias is None and mask is not None:
+
+                def per_shard(q_local, k_local, v_local, mask_local):
+                    return chunked_manual_dot_product_attention(
+                        q_local,
+                        k_local,
+                        v_local,
+                        bias=None,
+                        mask=mask_local,
+                        q_sharding=None,
+                        precision=precision,
+                        query_chunk_size=query_chunk_size,
+                        key_chunk_size=key_chunk_size,
+                    )
+
+                per_shard_mapped = shard_map.shard_map(
+                    per_shard,
+                    mesh,
+                    in_specs=(qkv_spec, qkv_spec, qkv_spec, mask_spec),
+                    out_specs=qkv_spec,
+                    check_rep=False,
+                )
+                return per_shard_mapped(query, key, value, mask)
+
+            if bias is not None and mask is None:
+
+                def per_shard(q_local, k_local, v_local, bias_local):
+                    return chunked_manual_dot_product_attention(
+                        q_local,
+                        k_local,
+                        v_local,
+                        bias=bias_local,
+                        mask=None,
+                        q_sharding=None,
+                        precision=precision,
+                        query_chunk_size=query_chunk_size,
+                        key_chunk_size=key_chunk_size,
+                    )
+
+                per_shard_mapped = shard_map.shard_map(
+                    per_shard,
+                    mesh,
+                    in_specs=(qkv_spec, qkv_spec, qkv_spec, mask_spec),
+                    out_specs=qkv_spec,
+                    check_rep=False,
+                )
+                return per_shard_mapped(query, key, value, bias)
+
+            assert bias is not None and mask is not None
+
+            def per_shard(q_local, k_local, v_local, bias_local, mask_local):
+                return chunked_manual_dot_product_attention(
+                    q_local,
+                    k_local,
+                    v_local,
+                    bias=bias_local,
+                    mask=mask_local,
+                    q_sharding=None,
+                    precision=precision,
+                    query_chunk_size=query_chunk_size,
+                    key_chunk_size=key_chunk_size,
+                )
+
+            per_shard_mapped = shard_map.shard_map(
+                per_shard,
+                mesh,
+                in_specs=(qkv_spec, qkv_spec, qkv_spec, mask_spec, mask_spec),
+                out_specs=qkv_spec,
+                check_rep=False,
+            )
+            return per_shard_mapped(query, key, value, bias, mask)
 
     bias_arr = None
     if bias is not None:
@@ -362,4 +492,3 @@ def chunked_manual_dot_product_attention(
         in_axes=(0, 0, 0, 0, 0),
         out_axes=0,
     )(query, key, value, bias_arr, mask_arr)
-

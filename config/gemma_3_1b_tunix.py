@@ -24,7 +24,7 @@ def get_config():
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_implementation = "xla_chunked"
 
-    config.model_name = "gemma3"
+    config.model_name = "huggingface_gemma3"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True

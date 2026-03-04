@@ -1,4 +1,3 @@
-from jaxformers.print_utils import tree_pformat
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
@@ -8,6 +7,8 @@ import optax
 from jax import P
 from jaxtyping import Bool, Float, PyTree
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
+
+from jaxformers.print_utils import tree_pformat
 
 
 LayerWeights = TypeVar("LayerWeights")
@@ -45,7 +46,6 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "remat_attention": False,
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
-    "loss_parallel": True,
 }
 
 
@@ -53,6 +53,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
     jtu.register_dataclass,
     data_fields=["weights", "opt_state", "step"],
     meta_fields=[
+        "name",
         "tokenizer",
         "forward",
         "config",
@@ -66,6 +67,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
 )
 @dataclass
 class Model:
+    name: str
     config: PreTrainedConfig
     weights: PyTree[Float, "ModelWeights"]
     forward: Callable
@@ -82,4 +84,4 @@ class Model:
     is_lora: bool = False
 
     def __repr__(self):
-        return tree_pformat(self.weights)
+        return self.name + "\n" + tree_pformat(self.weights)

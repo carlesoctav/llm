@@ -2,21 +2,17 @@ import dataclasses
 import importlib
 import sys
 import time
-from functools import partial, reduce
-from typing import Any, Callable
+from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
-import quax._core as qc
 import sws
 from jax.experimental.rnn import PRNGKeyArray
-from rich.themes import DEFAULT
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 
 from jaxformers import tree_util
 from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops
@@ -181,6 +177,8 @@ def _preparse_absl_flags() -> None:
 
 
 def load_model(config: sws.FinalConfig, name: str):
+    name = name.replace("_", ".")
+    print("DEBUGPRINT {name}:", name)
     model_module = importlib.import_module(f"jaxformers.models.{name}")
     model = model_module.load(**config.model.to_dict())
     return model
@@ -484,6 +482,7 @@ def main(config: sws.FinalConfig):
         rngs = jax.random.key(config.train_seed) if config.train_seed else None
         if not config.random_init and not config.resume:
             model = load_model(config, config.model_name)
+            print("DEBUGPRINT {model}:", model)
             scheduler = load_scheduler(config, config.lr_scheduler_name)
             if config.use_lora:
                 if config.random_init_lora:

@@ -17,6 +17,7 @@ import tokamax
 from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.ops.attention import (
     chunked_manual_dot_product_attention,
+    flash_attention_dot_product_attention,
     xla_chunked_dot_product_attention,
 )
 
@@ -49,7 +50,14 @@ def main() -> None:
     steps = _env_int("STEPS", 5)
 
     impl = _env_str("ATTENTION_IMPL", "xla_chunked").strip().lower()
-    if impl not in ("sdpa", "xla", "tokamax_xla_chunked", "xla_chunked", "chunked_manual"):
+    if impl not in (
+        "sdpa",
+        "xla",
+        "tokamax_xla_chunked",
+        "flash_attention",
+        "xla_chunked",
+        "chunked_manual",
+    ):
         raise ValueError(f"Unsupported ATTENTION_IMPL={impl!r}")
 
     mask_mode = _env_str("ATTENTION_MASK", "bool").strip().lower()
@@ -129,6 +137,17 @@ def main() -> None:
                 precision=jax.lax.Precision.HIGHEST,
                 query_chunk_size=query_chunk_size,
                 key_chunk_size=key_chunk_size,
+            )
+
+        if impl == "flash_attention":
+            return flash_attention_dot_product_attention(
+                q_in,
+                k_in,
+                v_in,
+                mask=mask_in if mask_mode == "bool" else None,
+                is_causal=is_causal,
+                precision=jax.lax.Precision.HIGHEST,
+                q_sharding=q_sharding,
             )
 
         if impl == "xla_chunked":

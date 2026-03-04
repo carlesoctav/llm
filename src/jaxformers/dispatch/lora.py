@@ -1,7 +1,6 @@
 """
 copied from quax.examples.lora
 """
-from jaxformers.print_utils import tree_pformat
 
 import fnmatch
 import time
@@ -13,13 +12,14 @@ import jax
 import jax.core
 import jax.extend.core as jexc
 import jax.lax as lax
+from jax import P
 import jax.numpy as jnp
-import jax.random as jr
 import jax.tree_util as jtu
 import quax
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.modeling_utils import Model
+from jaxformers.print_utils import tree_pformat
 
 
 class LoraArray(quax.ArrayValue):
@@ -130,7 +130,7 @@ def _is_match(array_path, weights_path):
     return False
 
 
-def random_weight(key,shape):
+def random_weight(key, shape):
     return jax.random.normal(key, shape)
 
 
@@ -179,23 +179,20 @@ def loraify(
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
-            X, Y = weight.shape
+            *B, X, Y = weight.shape
             lora_key = jax.random.fold_in(rngs, counter)
             counter += 1
             dtype = getattr(weight, "dtype", jnp.float32)
-            a = jax.random.normal(lora_key, (X, rank), dtype=dtype) * scale
-            b = jnp.zeros((rank, Y), dtype=dtype)
-
-            a_sharding, b_sharding = _infer_lora_shardings(weight)
-            if a_sharding is not None:
-                a = jax.device_put(a, a_sharding)
-            if b_sharding is not None:
-                b = jax.device_put(b, b_sharding)
+            a = jax.random.normal(lora_key, (*B, X, rank), dtype=dtype) * scale
+            b = jnp.zeros((*B, rank, Y), dtype=dtype)
+            *s3, s0, s1 = tuple(weight.sharding.spec)
+            a = jax.device_put(a, P(*s3, s0, None))
+            b = jax.device_put(b, P(*s3, None, s1))
 
             lora_weight = LoraArray(
-                _w =weight,
-                a = a,
-                b = b,
+                _w=weight,
+                a=a,
+                b=b,
                 alpha=alpha,
                 allow_materialise=allow_materialise,
             )

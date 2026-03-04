@@ -178,7 +178,6 @@ def _preparse_absl_flags() -> None:
 
 def load_model(config: sws.FinalConfig, name: str):
     name = name.replace("_", ".")
-    print("DEBUGPRINT {name}:", name)
     model_module = importlib.import_module(f"jaxformers.models.{name}")
     model = model_module.load(**config.model.to_dict())
     return model

@@ -26,6 +26,7 @@ from jaxformers.masking_utils import (
 from jaxformers.modeling_utils import (
     AdditionalConfig,
     DEFAULT_ADDITIONAL_CONFIG,
+    load_weights,
     logical_to_physical,
     Model,
 )
@@ -57,6 +58,28 @@ SHARDING_RULES = {
 }
 
 
+def get_sharding(key, sharding_rules):
+    if "self_attn.q_proj" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "self_attn.k_proj" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "self_attn.v_proj" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "mlp.gate_proj" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "mlp.up_proj" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "self_attn.o_proj" in key:
+        return logical_to_physical(("fsdp", "model"), sharding_rules)
+    if "mlp.down_proj" in key:
+        return logical_to_physical(("fsdp", "model"), sharding_rules)
+    if "embed_tokens" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    if "lm_head" in key:
+        return logical_to_physical(("model", "fsdp"), sharding_rules)
+    return P()
+
+
 Config: TypeAlias = PreTrainedConfig
 Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], jax.Array]
 
@@ -83,10 +106,16 @@ def _default_initializer_for_key(config: Config, key: str) -> Initializer:
     if key.endswith(".bias"):
         return jax.nn.initializers.zeros
 
-    if key.endswith(".norm.weight") or ".layernorm.weight" in key or "norm.weight" in key:
+    if (
+        key.endswith(".norm.weight")
+        or ".layernorm.weight" in key
+        or "norm.weight" in key
+    ):
         return jax.nn.initializers.zeros
 
-    return jax.nn.initializers.truncated_normal(stddev=_default_initializer_range(config))
+    return jax.nn.initializers.truncated_normal(
+        stddev=_default_initializer_range(config)
+    )
 
 
 def apply_rope(x: jax.Array, theta: float, pos=0):
@@ -167,7 +196,6 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
             segment_ids=segment_ids,
         )
 
-
     return {
         "full_attention": full_mask,
         "sliding_attention": sliding_mask,
@@ -204,7 +232,6 @@ def forward_layer(
     residual = x
     x_norm = gemma_rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
-
     q_sharding = jax.NamedSharding(
         jax.sharding.get_abstract_mesh(),
         logical_to_physical(
@@ -234,15 +261,9 @@ def forward_layer(
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
 
-    q = rearrange(
-        q, "b t (n h) -> b t n h", n=config.num_attention_heads, h=head_dim
-    )
-    k = rearrange(
-        k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
-    )
-    v = rearrange(
-        v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim
-    )
+    q = rearrange(q, "b t (n h) -> b t n h", n=config.num_attention_heads, h=head_dim)
+    k = rearrange(k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
+    v = rearrange(v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
 
     q = gemma_rms_norm(q, w["q_norm"], config.rms_norm_eps)
     k = gemma_rms_norm(k, w["k_norm"], config.rms_norm_eps)
@@ -250,9 +271,7 @@ def forward_layer(
     query_pre_attn_scalar = float(
         getattr(config, "query_pre_attn_scalar", config.head_dim)
     )
-    q = q * jnp.sqrt(
-        jnp.array(config.head_dim / query_pre_attn_scalar, dtype=q.dtype)
-    )
+    q = q * jnp.sqrt(jnp.array(config.head_dim / query_pre_attn_scalar, dtype=q.dtype))
 
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
@@ -403,7 +422,9 @@ def forward(
     # xla_chunked cross-entropy instead. Ideally the cross-entropy op would
     # infer loss parallelism from sharding annotations, but that is not yet
     # supported in this implementation.
-    x = reshard(x, logical_to_physical(("batch", "context", "none"), config.sharding_rules))
+    x = reshard(
+        x, logical_to_physical(("batch", "context", "none"), config.sharding_rules)
+    )
 
     return (x, kv) if return_kv else x
 
@@ -628,6 +649,7 @@ def init(
     config.sharding_rules = sharding_rules
 
     return Model(
+        name=__name__,
         config=config,
         weights=weights,
         forward=partial(forward, config),
@@ -682,35 +704,7 @@ def load(
     )
     jax.set_mesh(mesh)
 
-    def get_sharding(key):
-        if "self_attn.q_proj" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "self_attn.k_proj" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "self_attn.v_proj" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "mlp.gate_proj" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "mlp.up_proj" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "self_attn.o_proj" in key:
-            return logical_to_physical(("fsdp", "model"), sharding_rules)
-        if "mlp.down_proj" in key:
-            return logical_to_physical(("fsdp", "model"), sharding_rules)
-        if "embed_tokens" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        if "lm_head" in key:
-            return logical_to_physical(("model", "fsdp"), sharding_rules)
-        return P()
-
-    weights = {}
-    for file in model_ckpt_dir.glob("*.safetensors"):
-        with safe_open(file, framework="numpy") as f:
-            for key in f.keys():
-                weights[key] = jax.device_put(
-                    f.get_tensor(key).astype(param_dtype),
-                    get_sharding(key),
-                )
+    weights = load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
 
     if "model.embed_tokens.weight" not in weights:
         raise KeyError(
@@ -724,7 +718,7 @@ def load(
     config.sharding_rules = sharding_rules
 
     return Model(
-        name = __name__,
+        name=__name__,
         config=config,
         weights=weights,
         forward=partial(forward, config),

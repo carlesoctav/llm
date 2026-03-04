@@ -10,10 +10,9 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from safetensors import safe_open
 from transformers import (
-    AutoConfig,
     AutoTokenizer,
+    Gemma3TextConfig,
     PreTrainedConfig,
 )
 
@@ -27,9 +26,12 @@ from jaxformers.modeling_utils import (
     AdditionalConfig,
     DEFAULT_ADDITIONAL_CONFIG,
     load_weights,
+    load_weights_vectorize,
     logical_to_physical,
     Model,
 )
+from jaxformers.print_utils import tree_pprint
+from jaxformers.scan_utils import make_scan_fwd
 
 from ...attention_utils import ATTENTION_INTERFACE
 from ...dispatch.einsum import einsum
@@ -46,16 +48,6 @@ from ...distributed import (
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 AxisName = str | tuple[str, ...] | None
-
-
-SHARDING_RULES = {
-    "none": None,
-    "batch": BATCH,
-    "fsdp": FSDP,
-    "model": MODEL,
-    "sequence": SEQ,
-    "context": CONTEXT,
-}
 
 
 def get_sharding(key, sharding_rules):
@@ -80,7 +72,17 @@ def get_sharding(key, sharding_rules):
     return P()
 
 
-Config: TypeAlias = PreTrainedConfig
+SHARDING_RULES = {
+    "none": None,
+    "batch": BATCH,
+    "fsdp": FSDP,
+    "model": MODEL,
+    "sequence": SEQ,
+    "context": CONTEXT,
+}
+
+
+Config: TypeAlias = Gemma3TextConfig
 Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], jax.Array]
 
 
@@ -114,7 +116,7 @@ def _default_initializer_for_key(config: Config, key: str) -> Initializer:
         return jax.nn.initializers.zeros
 
     return jax.nn.initializers.truncated_normal(
-        stddev=_default_initializer_range(config)
+        stddev=_default_initializer_range(config), lower=-3, upper=3
     )
 
 
@@ -172,7 +174,9 @@ def get_rope_theta(config: Config, attention_type: str) -> float:
     return float(attn_config["rope_theta"])
 
 
-def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
+def make_mask(
+    config: Config, input_embeds, attention_mask=None, segment_ids=None, **kwargs
+):
     attn_impl = config.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
         return {
@@ -195,11 +199,13 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
             attention_mask=attention_mask,
             segment_ids=segment_ids,
         )
-
-    return {
-        "full_attention": full_mask,
-        "sliding_attention": sliding_mask,
-    }
+    scan_mask = jnp.stack(
+        [
+            full_mask if a == "full_attention" else sliding_mask
+            for a in config.layer_types
+        ]
+    )
+    return scan_mask
 
 
 def linear_3d(x, w, b=None, *, out_sharding=None):
@@ -229,8 +235,9 @@ def forward_layer(
     head_dim = config.head_dim
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
+    x_norm = gemma_rms_norm(x, w["input_layernorm.weight"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
+
     q_sharding = jax.NamedSharding(
         jax.sharding.get_abstract_mesh(),
         logical_to_physical(
@@ -243,20 +250,20 @@ def forward_layer(
 
     q = linear_3d(
         x_norm,
-        w["q_proj"],
-        w.get("q_proj_bias"),
+        w["self_attn.q_proj.weight"],
+        w.get("self_attn.q_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
     k = linear_3d(
         x_norm,
-        w["k_proj"],
-        w.get("k_proj_bias"),
+        w["self_attn.k_proj.weight"],
+        w.get("self_attn.k_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
     v = linear_3d(
         x_norm,
-        w["v_proj"],
-        w.get("v_proj_bias"),
+        w["self_attn.v_proj.weight"],
+        w.get("self_attn.v_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
 
@@ -264,8 +271,8 @@ def forward_layer(
     k = rearrange(k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
     v = rearrange(v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
 
-    q = gemma_rms_norm(q, w["q_norm"], config.rms_norm_eps)
-    k = gemma_rms_norm(k, w["k_norm"], config.rms_norm_eps)
+    q = gemma_rms_norm(q, w["self_attn.q_norm.weight"], config.rms_norm_eps)
+    k = gemma_rms_norm(k, w["self_attn.k_norm.weight"], config.rms_norm_eps)
 
     query_pre_attn_scalar = float(
         getattr(config, "query_pre_attn_scalar", config.head_dim)
@@ -282,48 +289,52 @@ def forward_layer(
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
     attn_output = linear_3d(
         attn_output,
-        w["o_proj"],
-        w.get("o_proj_bias"),
+        w["self_attn.o_proj.weight"],
+        w.get("self_attn.o_proj.bias"),
         out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
     )
 
     attn_output = gemma_rms_norm(
         attn_output,
-        w["post_attention_layernorm"],
+        w["post_attention_layernorm.weight"],
         config.rms_norm_eps,
     )
     x = residual + attn_output
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["pre_feedforward_layernorm"], config.rms_norm_eps)
+    x_norm = gemma_rms_norm(
+        x, w["pre_feedforward_layernorm.weight"], config.rms_norm_eps
+    )
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     gate = act_fn(
         linear_3d(
             x_norm,
-            w["gate_proj"],
-            w.get("gate_proj_bias"),
+            w["mlp.gate_proj.weight"],
+            w.get("mlp.gate_proj.bias"),
             out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
     )
     up = linear_3d(
         x_norm,
-        w["up_proj"],
-        w.get("up_proj_bias"),
+        w["mlp.up_proj.weight"],
+        w.get("mlp.up_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
     ffw = einsum(
         "btf,df->btd",
         gate * up,
-        w["down_proj"],
+        w["mlp.down_proj.weight"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
     )
-    if w.get("down_proj_bias") is not None:
-        ffw = ffw + w["down_proj_bias"][None, None, :]
+    if w.get("mlp.down_proj.bias") is not None:
+        ffw = ffw + w["mlp.down_proj.bias"][None, None, :]
 
-    ffw = gemma_rms_norm(ffw, w["post_feedforward_layernorm"], config.rms_norm_eps)
+    ffw = gemma_rms_norm(
+        ffw, w["post_feedforward_layernorm.weight"], config.rms_norm_eps
+    )
     x = residual + ffw
     return x
 
@@ -352,67 +363,35 @@ def forward(
     )
     x *= jnp.sqrt(jnp.array(config.hidden_size, dtype=dtype))
 
+    if config.additional_config["remat_layer"]:
+        fwd = jax.remat(partial(forward_layer, config))
+    else:
+        fwd = partial(forward_layer, config)
 
-    mask_mapping = make_mask(
+    scan_mask = make_mask(
         config,
         x,
         **inputs,
     )
 
-    layer_types = config.layer_types
-    for layer_idx in range(int(config.num_hidden_layers)):
-        attention_type = layer_types[layer_idx % len(layer_types)]
-        rope_theta = get_rope_theta(config, attention_type)
-
-        prefix = f"{model_prefix}.layers.{layer_idx}."
-        layer_weights = {
-            "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
-            "post_attention_layernorm": weights[
-                f"{prefix}post_attention_layernorm.weight"
-            ],
-            "pre_feedforward_layernorm": weights[
-                f"{prefix}pre_feedforward_layernorm.weight"
-            ],
-            "post_feedforward_layernorm": weights[
-                f"{prefix}post_feedforward_layernorm.weight"
-            ],
-            "q_proj": weights[f"{prefix}self_attn.q_proj.weight"],
-            "q_proj_bias": weights.get(f"{prefix}self_attn.q_proj.bias"),
-            "k_proj": weights[f"{prefix}self_attn.k_proj.weight"],
-            "k_proj_bias": weights.get(f"{prefix}self_attn.k_proj.bias"),
-            "v_proj": weights[f"{prefix}self_attn.v_proj.weight"],
-            "v_proj_bias": weights.get(f"{prefix}self_attn.v_proj.bias"),
-            "o_proj": weights[f"{prefix}self_attn.o_proj.weight"],
-            "o_proj_bias": weights.get(f"{prefix}self_attn.o_proj.bias"),
-            "q_norm": weights[f"{prefix}self_attn.q_norm.weight"],
-            "k_norm": weights[f"{prefix}self_attn.k_norm.weight"],
-            "gate_proj": weights[f"{prefix}mlp.gate_proj.weight"],
-            "gate_proj_bias": weights.get(f"{prefix}mlp.gate_proj.bias"),
-            "up_proj": weights[f"{prefix}mlp.up_proj.weight"],
-            "up_proj_bias": weights.get(f"{prefix}mlp.up_proj.bias"),
-            "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
-            "down_proj_bias": weights.get(f"{prefix}mlp.down_proj.bias"),
-        }
-
-        if config.additional_config["remat_layer"]:
-            fwd = jax.remat(partial(forward_layer, config))
-        else:
-            fwd = partial(forward_layer, config)
-
-        layer_inputs = {**inputs, "attention_mask": mask_mapping.get(attention_type)}
-        x = fwd(
-            x,
-            layer_weights,
-            layer_idx,
-            rope_theta,
-            pos,
-            **layer_inputs,
-        )
-
+    tree_pprint(scan_mask)
+    print("DEBUGPRINT {config.layer_types}:", config.layer_types)
+    scan_rope_theta = jnp.asarray([
+        get_rope_theta(config, attention_type) for attention_type in config.layer_types
+    ])
+    scan_layer_idx = jnp.asarray(list(range(0, config.num_hidden_layers)))
+    input_kwargs = {
+        "attention_mask": scan_mask,
+        "rope_theta": scan_rope_theta,
+        "layer_idx": scan_layer_idx,
+        "pos": jnp.asarray(0),
+    }
+    x = make_scan_fwd(fwd, config.num_hidden_layers)(x, weights, input_kwargs)
     x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
-    # Note: x[1] are sharded across the tensor-parallel (TP) axis.
+
+    # Note: x[1] are sharded across the tensor-parallel (TP) mesh.
     # To compute the loss we must all_gather those shards into a full sequence.
-    # The sharded-token approach should enable loss parallelism, but here we rely on
+    # why shard token? The sharded-token approach should enable loss parallelism, but here we rely on
     # xla_chunked cross-entropy instead. Ideally the cross-entropy op would
     # infer loss parallelism from sharding annotations, but that is not yet
     # supported in this implementation.
@@ -643,7 +622,6 @@ def init(
     config.sharding_rules = sharding_rules
 
     return Model(
-        name=__name__,
         config=config,
         weights=weights,
         forward=partial(forward, config),
@@ -680,7 +658,7 @@ def load(
 
     model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
-    config = AutoConfig.from_pretrained(model_ckpt_dir)
+    config = Gemma3TextConfig.from_pretrained(model_ckpt_dir)
     if not isinstance(config, PreTrainedConfig):
         raise TypeError(f"Expected HF config, got {type(config)!r}")
 
@@ -698,7 +676,9 @@ def load(
     )
     jax.set_mesh(mesh)
 
-    weights = load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
+    weights = partial(
+        load_weights_vectorize, "model.layers.", config.num_hidden_layers
+    )(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
 
     if "model.embed_tokens.weight" not in weights:
         raise KeyError(

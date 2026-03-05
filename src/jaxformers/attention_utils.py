@@ -12,6 +12,7 @@ import tokamax
 from jaxformers.ops.attention import (
     chunked_manual_dot_product_attention,
     flash_attention_dot_product_attention,
+    tokamax_remat_chunked_xla_dot_product_attention,
     xla_chunked_dot_product_attention,
 )
 from jaxformers.utils import GeneralInterface
@@ -123,6 +124,7 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
         "sdpa": partial(tokamax.dot_product_attention, precision = jax.lax.Precision.HIGHEST),
         "flash_attention": flash_attention_dot_product_attention,
         "xla_chunked": xla_chunked_dot_product_attention,
+        "tokamax_remat_xla_chunked": tokamax_remat_chunked_xla_dot_product_attention,
         "chunked_manual": chunked_manual_dot_product_attention,
     }
 

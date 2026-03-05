@@ -42,6 +42,7 @@ def main() -> None:
     impl = os.environ.get("TOKAMAX_ATTENTION_IMPL", "auto").strip().lower()
     if impl in ("", "auto", "sdpa"):
         impl = None
+    tokamax_xla_chunk_size = os.environ.get("TOKAMAX_XLA_CHUNK_SIZE", "").strip()
 
     # Mask mode:
     # - "bool": pass a [B,1,T,S] boolean mask (matches our training path)
@@ -66,6 +67,21 @@ def main() -> None:
 
     is_causal = mask_mode == "causal"
     mask = _make_bool_causal_mask(B, T) if mask_mode == "bool" else None
+
+    if impl == "xla_chunked" and tokamax_xla_chunk_size:
+        parts = [p.strip() for p in tokamax_xla_chunk_size.split(",") if p.strip()]
+        if len(parts) == 1:
+            chunk_size: int | tuple[int, int] = int(parts[0])
+        elif len(parts) == 2:
+            chunk_size = (int(parts[0]), int(parts[1]))
+        else:
+            raise ValueError(
+                "TOKAMAX_XLA_CHUNK_SIZE must be like '128' or '1024,4096'; "
+                f"got {tokamax_xla_chunk_size!r}"
+            )
+        from tokamax._src.ops.attention import xla_chunked as tok_xla_chunked
+
+        impl = tok_xla_chunked.XlaChunkedDotProductAttention(chunk_size=chunk_size)
 
     q_sharding = None
     if use_q_sharding:
@@ -95,7 +111,11 @@ def main() -> None:
     print("H (head_dim)", H)
     print("q_shape (B,T,N,H)", q.shape)
     print("k_shape (B,S,K,H)", k.shape)
-    print("tokamax_impl", impl or "auto")
+    if tokamax_xla_chunk_size and not isinstance(impl, str) and impl is not None:
+        print("tokamax_impl", "xla_chunked")
+        print("tokamax_xla_chunk_size", tokamax_xla_chunk_size)
+    else:
+        print("tokamax_impl", impl or "auto")
     print("mask_mode", mask_mode)
     print("use_q_sharding", use_q_sharding)
     print("layers", layers)

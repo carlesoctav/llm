@@ -18,6 +18,7 @@ from jaxformers.benchmark_utils import print_compiled_memory_stats
 from jaxformers.ops.attention import (
     chunked_manual_dot_product_attention,
     flash_attention_dot_product_attention,
+    tokamax_remat_chunked_xla_dot_product_attention,
     xla_chunked_dot_product_attention,
 )
 
@@ -54,6 +55,7 @@ def main() -> None:
         "sdpa",
         "xla",
         "tokamax_xla_chunked",
+        "tokamax_remat_xla_chunked",
         "flash_attention",
         "xla_chunked",
         "chunked_manual",
@@ -125,6 +127,9 @@ def main() -> None:
     if impl in ("xla_chunked", "chunked_manual"):
         print("query_chunk_size", query_chunk_size)
         print("key_chunk_size", key_chunk_size)
+    if impl == "tokamax_remat_xla_chunked":
+        print("query_chunk_size", query_chunk_size)
+        print("key_chunk_size", key_chunk_size)
 
     def attn_fn(q_in, k_in, v_in, mask_in):
         if impl == "chunked_manual":
@@ -147,6 +152,19 @@ def main() -> None:
                 mask=mask_in if mask_mode == "bool" else None,
                 is_causal=is_causal,
                 precision=jax.lax.Precision.HIGHEST,
+                q_sharding=q_sharding,
+            )
+
+        if impl == "tokamax_remat_xla_chunked":
+            return tokamax_remat_chunked_xla_dot_product_attention(
+                q_in,
+                k_in,
+                v_in,
+                mask=mask_in if mask_mode == "bool" else None,
+                is_causal=is_causal,
+                precision=jax.lax.Precision.HIGHEST,
+                query_chunk_size=query_chunk_size,
+                key_chunk_size=key_chunk_size,
                 q_sharding=q_sharding,
             )
 

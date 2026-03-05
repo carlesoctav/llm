@@ -159,16 +159,24 @@ def loraify(
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
             *B, X, Y = weight.shape
-            lora_key = jax.random.fold_in(rngs, counter)
-            counter += 1
-            dtype = getattr(weight, "dtype", jnp.float32)
             *s3, s0, s1 = tuple(weight.sharding.spec)
-            a_sharding = P(*s3, s0, None)
+            a_sharding = P(s0, None)
             b_sharding = P(*s3, None, s1)
-            a_shape = (*B, X, rank)
+            a_shape = (X, rank)
             b_shape = (*B, rank, Y)
-            a = default_init(lora_key, a_shape, dtype=dtype, out_sharding=a_sharding) * scale * ( 1 / jnp.sqrt(rank))
-            b = jnp.zeros(b_shape, dtype=dtype, out_sharding=b_sharding)
+
+            if len(B):
+                init_fn = jax.vmap(default_init, in_axes = (0, None, None, None))
+                lora_key = jax.random.split(jax.random.fold_in(rngs, counter), B)
+                counter += 1
+            else:
+                init_fn = default_init
+                lora_key = jax.random.fold_in(rngs, counter)
+                counter += 1
+
+            a = init_fn(lora_key, a_shape, weight.dtype, a_sharding) * scale * ( 1 / jnp.sqrt(rank))
+            b = jnp.zeros(b_shape, weight.dtype, out_sharding=b_sharding)
+
             lora_weight = LoraArray(
                 _w=weight,
                 a=a,

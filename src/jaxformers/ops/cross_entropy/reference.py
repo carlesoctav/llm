@@ -22,18 +22,17 @@ def cross_entropy_reference(
 ):
     del block_sizes  # unused for reference impl
 
-    def _inner(x: jax.Array, labels: jax.Array, w: jax.Array):
-        logits = einsum(
-            "bh,vh -> bv",
-            x,
-            w,
-            precision=precision,
-            preferred_element_type=dtype,
-        )
-        if logit_soft_cap is not None:
-            logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
-        loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
-        lse = jax.nn.logsumexp(logits, axis=-1)
-        return loss, lse
+    logits = einsum(
+        "bh,vh -> bv",
+        x,
+        w,
+        precision=precision,
+        preferred_element_type=jnp.float32,
+    )
+    if logit_soft_cap is not None:
+        logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
-    return _inner(x, labels, w)
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    lse = jax.nn.logsumexp(logits, axis=-1)
+
+    return loss, lse

@@ -2,24 +2,20 @@ import dataclasses
 import importlib
 import sys
 import time
-from functools import partial, reduce
-from typing import Any, Callable
+from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
-import quax._core as qc
 import sws
 from jax.experimental.rnn import PRNGKeyArray
-from rich.themes import DEFAULT
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
 
 from jaxformers import tree_util
-from jaxformers.benchmark_utils import print_compiled_memory_stats
+from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops
 from jaxformers.data.next_token_prediction import transforms as ntp_transforms
 from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import loraify
@@ -181,6 +177,7 @@ def _preparse_absl_flags() -> None:
 
 
 def load_model(config: sws.FinalConfig, name: str):
+    name = name.replace("_", ".")
     model_module = importlib.import_module(f"jaxformers.models.{name}")
     model = model_module.load(**config.model.to_dict())
     return model
@@ -226,16 +223,15 @@ def load_dataset(config: sws.FinalConfig, data_name: str):
 def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
+        forward_dtype = config.forward_dtype
 
-        hidden_states = model.forward(weights, **batch["inputs"], rngs=rngs)
-        hidden_states = hidden_states.reshape(
-            -1,
-            hidden_states.shape[-1],
-            out_sharding=logical_to_physical(
-                ("batch", "context", "none"), model.config.sharding_rules
-            ),
+        hidden_states = model.forward(
+            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
         )
+
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
+
         if "assistant_masks" in batch["inputs"]:
             count = jnp.sum(
                 batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
@@ -246,13 +242,19 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
         else:
             count = jnp.sum(batch["inputs"]["attention_mask"])
             mask = (batch["inputs"]["attention_mask"]).reshape(-1)
-
         loss = cross_entropy_loss(
             hidden_states,
             labels,
-            jax.reshard(
-                weights[model.lm_head_key],
-                logical_to_physical(("none", "none"), model.config.sharding_rules),
+            (
+                # The fused XLA chunked CE kernel currently assumes replicated
+                # vocab weights; avoid forcing replication for the reference
+                # implementation to match Tunix's fsdp-sharded embed/lm_head.
+                jax.reshard(
+                    weights[model.lm_head_key],
+                    logical_to_physical(("none", "none"), model.config.sharding_rules),
+                )
+                if (config.loss_implementation or None) != "reference"
+                else weights[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
@@ -290,10 +292,12 @@ def eval(model, eval_ds):
 
 
 def process_aux(accum_aux: dict[str, Any], namespace=""):
-    return {
-        f"{namespace}/{k}": v[0] / v[1] if isinstance(v, tuple) else v
-        for k, v in accum_aux.items()
-    }
+    def finalize(v: Any) -> Any:
+        if isinstance(v, tuple):
+            return v[0] / v[1]
+        return v
+
+    return {f"{namespace}/{k}": finalize(v) for k, v in accum_aux.items()}
 
 
 def add_aux(accum_aux, aux):
@@ -355,7 +359,7 @@ def train(
         pbar = tqdm(
             total=total,
             initial=int(step),
-            desc=f"train[p{jax.process_index()}]",
+            desc="train",
             unit="step",
             dynamic_ncols=True,
         )
@@ -388,19 +392,23 @@ def train(
                 with jax.named_scope("compile train step"):
                     start_time = time.monotonic()
                     train_step_fn = (
-                        jax.jit(partial(train_step, config))
+                        jax.jit(partial(train_step, config), donate_argnums=(0,))
                         .lower(model, batch, loop_rngs)
                         .compile()
                     )
                     first_compile_time = time.monotonic() - start_time
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, loop_rngs)
                     if jax.process_index() == 0:
                         print("compile time: ", first_compile_time)
                         compiled_analysis = train_step_fn.memory_analysis()
                         memory_stats = print_compiled_memory_stats(compiled_analysis)
+                        cost = print_flops(train_step_fn.cost_analysis())
+
                         to_log_later.update(memory_stats)
+                        to_log_later.update(cost)
+
+                    model, aux = train_step_fn(model, batch, loop_rngs)
                     first_step = False
             else:
                 with (
@@ -410,7 +418,7 @@ def train(
                     model, aux = train_step_fn(model, batch, loop_rngs)
 
             accum_aux = add_aux(accum_aux, aux)
-            global_aux = add_aux(global_aux, accum_aux)
+            global_aux = add_aux(global_aux, aux)
             emit = mini_step == (config.optimizer.grad_accum - 1)
             if emit:
                 processed_aux = process_aux(accum_aux, "step")
@@ -440,19 +448,18 @@ def train(
             mini_step = (mini_step + 1) % config.optimizer.grad_accum
             step = emit * (step + 1) + (1 - emit) * step
     finally:
-        if program_wall_t0 is not None:
-            to_log_later["program_time"] = time.monotonic() - program_wall_t0
-        if first_compile_time is not None:
-            to_log_later["compile_time"] = first_compile_time
+        to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        to_log_later["compile_time"] = first_compile_time
         final_cum = process_aux(global_aux, "cum")
-        final_cum = pbar_display(final_cum)
         to_log_later.update(final_cum)
         token_count = to_log_later.get("cum/token_count")
         program_time = to_log_later.get("program_time")
-        if token_count is not None and program_time:
-            to_log_later["systems/tok_s"] = token_count / program_time
+        to_log_later["systems/tok_s"] = token_count / program_time
+
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
+            print(f"program_time: {to_log_later['program_time']:.3f}s")
+            print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()
@@ -472,9 +479,9 @@ def main(config: sws.FinalConfig):
     logger = create_logger(config)
     try:
         rngs = jax.random.key(config.train_seed) if config.train_seed else None
-
         if not config.random_init and not config.resume:
             model = load_model(config, config.model_name)
+            print("DEBUGPRINT {model}:", model)
             scheduler = load_scheduler(config, config.lr_scheduler_name)
             if config.use_lora:
                 if config.random_init_lora:

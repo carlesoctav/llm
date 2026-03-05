@@ -12,13 +12,14 @@ import jax
 import jax.core
 import jax.extend.core as jexc
 import jax.lax as lax
+from jax import P
 import jax.numpy as jnp
-import jax.random as jr
 import jax.tree_util as jtu
 import quax
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.modeling_utils import Model
+from jaxformers.print_utils import tree_pformat
 
 
 class LoraArray(quax.ArrayValue):
@@ -129,7 +130,7 @@ def _is_match(array_path, weights_path):
     return False
 
 
-def random_weight(key,shape):
+def random_weight(key, shape):
     return jax.random.normal(key, shape)
 
 
@@ -147,20 +148,51 @@ def loraify(
     counter = 0
     loraify_weight = []
     t0 = time.monotonic()
+
+    def _infer_lora_shardings(weight: ArrayLike):
+        """Infer sharding for LoRA A/B from the base weight sharding.
+
+        We shard only along the corresponding base-weight dimension and keep the
+        rank dimension replicated. This keeps LoRA params and optimizer state
+        sharded (avoids full replication), aligning with Tunix' resharded LoRA.
+        """
+
+        base_sharding = getattr(weight, "sharding", None)
+        if not isinstance(base_sharding, jax.sharding.NamedSharding):
+            return None, None
+
+        spec = tuple(base_sharding.spec)
+        if len(spec) != 2:
+            return None, None
+
+        s0, s1 = spec
+        mesh = base_sharding.mesh
+        a_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(s0, None)
+        )
+        b_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(None, s1)
+        )
+        return a_sharding, b_sharding
+
     def _loraify(path, weight):
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
-            X, Y = weight.shape
+            *B, X, Y = weight.shape
             lora_key = jax.random.fold_in(rngs, counter)
             counter += 1
-            a = jax.random.normal(lora_key, (X, rank))
-            b = jnp.zeros((rank, Y))
+            dtype = getattr(weight, "dtype", jnp.float32)
+            a = jax.random.normal(lora_key, (*B, X, rank), dtype=dtype) * scale
+            b = jnp.zeros((*B, rank, Y), dtype=dtype)
+            *s3, s0, s1 = tuple(weight.sharding.spec)
+            a = jax.device_put(a, P(*s3, s0, None))
+            b = jax.device_put(b, P(*s3, None, s1))
 
             lora_weight = LoraArray(
-                _w =weight,
-                a = a,
-                b = b,
+                _w=weight,
+                a=a,
+                b=b,
                 alpha=alpha,
                 allow_materialise=allow_materialise,
             )
@@ -171,7 +203,7 @@ def loraify(
 
     weights = jtu.tree_map_with_path(_loraify, model.weights)
     diff = time.monotonic() - t0
-    print("Model weights converted to LoRA:", *loraify_weight)
+    print("Model weights converted to LoRA:", tree_pformat(loraify_weight))
     print(f"loraify takes {diff}s")
     return replace(
         model,

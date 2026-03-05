@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Attention microbench that can compare tokamax implementations vs our
-# chunked XLA attention implementations. Mirrors the CE bench style:
+# `chunked_manual` attention. Mirrors the CE bench style:
 # - compile time
 # - steady-state time
 # - compiled memory analysis (fwd + bwd)
@@ -15,12 +15,7 @@ import numpy as np
 import tokamax
 
 from jaxformers.benchmark_utils import print_compiled_memory_stats
-from jaxformers.ops.attention import (
-    chunked_manual_dot_product_attention,
-    flash_attention_dot_product_attention,
-    tokamax_remat_chunked_xla_dot_product_attention,
-    xla_chunked_dot_product_attention,
-)
+from jaxformers.ops.attention.chunked_manual import chunked_manual_dot_product_attention
 
 
 def _env_int(name: str, default: int) -> int:
@@ -42,24 +37,16 @@ def _make_bool_causal_mask(batch: int, seqlen: int) -> jax.Array:
 def main() -> None:
     print("devices:", jax.devices())
 
-    B = _env_int("BATCH", 16)
-    T = _env_int("SEQLEN", 2048)
-    N = _env_int("Q_HEADS", 4)
-    K = _env_int("KV_HEADS", 1)
-    H = _env_int("HEAD_DIM", 256)
+    batch = _env_int("BATCH", 16)
+    seqlen = _env_int("SEQLEN", 2048)
+    num_q_heads = _env_int("Q_HEADS", 4)
+    num_kv_heads = _env_int("KV_HEADS", 1)
+    head_dim = _env_int("HEAD_DIM", 256)
     layers = _env_int("LAYERS", 1)
     steps = _env_int("STEPS", 5)
 
     impl = _env_str("ATTENTION_IMPL", "xla_chunked").strip().lower()
-    if impl not in (
-        "sdpa",
-        "xla",
-        "tokamax_xla_chunked",
-        "tokamax_remat_xla_chunked",
-        "flash_attention",
-        "xla_chunked",
-        "chunked_manual",
-    ):
+    if impl not in ("sdpa", "xla", "xla_chunked", "chunked_manual"):
         raise ValueError(f"Unsupported ATTENTION_IMPL={impl!r}")
 
     mask_mode = _env_str("ATTENTION_MASK", "bool").strip().lower()
@@ -78,56 +65,41 @@ def main() -> None:
     key = jax.random.PRNGKey(0)
     kq, kk, kv = jax.random.split(key, 3)
 
-    q = jax.random.normal(kq, (B, T, N, H), dtype=jnp.bfloat16)  # [B, T, N, H]
-    k = jax.random.normal(kk, (B, T, K, H), dtype=jnp.bfloat16)  # [B, S, K, H]
-    v = jax.random.normal(kv, (B, T, K, H), dtype=jnp.bfloat16)  # [B, S, K, H]
+    q = jax.random.normal(kq, (batch, seqlen, num_q_heads, head_dim), dtype=jnp.bfloat16)
+    k = jax.random.normal(kk, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    v = jax.random.normal(kv, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
 
     is_causal = mask_mode == "causal"
-    mask = _make_bool_causal_mask(B, T) if mask_mode == "bool" else None
+    mask = _make_bool_causal_mask(batch, seqlen) if mask_mode == "bool" else None
     if impl == "chunked_manual" and mask_mode != "bool":
         # `chunked_manual` only accepts explicit masks. Keep semantics consistent.
-        mask = _make_bool_causal_mask(B, T)
+        mask = _make_bool_causal_mask(batch, seqlen)
         is_causal = False
 
     q_sharding = None
     if use_q_sharding:
         devs = np.array(jax.devices())
-        mesh_b = _env_int("MESH_B", len(devs))
-        mesh_n = _env_int("MESH_N", 1)
-        if mesh_b * mesh_n != len(devs):
-            raise ValueError(f"MESH_B*MESH_N must equal device count; got {mesh_b}*{mesh_n} != {len(devs)}")
-        mesh = jax.sharding.Mesh(devs.reshape(mesh_b, mesh_n), ("B", "N"))
-
-        q_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, "N" if mesh_n > 1 else None, None)
-        kv_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, ("N" if (mesh_n > 1 and K == N) else None), None)
-        mask_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, None, None)
-
-        q_sharding = jax.sharding.NamedSharding(mesh, q_spec)
-        kv_sharding = jax.sharding.NamedSharding(mesh, kv_spec)
-        mask_sharding = jax.sharding.NamedSharding(mesh, mask_spec)
-
+        mesh = jax.sharding.Mesh(devs, ("dp_shard",))
+        q_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("dp_shard", None, None, None)
+        )
         q = jax.device_put(q, q_sharding)
-        k = jax.device_put(k, kv_sharding)
-        v = jax.device_put(v, kv_sharding)
+        k = jax.device_put(k, q_sharding)
+        v = jax.device_put(v, q_sharding)
         if mask is not None:
-            mask = jax.device_put(mask, mask_sharding)
+            mask = jax.device_put(mask, q_sharding)
 
-    print("B", B)
-    print("T", T)
-    print("N (q_heads)", N)
-    print("K (kv_heads)", K)
-    print("H (head_dim)", H)
-    print("q_shape (B,T,N,H)", q.shape)
-    print("k_shape (B,S,K,H)", k.shape)
+    print("batch", batch)
+    print("seqlen", seqlen)
+    print("q_heads", num_q_heads)
+    print("kv_heads", num_kv_heads)
+    print("head_dim", head_dim)
     print("layers", layers)
     print("steps", steps)
     print("impl", impl)
     print("mask_mode", mask_mode)
     print("use_q_sharding", use_q_sharding)
-    if impl in ("xla_chunked", "chunked_manual"):
-        print("query_chunk_size", query_chunk_size)
-        print("key_chunk_size", key_chunk_size)
-    if impl == "tokamax_remat_xla_chunked":
+    if impl == "chunked_manual":
         print("query_chunk_size", query_chunk_size)
         print("key_chunk_size", key_chunk_size)
 
@@ -144,44 +116,7 @@ def main() -> None:
                 key_chunk_size=key_chunk_size,
             )
 
-        if impl == "flash_attention":
-            return flash_attention_dot_product_attention(
-                q_in,
-                k_in,
-                v_in,
-                mask=mask_in if mask_mode == "bool" else None,
-                is_causal=is_causal,
-                precision=jax.lax.Precision.HIGHEST,
-                q_sharding=q_sharding,
-            )
-
-        if impl == "tokamax_remat_xla_chunked":
-            return tokamax_remat_chunked_xla_dot_product_attention(
-                q_in,
-                k_in,
-                v_in,
-                mask=mask_in if mask_mode == "bool" else None,
-                is_causal=is_causal,
-                precision=jax.lax.Precision.HIGHEST,
-                query_chunk_size=query_chunk_size,
-                key_chunk_size=key_chunk_size,
-                q_sharding=q_sharding,
-            )
-
-        if impl == "xla_chunked":
-            return xla_chunked_dot_product_attention(
-                q_in,
-                k_in,
-                v_in,
-                mask=mask_in if mask_mode == "bool" else None,
-                is_causal=is_causal,
-                precision=jax.lax.Precision.HIGHEST,
-                query_chunk_size=query_chunk_size,
-                key_chunk_size=key_chunk_size,
-                q_sharding=q_sharding,
-            )
-
-        tokamax_impl = None if impl == "sdpa" else ("xla_chunked" if impl == "tokamax_xla_chunked" else impl)
+        tokamax_impl = None if impl == "sdpa" else impl
         return tokamax.dot_product_attention(
             q_in,
             k_in,
@@ -200,8 +135,8 @@ def main() -> None:
 
         x = x + q_in
         for _ in range(layers - 1):
-            k_x = x[:, :, :K, :]
-            v_x = x[:, :, :K, :]
+            k_x = x[:, :, :num_kv_heads, :]
+            v_x = x[:, :, :num_kv_heads, :]
             x = x + attn_fn(x, k_x, v_x, mask_in)
         return x
 
@@ -248,7 +183,7 @@ def main() -> None:
     bwd_steady_s = (time.perf_counter() - t0) / steps
     print("bwd_steady_time_s", bwd_steady_s)
 
-    tokens = B * T
+    tokens = batch * seqlen
     print("tokens", tokens)
     print("fwd_tokens_per_s", tokens / fwd_steady_s)
     print("bwd_tokens_per_s", tokens / bwd_steady_s)

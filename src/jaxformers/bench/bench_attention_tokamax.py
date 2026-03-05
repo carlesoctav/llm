@@ -29,11 +29,11 @@ def _make_bool_causal_mask(batch: int, seqlen: int) -> jax.Array:
 def main() -> None:
     print("devices:", jax.devices())
 
-    B = _env_int("BATCH", 4)
-    T = _env_int("SEQLEN", 2048)
-    N = _env_int("Q_HEADS", 4)
-    K = _env_int("KV_HEADS", 1)
-    H = _env_int("HEAD_DIM", 256)
+    batch = _env_int("BATCH", 4)
+    seqlen = _env_int("SEQLEN", 2048)
+    num_q_heads = _env_int("Q_HEADS", 4)
+    num_kv_heads = _env_int("KV_HEADS", 1)
+    head_dim = _env_int("HEAD_DIM", 256)
     layers = _env_int("LAYERS", 1)
 
     # Implementation passed to tokamax.
@@ -42,7 +42,6 @@ def main() -> None:
     impl = os.environ.get("TOKAMAX_ATTENTION_IMPL", "auto").strip().lower()
     if impl in ("", "auto", "sdpa"):
         impl = None
-    tokamax_xla_chunk_size = os.environ.get("TOKAMAX_XLA_CHUNK_SIZE", "").strip()
 
     # Mask mode:
     # - "bool": pass a [B,1,T,S] boolean mask (matches our training path)
@@ -61,61 +60,34 @@ def main() -> None:
     key = jax.random.PRNGKey(0)
     kq, kk, kv = jax.random.split(key, 3)
 
-    q = jax.random.normal(kq, (B, T, N, H), dtype=jnp.bfloat16)  # [B, T, N, H]
-    k = jax.random.normal(kk, (B, T, K, H), dtype=jnp.bfloat16)  # [B, S, K, H]
-    v = jax.random.normal(kv, (B, T, K, H), dtype=jnp.bfloat16)  # [B, S, K, H]
+    q = jax.random.normal(kq, (batch, seqlen, num_q_heads, head_dim), dtype=jnp.bfloat16)
+    k = jax.random.normal(kk, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    v = jax.random.normal(kv, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
 
     is_causal = mask_mode == "causal"
-    mask = _make_bool_causal_mask(B, T) if mask_mode == "bool" else None
-
-    if impl == "xla_chunked" and tokamax_xla_chunk_size:
-        parts = [p.strip() for p in tokamax_xla_chunk_size.split(",") if p.strip()]
-        if len(parts) == 1:
-            chunk_size: int | tuple[int, int] = int(parts[0])
-        elif len(parts) == 2:
-            chunk_size = (int(parts[0]), int(parts[1]))
-        else:
-            raise ValueError(
-                "TOKAMAX_XLA_CHUNK_SIZE must be like '128' or '1024,4096'; "
-                f"got {tokamax_xla_chunk_size!r}"
-            )
-        from tokamax._src.ops.attention import xla_chunked as tok_xla_chunked
-
-        impl = tok_xla_chunked.XlaChunkedDotProductAttention(chunk_size=chunk_size)
+    mask = _make_bool_causal_mask(batch, seqlen) if mask_mode == "bool" else None
 
     q_sharding = None
     if use_q_sharding:
+        # Match the common dp-shard setup: shard the leading batch axis across devices.
+        # This uses `shard_map` inside tokamax attention.
         devs = np.array(jax.devices())
-        mesh_b = _env_int("MESH_B", len(devs))
-        mesh_n = _env_int("MESH_N", 1)
-        if mesh_b * mesh_n != len(devs):
-            raise ValueError(f"MESH_B*MESH_N must equal device count; got {mesh_b}*{mesh_n} != {len(devs)}")
-        mesh = jax.sharding.Mesh(devs.reshape(mesh_b, mesh_n), ("B", "N"))
-        q_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, "N" if mesh_n > 1 else None, None)
-        kv_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, ("N" if (mesh_n > 1 and K == N) else None), None)
-        mask_spec = jax.sharding.PartitionSpec("B" if mesh_b > 1 else None, None, None, None)
-
-        q_sharding = jax.sharding.NamedSharding(mesh, q_spec)
-        kv_sharding = jax.sharding.NamedSharding(mesh, kv_spec)
-        mask_sharding = jax.sharding.NamedSharding(mesh, mask_spec)
+        mesh = jax.sharding.Mesh(devs, ("dp_shard",))
+        q_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("dp_shard", None, None, None)
+        )
         q = jax.device_put(q, q_sharding)
-        k = jax.device_put(k, kv_sharding)
-        v = jax.device_put(v, kv_sharding)
+        k = jax.device_put(k, q_sharding)
+        v = jax.device_put(v, q_sharding)
         if mask is not None:
-            mask = jax.device_put(mask, mask_sharding)
+            mask = jax.device_put(mask, q_sharding)
 
-    print("B", B)
-    print("T", T)
-    print("N (q_heads)", N)
-    print("K (kv_heads)", K)
-    print("H (head_dim)", H)
-    print("q_shape (B,T,N,H)", q.shape)
-    print("k_shape (B,S,K,H)", k.shape)
-    if tokamax_xla_chunk_size and not isinstance(impl, str) and impl is not None:
-        print("tokamax_impl", "xla_chunked")
-        print("tokamax_xla_chunk_size", tokamax_xla_chunk_size)
-    else:
-        print("tokamax_impl", impl or "auto")
+    print("batch", batch)
+    print("seqlen", seqlen)
+    print("q_heads", num_q_heads)
+    print("kv_heads", num_kv_heads)
+    print("head_dim", head_dim)
+    print("tokamax_impl", impl or "auto")
     print("mask_mode", mask_mode)
     print("use_q_sharding", use_q_sharding)
     print("layers", layers)
@@ -142,8 +114,8 @@ def main() -> None:
         # shapes consistent for MQA/GQA settings.
         x = x + q_in
         for _ in range(layers - 1):
-            k_x = x[:, :, :K, :]
-            v_x = x[:, :, :K, :]
+            k_x = x[:, :, :num_kv_heads, :]
+            v_x = x[:, :, :num_kv_heads, :]
             x = x + attn_fn(x, k_x, v_x, mask_in)
         return x
 
@@ -191,7 +163,7 @@ def main() -> None:
     bwd_steady_s = (time.perf_counter() - t0) / steps
     print("bwd_steady_time_s", bwd_steady_s)
 
-    tokens = B * T
+    tokens = batch * seqlen
     print("tokens", tokens)
     print("fwd_tokens_per_s", tokens / fwd_steady_s)
     print("bwd_tokens_per_s", tokens / bwd_steady_s)

@@ -24,7 +24,10 @@ IMPLEMENTATIONS: dict[str, ArrayImpl] = {
 
 _DEFAULT_IMPLEMENTATION: tuple[Implementation, ...] = ("xla_chunked", "reference")
 try:
-    from .pallas_tpu import PallasUnsupportedError, linear_softmax_cross_entropy_loss_pallas
+    from .pallas_tpu import (
+        linear_softmax_cross_entropy_loss_pallas,
+        PallasUnsupportedError,
+    )
 
     IMPLEMENTATIONS["pallas_tpu"] = linear_softmax_cross_entropy_loss_pallas
     if jax.default_backend() == "tpu":
@@ -83,6 +86,7 @@ def cross_entropy_loss(
     dtype: jnp.dtype | None = jnp.float32,
     logit_soft_cap: float | None = None,
     precision: jax.lax.PrecisionLike = None,
+    q_sharding: jax.sharding.NamedSharding | None = None,
     implementation: Implementation | Sequence[Implementation | ArrayImpl] | None = None,
 ) -> jax.Array:
 
@@ -108,24 +112,29 @@ def cross_entropy_loss(
         if fn is None:
             raise ValueError(f"Unsupported implementation: {impl}")
         if block_sizes is None:
-            block_sizes_for_impl = infer_block_sizes(impl, B, H, V, dtype = dtype)
+            block_sizes_for_impl = infer_block_sizes(impl, B, H, V, dtype=dtype)
         else:
             block_sizes_for_impl = block_sizes
+        need_lse = logsumexp_weight is not None and logsumexp_weight != 0.0
         try:
-            loss, lse = fn(
-                x,
-                labels,
-                w,
-                logit_soft_cap=logit_soft_cap,
-                block_sizes=block_sizes_for_impl,
-                dtype=dtype,
-                precision=precision,
+            # Only compute logsumexp when actually used, to avoid forcing
+            # materialization of [B, V] logits in the reference implementation.
+            loss, lse = (
+                fn(
+                    x,
+                    labels,
+                    w,
+                    logit_soft_cap=logit_soft_cap,
+                    block_sizes=block_sizes_for_impl,
+                    dtype=dtype,
+                    precision=precision,
+                )
             )
         except Exception as e:
             errors.append(e)
             continue
 
-        if logsumexp_weight is not None and logsumexp_weight != 0.0:
+        if need_lse:
             loss = loss + logsumexp_weight * (lse**2)
         return _apply_reduction(loss, reduction, weight)
     raise ExceptionGroup("all implementations failed", errors)

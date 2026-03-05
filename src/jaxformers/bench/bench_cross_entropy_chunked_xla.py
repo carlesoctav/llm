@@ -15,10 +15,10 @@ from jaxformers.ops.cross_entropy.config import infer_block_sizes
 def main() -> None:
     print("devices:", jax.devices())
 
-    batch = 64
+    batch = 16
     pos = 2048
-    embed = 512
-    vocab = 128256
+    embed = 1152
+    vocab = 262144
 
     key = jax.random.PRNGKey(0)
     key_x, key_w, key_y = jax.random.split(key, 3)
@@ -97,3 +97,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

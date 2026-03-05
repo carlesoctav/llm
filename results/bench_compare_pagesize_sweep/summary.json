@@ -1,0 +1,68 @@
+[
+    {
+        "page_size": 16,
+        "kv_capacity_tokens": 65536,
+        "vllm_block_size": 16,
+        "vllm_num_gpu_blocks_override": 4096,
+        "jaxformers": {
+            "elapsed_time": 1.8504713959991932,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 17.292890919138504,
+            "tokens_per_second": 19921.410338847556
+        },
+        "vllm": {
+            "elapsed_time": 1.7104055997915566,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 18.7090126481694,
+            "tokens_per_second": 21552.782570691146
+        },
+        "jaxformers_output_tokens_per_second": 2213.4900376497285,
+        "vllm_output_tokens_per_second": 2394.753618965683
+    },
+    {
+        "page_size": 32,
+        "kv_capacity_tokens": 65536,
+        "vllm_block_size": 16,
+        "vllm_num_gpu_blocks_override": 4096,
+        "jaxformers": {
+            "elapsed_time": 1.7636508140712976,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 18.144181231731263,
+            "tokens_per_second": 20902.096778954412
+        },
+        "vllm": {
+            "elapsed_time": 1.6754403319209814,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 19.099456656454187,
+            "tokens_per_second": 22002.574068235223
+        },
+        "jaxformers_output_tokens_per_second": 2322.4551976616017,
+        "vllm_output_tokens_per_second": 2444.730452026136
+    },
+    {
+        "page_size": 64,
+        "kv_capacity_tokens": 65536,
+        "vllm_block_size": 16,
+        "vllm_num_gpu_blocks_override": 4096,
+        "jaxformers": {
+            "elapsed_time": 1.6757271317765117,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 19.09618779405654,
+            "tokens_per_second": 21998.808338753137
+        },
+        "vllm": {
+            "elapsed_time": 1.718117019161582,
+            "num_requests": 32,
+            "total_num_tokens": 36864,
+            "requests_per_second": 18.62504104383738,
+            "tokens_per_second": 21456.047282500662
+        },
+        "jaxformers_output_tokens_per_second": 2444.312037639237,
+        "vllm_output_tokens_per_second": 2384.005253611185
+    }
+]

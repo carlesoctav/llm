@@ -1,0 +1,7 @@
+{
+    "elapsed_time": 1.3349271626211703,
+    "num_requests": 8,
+    "total_num_tokens": 512,
+    "requests_per_second": 5.9928363314532875,
+    "tokens_per_second": 383.5415252130104
+}

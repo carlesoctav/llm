@@ -1,0 +1,24 @@
+[
+    {
+        "page_size": 64,
+        "kv_capacity_tokens": 393216,
+        "vllm_block_size": 16,
+        "vllm_num_gpu_blocks_override": 24576,
+        "jaxformers": {
+            "elapsed_time": 111.76085721794516,
+            "num_requests": 32,
+            "total_num_tokens": 393216,
+            "requests_per_second": 0.2863256492172095,
+            "tokens_per_second": 3518.36957758107
+        },
+        "vllm": {
+            "elapsed_time": 88.0507186842151,
+            "num_requests": 32,
+            "total_num_tokens": 393216,
+            "requests_per_second": 0.36342690301898306,
+            "tokens_per_second": 4465.789784297263
+        },
+        "jaxformers_output_tokens_per_second": 1172.78985919369,
+        "vllm_output_tokens_per_second": 1488.5965947657546
+    }
+]

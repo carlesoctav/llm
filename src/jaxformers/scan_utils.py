@@ -1,6 +1,7 @@
 from jaxformers.print_utils import tree_pprint
 import functools
 
+import jax.tree as jt
 import jax
 
 from jaxformers import tree_util
@@ -8,7 +9,6 @@ from jaxformers import tree_util
 
 def make_scan_fwd(fwd, num_hidden_layers):
     def scan_fwd(x, w, input_kwargs):
-        @functools.wraps(fwd)
         def fn(carry, x):
             inputs = carry
             scan_weights, scan_input_kwargs = x
@@ -35,5 +35,6 @@ def split_scan_items(weights, size, index=0):
                 return False
             return leaf.shape[index] == size
         return False
-    scan_items, other_items = tree_util.partition(weights, filter)
+    filter_bool = jt.map(filter, weights)
+    scan_items, other_items = tree_util.partition(weights, filter_bool)
     return scan_items, other_items

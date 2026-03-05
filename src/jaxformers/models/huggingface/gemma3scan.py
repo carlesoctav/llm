@@ -173,10 +173,7 @@ def get_rope_theta(config: Config, attention_type: str) -> float:
         )
     return float(attn_config["rope_theta"])
 
-
-def make_mask(
-    config: Config, input_embeds, attention_mask=None, segment_ids=None, **kwargs
-):
+def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
     attn_impl = config.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
         return {
@@ -199,14 +196,11 @@ def make_mask(
             attention_mask=attention_mask,
             segment_ids=segment_ids,
         )
-    scan_mask = jnp.stack(
-        [
-            full_mask if a == "full_attention" else sliding_mask
-            for a in config.layer_types
-        ]
-    )
-    return scan_mask
 
+    return {
+        "full_attention": full_mask,
+        "sliding_attention": sliding_mask,
+    }
 
 def linear_3d(x, w, b=None, *, out_sharding=None):
     y = einsum(
@@ -225,14 +219,15 @@ def forward_layer(
     config: Config,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
-    layer_idx: int,
-    rope_theta: float,
+    layer_idx: Int[Array, ""],
+    rope_theta: Float[Array, ""],
     pos=0,
     **inputs,
 ):
     rules = config.sharding_rules
     act_fn = get_activation_fn(config.hidden_activation)
     head_dim = config.head_dim
+    attention_mask = jax.lax.select(inputs["is_sliding"], inputs["attention_mask"]["sliding_attention"], inputs["attention_mask"]["full_attention"])
 
     residual = x
     x_norm = gemma_rms_norm(x, w["input_layernorm.weight"], config.rms_norm_eps)
@@ -283,7 +278,7 @@ def forward_layer(
     k = apply_rope(k, rope_theta, pos)
 
     attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
+        q, k, v, mask=attention_mask, q_sharding=q_sharding
     )
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
@@ -368,23 +363,18 @@ def forward(
     else:
         fwd = partial(forward_layer, config)
 
-    scan_mask = make_mask(
+    mask_mapping = make_mask(
         config,
         x,
         **inputs,
     )
-
-    tree_pprint(scan_mask)
-    print("DEBUGPRINT {config.layer_types}:", config.layer_types)
-    scan_rope_theta = jnp.asarray([
-        get_rope_theta(config, attention_type) for attention_type in config.layer_types
-    ])
-    scan_layer_idx = jnp.asarray(list(range(0, config.num_hidden_layers)))
     input_kwargs = {
-        "attention_mask": scan_mask,
-        "rope_theta": scan_rope_theta,
-        "layer_idx": scan_layer_idx,
+        "attention_mask": mask_mapping,
+        "rope_theta": jnp.asarray([get_rope_theta(config, attention_type) for attention_type in config.layer_types]),
+        "is_sliding": jnp.array([t == "sliding_attention" for t in config.layer_types]),
+        "layer_idx" : jnp.asarray(list(range(0, config.num_hidden_layers))),
         "pos": jnp.asarray(0),
+        "rngs": jax.random.split(rngs, config.num_hidden_layers) if rngs is not None else rngs,
     }
     x = make_scan_fwd(fwd, config.num_hidden_layers)(x, weights, input_kwargs)
     x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)

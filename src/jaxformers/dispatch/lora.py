@@ -24,7 +24,7 @@ from jaxformers.modeling_utils import Model
 from jaxformers.print_utils import tree_pformat
 
 
-default_init = jax.nn.initializers.truncated_normal(lower = -3, upper = 3)
+default_init = jax.nn.initializers.he_normal(in_axis=-1, out_axis=-2)
 
 
 class LoraArray(quax.ArrayValue):
@@ -144,7 +144,7 @@ def loraify(
     weights_path: list[str],
     rank: int,
     alpha: float,
-    scale: float = 1,
+    # scale: float = 1,
     allow_materialise: bool = False,
     stop_gradient: bool = True,
     *,
@@ -166,7 +166,7 @@ def loraify(
             b_shape = (*B, rank, Y)
 
             if len(B):
-                init_fn = jax.vmap(default_init, in_axes = (0, None, None, None))
+                init_fn = jax.vmap(default_init, in_axes=(0, None, None, None))
                 lora_key = jax.random.split(jax.random.fold_in(rngs, counter), B)
                 counter += 1
             else:
@@ -174,7 +174,7 @@ def loraify(
                 lora_key = jax.random.fold_in(rngs, counter)
                 counter += 1
 
-            a = init_fn(lora_key, a_shape, weight.dtype, a_sharding) * scale * ( 1 / jnp.sqrt(rank))
+            a = init_fn(lora_key, a_shape, weight.dtype, a_sharding)
             b = jnp.zeros(b_shape, weight.dtype, out_sharding=b_sharding)
 
             lora_weight = LoraArray(

@@ -235,6 +235,7 @@ def xla_chunked_dot_product_attention(
     key_starts = jnp.arange(0, Spad, key_chunk_size, dtype=jnp.int32)
     query_starts = jnp.arange(0, Tpad, query_chunk_size, dtype=jnp.int32)
 
+    @functools.partial(jax.remat, prevent_cse=False)
     def q_body(_, t0):
         q_chunk = jax.lax.dynamic_slice(
             query, (0, t0, 0, 0), (B, query_chunk_size, N, H)

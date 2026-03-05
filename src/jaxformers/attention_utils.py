@@ -1,10 +1,42 @@
-from jaxformers.utils import GeneralInterface
+from __future__ import annotations
+
+from functools import partial
+from typing import Protocol
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
+
 import tokamax
-from typing import Protocol
-from functools import partial
+
+from jaxformers.ops.attention import (
+    chunked_manual_dot_product_attention,
+    flash_attention_dot_product_attention,
+    tokamax_remat_chunked_xla_dot_product_attention,
+    xla_chunked_dot_product_attention,
+)
+from jaxformers.utils import GeneralInterface
+
+
+def _normalize_mask(
+    mask: Bool[Array, "..."],
+    B: int,
+    N: int,
+    T: int,
+    S: int,
+) -> Bool[Array, "B N T S"]:
+    """Normalize a mask to `[B, N, T, S]`.
+
+    Accepted layouts:
+      - `[B, 1, T, S]` (common causal mask)
+      - `[B, N, T, S]`
+    """
+    m = jnp.asarray(mask, dtype=jnp.bool_)
+    if m.shape == (B, N, T, S):
+        return m
+    if m.shape == (B, 1, T, S):
+        return jnp.broadcast_to(m, (B, N, T, S))
+    raise ValueError(f"Unsupported mask shape {m.shape}; expected (B,1,T,S) or (B,N,T,S)")
 
 
 class AttentionImpl(Protocol):
@@ -90,11 +122,10 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
         "sdpa": partial(tokamax.dot_product_attention, precision = jax.lax.Precision.HIGHEST),
-        "xla_chunked": partial(
-            tokamax.dot_product_attention,
-            implementation="xla_chunked",
-            precision=jax.lax.Precision.HIGHEST,
-        ),
+        "flash_attention": flash_attention_dot_product_attention,
+        "xla_chunked": xla_chunked_dot_product_attention,
+        "tokamax_remat_xla_chunked": tokamax_remat_chunked_xla_dot_product_attention,
+        "chunked_manual": chunked_manual_dot_product_attention,
     }
 
 ATTENTION_INTERFACE = AttentionInterface()

@@ -35,4 +35,4 @@ def find_learning_rate(opt_state):
     return res
 
 def find_grad_norm(opt_state):
-    return {"grad/grad_norm": opt_state[2].grad_norm}
+    return {"grad/grad_norm": opt_state[0].grad_norm}

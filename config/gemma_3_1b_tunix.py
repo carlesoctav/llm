@@ -50,7 +50,7 @@ def get_config():
     config.lr_scheduler_name = None
     # config.lr_scheduler.xx = xx
 
-    config.optimizer_name = "adam"
+    config.optimizer_name = "sgd"
     config.optimizer.max_grad_norm = 1.0
     config.optimizer.grad_accum = 4
 

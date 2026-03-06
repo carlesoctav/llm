@@ -13,6 +13,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 import sws
 from jax.experimental.rnn import PRNGKeyArray
+from optax.microbatching import microbatch
 from tqdm.auto import tqdm
 
 from jaxformers import tree_util
@@ -200,7 +201,9 @@ def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
         train_mask = mask_trainable_lora(model.weights)
 
     train_weights, _ = tree_util.partition(model.weights, train_mask)
-    tx = optmizer_module.make(scheduler, **config.optimizer.to_dict())
+    optimizer_kwargs = config.optimizer.to_dict()
+    optimizer_kwargs["grad_accum"] = 1
+    tx = optmizer_module.make(scheduler, **optimizer_kwargs)
     opt_state = tx.init(train_weights)
     return dataclasses.replace(model, opt_state=opt_state, tx=tx, train_mask=train_mask)
 
@@ -276,20 +279,26 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
         return loss, aux
 
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    k = config.optimizer.grad_accum
-    c = model.opt_state[0].count
-    emit = c == (k - 1)
+    microbatch_count = config.optimizer.grad_accum
+    if microbatch_count < 1:
+        raise ValueError("`config.optimizer.grad_accum` must be >= 1.")
+    if config.train_loader.global_batch_size % microbatch_count != 0:
+        raise ValueError(
+            "`config.train_loader.global_batch_size` must be divisible by "
+            "`config.optimizer.grad_accum`."
+        )
+    grad_fn = microbatch(
+        jax.jit(jax.value_and_grad(loss_fn, has_aux=True)),
+        argnums=2,
+        microbatch_size=config.train_loader.global_batch_size // microbatch_count,
+    )
 
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
     token_count = aux["token_count"]
-
+    inv_token_count = (1 / token_count).astype(jnp.bfloat16)
+    grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
     updates, nst = model.tx.update(
         grad, model.opt_state, model.weights, count=token_count
-    )
-
-    nst = (nst[0], nst[1]) + jtu.tree_map(
-        lambda nst, st: jnp.where(emit, nst, st), nst[2:], model.opt_state[2:]
     )
 
     nweights = tree_util.apply_updates(model.weights, updates)
@@ -408,7 +417,6 @@ def train(
                             _infer_jit_shardings(model),
                             _infer_jit_shardings(batch),
                             None,
-                            # _infer_jit_shardings(loop_rngs),
                         ),
                         out_shardings=(
                             _infer_jit_shardings(model),
@@ -445,8 +453,8 @@ def train(
 
             accum_aux = add_aux(accum_aux, aux)
             global_aux = add_aux(global_aux, aux)
-            emit = mini_step == (config.optimizer.grad_accum - 1)
-            if emit:
+            # emit = mini_step == (config.optimizer.grad_accum - 1)
+            if True:
                 processed_aux = process_aux(accum_aux, "step")
                 cum_processed_aux = process_aux(global_aux, "cum")
                 if config.log.learning_rate:
@@ -470,22 +478,27 @@ def train(
                         step=ocp.args.JsonSave(int(step)),
                     ),
                 )
+                step+=1
 
-            mini_step = (mini_step + 1) % config.optimizer.grad_accum
-            step = emit * (step + 1) + (1 - emit) * step
+            # mini_step = (mini_step + 1) % config.optimizer.grad_accum
+            # step = emit * (step + 1) + (1 - emit) * step
     finally:
-        to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        if program_wall_t0 is not None:
+            to_log_later["program_time"] = time.monotonic() - program_wall_t0
         to_log_later["compile_time"] = first_compile_time
         final_cum = process_aux(global_aux, "cum")
         to_log_later.update(final_cum)
         token_count = to_log_later.get("cum/token_count")
         program_time = to_log_later.get("program_time")
-        to_log_later["systems/tok_s"] = token_count / program_time
+        if token_count is not None and program_time not in (None, 0):
+            to_log_later["systems/tok_s"] = token_count / program_time
 
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
-            print(f"program_time: {to_log_later['program_time']:.3f}s")
-            print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
+            if "program_time" in to_log_later:
+                print(f"program_time: {to_log_later['program_time']:.3f}s")
+            if "systems/tok_s" in to_log_later:
+                print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
         ckpt_manager.close()

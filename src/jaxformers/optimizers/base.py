@@ -9,7 +9,7 @@ from .log_grad_norm import log_grad_norm
 
 def make_opt_base_components( grad_accum: int):
     components = []
-    components.append(optax.apply_every(grad_accum))
-    components.append(divide_every(grad_accum))
+    # components.append(optax.apply_every(grad_accum))
+    # components.append(divide_every(grad_accum))
     components.append(log_grad_norm())
     return components

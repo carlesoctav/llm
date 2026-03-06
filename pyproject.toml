@@ -3,7 +3,7 @@ name = "minimal"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "datasets>=4.5.0",
     "einops>=0.8.2",
@@ -15,9 +15,11 @@ dependencies = [
     "quax>=0.2.1",
     "sws-config>=0.6.3",
     "tokamax>=0.0.10",
-    "tpu-info>=0.8.1",
+    "tpu-info>=0.7.1",
     "tqdm>=4.67.1",
-    "transformers>=5.0.0",
+    "transformers>=4.56.0,<5",
+    "tpu-inference",
+    "vllm",
     "wandb>=0.25.0",
 ]
 
@@ -40,8 +42,23 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[tool.uv]
+override-dependencies = [
+    "flax==0.12.4",
+    "jax[tpu]==0.8.3",
+    "jaxlib==0.8.3",
+    "libtpu==0.0.32",
+    "qwix==0.1.2",
+    "runai-model-streamer[s3,gcs]==0.15.4",
+    "torchvision==0.25.0",
+    "torchax==0.0.11",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+tpu-inference = { path = "../vllm-tpu/packages/tpu-inference", editable = true }
+vllm = { path = "../vllm-tpu/packages/vllm", editable = true }
 
 [dependency-groups]
 dev = [

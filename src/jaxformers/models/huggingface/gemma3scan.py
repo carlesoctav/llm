@@ -13,8 +13,8 @@ from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
 from transformers import (
     AutoTokenizer,
     Gemma3TextConfig,
-    PreTrainedConfig,
 )
+from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
 
 from jaxformers.distributed.parallel import ParallelDims
 from jaxformers.masking_utils import (
@@ -159,19 +159,24 @@ def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array
 
 def get_rope_theta(config: Config, attention_type: str) -> float:
     rope_parameters = getattr(config, "rope_parameters", None)
-    if not isinstance(rope_parameters, dict):
-        raise TypeError(
-            "Gemma-3 config must define `rope_parameters` as a dict with per-attention-type "
-            "settings (e.g. {'full_attention': {'rope_theta': ...}, ...})."
-        )
+    if isinstance(rope_parameters, dict):
+        attn_config = rope_parameters.get(attention_type)
+        if isinstance(attn_config, dict) and attn_config.get("rope_theta") is not None:
+            return float(attn_config["rope_theta"])
 
-    attn_config = rope_parameters.get(attention_type)
-    if not isinstance(attn_config, dict) or attn_config.get("rope_theta") is None:
-        raise KeyError(
-            f"Missing `rope_theta` for attention_type={attention_type!r} in `rope_parameters`. "
-            f"Available keys: {sorted(rope_parameters.keys())!r}"
-        )
-    return float(attn_config["rope_theta"])
+    if attention_type == "sliding_attention":
+        rope_local_base_freq = getattr(config, "rope_local_base_freq", None)
+        if rope_local_base_freq is not None:
+            return float(rope_local_base_freq)
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is not None:
+        return float(rope_theta)
+
+    raise KeyError(
+        "Gemma-3 config is missing RoPE settings. Expected either per-attention "
+        "`rope_parameters`, `rope_theta`, or `rope_local_base_freq`."
+    )
 
 def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
     attn_impl = config.additional_config["attn_implementation"]

@@ -1,3 +1,4 @@
+from jaxformers.optimizers.grad_accum import gradient_accumulation
 from typing import Callable
 
 import jax.tree_util as jtu
@@ -31,4 +32,4 @@ def make(
     )
 
     components.append(custom_scale_by_learning_rate(learning_rate))
-    return optax.chain(*components)
+    return gradient_accumulation(optax.chain(*components), grad_accum)

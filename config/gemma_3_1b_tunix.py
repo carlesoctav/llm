@@ -15,9 +15,9 @@ def get_config():
     config.random_init_lora = True
 
     config.exp_name = ""
-    config.project = ""
+    config.project_name = ""
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project}/{config.exp_name}"
+    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.train_seed = 42
     config.eval_every = None
     config.max_train_step = 10_000
@@ -102,7 +102,7 @@ def get_config():
     config.checkpoint_options.save_interval_steps = 2500
     config.checkpoint_options.max_to_keep = 1
 
-    config.logger.project = lambda: config.project
+    config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
 
     config.logger.resume = lambda: "allow" if config.resume else "never"

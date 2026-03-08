@@ -177,7 +177,6 @@ def _preparse_absl_flags() -> None:
 
 
 def load_model(config: sws.FinalConfig, name: str):
-    name = name.replace("_", ".")
     model_module = importlib.import_module(f"jaxformers.models.{name}")
     model = model_module.load(**config.model.to_dict())
     return model
@@ -267,24 +266,14 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    k = config.optimizer.grad_accum
-    c = model.opt_state[0].count
-    emit = c == (k - 1)
-
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
     token_count = aux["token_count"]
-
-    updates, nst = model.tx.update(
+    updates, new_state = model.tx.update(
         grad, model.opt_state, model.weights, count=token_count
     )
 
-    nst = (nst[0], nst[1]) + jtu.tree_map(
-        lambda nst, st: jnp.where(emit, nst, st), nst[2:], model.opt_state[2:]
-    )
-
-    nweights = tree_util.apply_updates(model.weights, updates)
-
-    return dataclasses.replace(model, weights=nweights, opt_state=nst), aux
+    new_weights = tree_util.apply_updates(model.weights, updates)
+    return dataclasses.replace(model, weights=new_weights, opt_state=new_state), aux
 
 
 def eval(model, eval_ds):

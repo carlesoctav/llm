@@ -23,7 +23,7 @@ def make_scan_fwd(fwd, num_hidden_layers):
         carry, _ = jax.lax.scan(
             fn,
             init = x,
-            xs = (scan_weights, scan_input_kwargs)
+            xs = (scan_weights, scan_input_kwargs),
         )
         return carry
     return scan_fwd

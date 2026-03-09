@@ -13,9 +13,9 @@ from safetensors import safe_open
 from transformers import (
     AutoConfig,
     AutoTokenizer,
-    PreTrainedConfig,
     PreTrainedTokenizerBase,
 )
+from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
 
 from jaxformers.modeling_utils import (
     AdditionalConfig,

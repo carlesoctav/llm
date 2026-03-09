@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxformers.inference import LLM
+from jaxformers.inference import JaxformersLLM
 from jaxformers.models import qwen3
 
 
@@ -130,7 +130,7 @@ def main() -> None:
         param_dtype=jnp.bfloat16,
     )
 
-    llm = LLM(
+    llm = JaxformersLLM(
         model,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,

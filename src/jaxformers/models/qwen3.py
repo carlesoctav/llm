@@ -21,9 +21,9 @@ from safetensors import safe_open
 from transformers import (
     AddedToken,
     AutoConfig,
-    PreTrainedConfig,
     PreTrainedTokenizerFast,
 )
+from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
 
 from jaxformers.distributed.parallel import ParallelDims
 from jaxformers.masking_utils import (

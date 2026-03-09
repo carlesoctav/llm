@@ -10,7 +10,8 @@ import optax
 from jax import P
 from jaxtyping import Bool, Float, PyTree
 from safetensors import safe_open
-from transformers import PreTrainedConfig, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
+from transformers.configuration_utils import PretrainedConfig as PreTrainedConfig
 
 from jaxformers.print_utils import tree_pformat
 

@@ -1,15 +1,7 @@
 import importlib
 
-import sws
-
-
-def load(config: sws.FinalConfig, logger_name: str):
+def make_logger(logger_name: str, logger_config: dict):
     logger_module = importlib.import_module(f"jaxformers.logger.{logger_name}")
-    make = getattr(logger_module, "make", None)
-    if not callable(make):
-        raise ValueError(f"logger module jaxformers.logger.{logger_name} must define make(config)")
-    logger = make(config)
-    finish = getattr(logger, "finish", None)
-    if not callable(finish):
-        raise ValueError(f"logger {logger_name!r} must implement finish()")
+    logger = logger_module.make(logger_config)
+    logger.finish
     return logger

@@ -7,28 +7,26 @@ from transformers import AutoTokenizer
 def get_config():
     config = sws.Config()
 
-    config.resume = False
-    config.random_init = False
     config.skip_eval = True
 
-    config.use_lora = True
-    config.random_init_lora = True
+    config.init_model = "pretrained"
+    config.init_lora = None
 
     config.exp_name = ""
-    config.project = ""
+    config.project_name = ""
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project}/{config.exp_name}"
+    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.train_seed = 42
     config.eval_every = None
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16
-    config.loss_implementation = "xla_chunked"
+    config.loss_implementation = "reference"
 
-    config.model_name = "huggingface_gemma3"
+    config.model_name = "huggingface.gemma3"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.model.model_id = "google/gemma-3-1b-it"
-    config.model.additional_config.remat_layer = True
-    config.model.additional_config.attn_implementation = "xla_chunked"
+    config.model.additional_config.remat_layer = False
+    config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
 
     config.model.devices = lambda: jax.devices()
@@ -75,7 +73,7 @@ def get_config():
     config.data.transforms.packing_bins = 64
 
     # total batch size is global_batch_size * config.optimizer.grad_accum
-    config.train_loader.global_batch_size = 16
+    config.train_loader.global_batch_size = 32
     config.train_loader.seed = 42
 
     # config.train_loader.pspec =
@@ -93,23 +91,28 @@ def get_config():
     # config.train_loader.worker_buffer_size = 100
     config.train_loader.drop_remainder = True
 
-
     config.log.grad_norm = True
     config.log.learning_rate = True
     config.logger_name = "wandb"
 
     # see orbax checkpointmanager options
+    config.use_checkpoint = False
     config.checkpoint_options.save_interval_steps = 2500
     config.checkpoint_options.max_to_keep = 1
 
-    config.logger.project = lambda: config.project
+    config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
-
-    config.logger.resume = lambda: "allow" if config.resume else "never"
 
     # config.logger.entity =
     # config.logger.dir =
     # config.logger.notes =
     # config.logger.tags =
+    #
+    #
+    config.callback = [
+        "log_grad_norm",
+        "log_learning_rate",
+        # ("log_performance", {"denom_keys": ["token", "batch"], "real_step_threshold": 0}),
+    ]
 
     return config

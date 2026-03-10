@@ -1,6 +1,9 @@
 """
 copied from quax.examples.lora
 """
+from enum import StrEnum, auto
+
+from jaxformers.models.huggingface.gemma3 import Initializer
 
 import fnmatch
 import time
@@ -15,11 +18,41 @@ import jax.lax as lax
 from jax import P
 import jax.numpy as jnp
 import jax.tree_util as jtu
+import numpy as np
 import quax
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.modeling_utils import Model
 from jaxformers.print_utils import tree_pformat
+
+
+default_init = jax.nn.initializers.he_normal(in_axis=-1, out_axis=-2)
+
+
+class InitLora(StrEnum):
+    RANDOM = auto()
+    PYTREE = auto()
+
+
+def make_lora(
+    model: Model,
+    init_lora: InitLora | str | None,
+    lora_config: dict,
+    *,
+    rngs: PRNGKeyArray | None = None,
+) -> Model:
+    if init_lora is None:
+        return model
+
+    if init_lora in (InitLora.RANDOM, "random"):
+        if rngs is None:
+            raise ValueError("random LoRA init requires an rng key")
+        return loraify(model, **lora_config, rngs=rngs)
+
+    if init_lora in (InitLora.PYTREE, "pytree"):
+        raise NotImplementedError("LoRA pytree initialization is not implemented yet.")
+
+    raise ValueError(f"Unsupported LoRA init method: {init_lora!r}")
 
 
 class LoraArray(quax.ArrayValue):
@@ -139,7 +172,7 @@ def loraify(
     weights_path: list[str],
     rank: int,
     alpha: float,
-    scale: float = 0.01,
+    # scale: float = 1,
     allow_materialise: bool = False,
     stop_gradient: bool = True,
     *,
@@ -149,45 +182,28 @@ def loraify(
     loraify_weight = []
     t0 = time.monotonic()
 
-    def _infer_lora_shardings(weight: ArrayLike):
-        """Infer sharding for LoRA A/B from the base weight sharding.
-
-        We shard only along the corresponding base-weight dimension and keep the
-        rank dimension replicated. This keeps LoRA params and optimizer state
-        sharded (avoids full replication), aligning with Tunix' resharded LoRA.
-        """
-
-        base_sharding = getattr(weight, "sharding", None)
-        if not isinstance(base_sharding, jax.sharding.NamedSharding):
-            return None, None
-
-        spec = tuple(base_sharding.spec)
-        if len(spec) != 2:
-            return None, None
-
-        s0, s1 = spec
-        mesh = base_sharding.mesh
-        a_sharding = jax.sharding.NamedSharding(
-            mesh, jax.sharding.PartitionSpec(s0, None)
-        )
-        b_sharding = jax.sharding.NamedSharding(
-            mesh, jax.sharding.PartitionSpec(None, s1)
-        )
-        return a_sharding, b_sharding
-
     def _loraify(path, weight):
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
             *B, X, Y = weight.shape
-            lora_key = jax.random.fold_in(rngs, counter)
-            counter += 1
-            dtype = getattr(weight, "dtype", jnp.float32)
-            a = jax.random.normal(lora_key, (*B, X, rank), dtype=dtype) * scale
-            b = jnp.zeros((*B, rank, Y), dtype=dtype)
             *s3, s0, s1 = tuple(weight.sharding.spec)
-            a = jax.device_put(a, P(*s3, s0, None))
-            b = jax.device_put(b, P(*s3, None, s1))
+            a_sharding = P(s0, None)
+            b_sharding = P(*s3, None, s1)
+            a_shape = (X, rank)
+            b_shape = (*B, rank, Y)
+
+            if len(B):
+                init_fn = jax.vmap(default_init, in_axes=(0, None, None, None))
+                lora_key = jax.random.split(jax.random.fold_in(rngs, counter), B)
+                counter += 1
+            else:
+                init_fn = default_init
+                lora_key = jax.random.fold_in(rngs, counter)
+                counter += 1
+
+            a = init_fn(lora_key, a_shape, weight.dtype, a_sharding)
+            b = jnp.zeros(b_shape, weight.dtype, out_sharding=b_sharding)
 
             lora_weight = LoraArray(
                 _w=weight,

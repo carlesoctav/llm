@@ -151,7 +151,7 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         )
 
 
-def load(load_kwargs: list[dict[str, Any]]):
+def make(load_kwargs: list[dict[str, Any]]):
     datasets = []
     for load_kwarg in load_kwargs:
         dataset = load_dataset(**load_kwarg)

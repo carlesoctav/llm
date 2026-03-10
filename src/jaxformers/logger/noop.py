@@ -17,6 +17,6 @@ class NoopLogger:
         return
 
 
-def make(config):
-    _ = config
+def make(logger_config):
+    _ = logger_config
     return NoopLogger()

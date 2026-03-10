@@ -28,6 +28,7 @@ def get_config():
     config.model.additional_config.remat_layer = False
     config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
+    config.model.additional_config.forward_impl = "loop"
 
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16

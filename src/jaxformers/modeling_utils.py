@@ -35,12 +35,14 @@ class AdditionalConfig(TypedDict):
 
     attn_implementation: str = "sdpa"
     sequence_parallelism: bool = True
+    forward_impl: str = "loop"
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
+    "forward_impl": "loop",
 }
 
 

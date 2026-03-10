@@ -1,6 +1,8 @@
 """
 copied from quax.examples.lora
 """
+from enum import StrEnum, auto
+
 from jaxformers.models.huggingface.gemma3 import Initializer
 
 import fnmatch
@@ -25,6 +27,32 @@ from jaxformers.print_utils import tree_pformat
 
 
 default_init = jax.nn.initializers.he_normal(in_axis=-1, out_axis=-2)
+
+
+class InitLora(StrEnum):
+    RANDOM = auto()
+    PYTREE = auto()
+
+
+def make_lora(
+    model: Model,
+    init_lora: InitLora | str | None,
+    lora_config: dict,
+    *,
+    rngs: PRNGKeyArray | None = None,
+) -> Model:
+    if init_lora is None:
+        return model
+
+    if init_lora in (InitLora.RANDOM, "random"):
+        if rngs is None:
+            raise ValueError("random LoRA init requires an rng key")
+        return loraify(model, **lora_config, rngs=rngs)
+
+    if init_lora in (InitLora.PYTREE, "pytree"):
+        raise NotImplementedError("LoRA pytree initialization is not implemented yet.")
+
+    raise ValueError(f"Unsupported LoRA init method: {init_lora!r}")
 
 
 class LoraArray(quax.ArrayValue):
@@ -383,7 +411,3 @@ def _(
     if out_sharding is not None:
         out = jax.sharding.reshard(out, out_sharding)
     return out
-
-
-def make_lora(model, lora_init, lora_config, rngs):
-    pass

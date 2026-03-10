@@ -10,7 +10,6 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from safetensors import safe_open
 from transformers import (
     AutoConfig,
     AutoTokenizer,

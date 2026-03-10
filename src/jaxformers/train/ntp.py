@@ -1,5 +1,4 @@
 import dataclasses
-import importlib
 import sys
 import time
 from functools import partial
@@ -17,23 +16,18 @@ from tqdm.auto import tqdm
 
 from jaxformers import tree_util
 from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops
-from jaxformers.callbacks.base import callback_chain
-from jaxformers.data.next_token_prediction import transforms as ntp_transforms
-from jaxformers.data.training import make_dataloader
-from jaxformers.dispatch.lora import loraify
-from jaxformers.logger import load as load_logger
+from jaxformers.callbacks import make_callbacks
+from jaxformers.data import make_dataset
+from jaxformers.dispatch.lora import make_lora
+from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
-from jaxformers.optimizer_utils import (
-    find_grad_norm,
-    find_learning_rate,
-    mask_trainable_lora,
-)
+from jaxformers.optimizers import make_optimizer, make_scheduler
 
 
-DEFAULT_REDUCED = {"loss": "mean", "token": "sum"}
-DEFAULT_AUX = {"loss": (0, 0), "token": 0}
+DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
+DEFAULT_AUX = {"loss": (0, 0), "token": 0, "batch": 0}
 
 
 def _preparse_absl_flags() -> None:
@@ -64,45 +58,7 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
-    optmizer_module = importlib.import_module(f"jaxformers.optimizers.{opt_name}")
-    train_mask = None
-    if getattr(model, "is_lora", False):
-        train_mask = mask_trainable_lora(model.weights)
-
-    train_weights, _ = tree_util.partition(model.weights, train_mask)
-    optimizer_kwargs = config.optimizer.to_dict()
-    tx = optmizer_module.make(scheduler, **optimizer_kwargs)
-    opt_state = tx.init(train_weights)
-    return dataclasses.replace(model, opt_state=opt_state, tx=tx, train_mask=train_mask)
-
-
-def load_scheduler(config: sws.FinalConfig, sched_name):
-    if sched_name is None:
-        return config.learning_rate
-    raise NotImplementedError
-
-
-def load_dataset(config: sws.FinalConfig, data_name: str):
-    dataset_module = importlib.import_module(f"jaxformers.data.{data_name}")
-
-    train_dataset = dataset_module.load(config.data.load_kwargs)
-    transforms = ntp_transforms(**config.data.transforms.to_dict())
-    train_ds = make_dataloader(
-        train_dataset, transforms, **config.train_loader.to_dict()
-    )
-
-    eval_ds = None
-    if not config.skip_eval:
-        eval_dataset = dataset_module.load(config.data.eval_data)
-        eval_ds = make_dataloader(
-            eval_dataset, transforms, **config.eval_loader.to_dict()
-        )
-
-    return train_ds, eval_ds
-
-
-def train_step(config: sws.FinalConfig, model: Model, batch, callback_state, rngs):
+def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
@@ -143,7 +99,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, callback_state, rng
             implementation=config.loss_implementation or None,
         )
 
-        aux = {"loss": (loss, count), "token": count}
+        batch_size = batch["labels"].shape[0]
+        aux = {"loss": (loss, count), "token": count, "batch": batch_size}
 
         return loss, aux
 
@@ -159,7 +116,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, callback_state, rng
             microbatch_size=microbatch_size,
         )
     else:
-        grad_fn = jax.vlaue_and_grad(loss_fn, has_aux=True)
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
 
@@ -171,9 +128,15 @@ def train_step(config: sws.FinalConfig, model: Model, batch, callback_state, rng
         grad, model.opt_state, model.weights, count=token_count
     )
     nweights = tree_util.apply_updates(model.weights, updates)
+    callback_state = model.callback_state
     if model.callback_state is not None:
-        callback_state = model.callback_updates(
-            model.callback_state, grad, updates, model.opt_state, model.weights
+        callback_state = model.callbacks.update(
+            model.callback_state,
+            grad,
+            updates,
+            nst,
+            nweights,
+            aux,
         )
 
     return dataclasses.replace(
@@ -237,7 +200,8 @@ def train(
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
-    need_save = config.checkpoints.save_interval_steps > 0
+    need_save = config.checkpoint_options.save_interval_steps > 0
+    ckpt_manager = None
 
     if need_save:
         ckpt_options = ocp.CheckpointManagerOptions(
@@ -252,7 +216,7 @@ def train(
 
     pbar = None
     if jax.process_index() == 0:
-        total = getattr(config, "max_train_step", None)
+        total = config.max_train_step
         pbar = tqdm(
             total=total,
             initial=int(step),
@@ -263,7 +227,7 @@ def train(
 
     try:
         while step < config.max_train_step:
-            if not skip_eval and (step % config.eval_every_n_steps) == 0:
+            if not skip_eval and (step % config.eval_every) == 0:
                 eval_aux = eval(model, eval_ds)
                 processed_aux = process_aux(eval_aux)
 
@@ -316,10 +280,14 @@ def train(
                 ):
                     model, aux = train_step_fn(model, batch, loop_rngs)
 
-            callback_output, callback_state = model.callback_process(
-                model.callback_state, aux
-            )
-            dataclasses.replace(model, callback_state=callback_state)
+            callback_output = {}
+            if model.callback_state is not None:
+                callback_output, callback_state = model.callbacks.process(
+                    {},
+                    model.callback_state,
+                    aux,
+                )
+                model = dataclasses.replace(model, callback_state=callback_state)
             global_aux = add_aux(global_aux, aux)
             processed_aux = process_aux(aux, "step")
             cum_processed_aux = process_aux(global_aux, "cum")
@@ -369,60 +337,46 @@ def train(
     return model, to_log_later
 
 
-def create_logger(config: sws.FinalConfig):
-    if jax.process_index() != 0:
-        return load_logger(config, "noop")
-    logger_name = getattr(config, "logger_name", "noop")
-    return load_logger(config, logger_name)
-
-
-def load_callback(config: sws.FinalConfig):
-    callbacks = []
-    for callback in config.callback:
-        if isinstance(callback, str):
-            callback_lib = importlib.import_module(f"jaxformers.callbacks.{callback}")
-            callbacks.append(callback_lib.make())
-        elif isinstance(callback, tuple):
-            callback_lib = importlib.import_module(
-                f"jaxformers.callbacks.{callback[0]}"
-            )
-            callbacks.append(callback_lib.make(**callback[1]))
-        else:
-            raise ValueError(
-                f"Invalid callback specification: {callback!r}. "
-                "Expected either a string callback name (e.g. 'my_callback') "
-                "or a tuple of the form (callback_name, kwargs_dict)."
-            )
-    return callback_chain(*callbacks)
-
-
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    logger = create_logger(config)
+
+    logger = None
+    if jax.process_index() == 0:
+        logger = make_logger(config.logger_name, config.logger.to_dict())
+        logger.config.update(config.to_dict())
     try:
         rngs = jax.random.key(config.train_seed) if config.train_seed else None
-        if not config.random_init and not config.resume:
-            model = make_model(config.model_name, config.init_model, config.model_config.to_dict())
-            print("DEBUGPRINT {model}:", model)
-            scheduler = load_scheduler(config, config.lr_scheduler_name)
-            if config.use_lora:
-                if config.random_init_lora:
-                    rngs, lora_rngs = jax.random.split(rngs, 2)
-                    model = loraify(model, **config.lora.to_dict(), rngs=lora_rngs)
-                else:
-                    raise NotImplementedError
-            t0 = time.monotonic()
-            model = load_optimizer(config, model, config.optimizer_name, scheduler)
-            diff = time.monotonic() - t0
-            print(f"Created optimizer and its state in {diff:.2f} seconds.")
-        else:
-            raise NotImplementedError
+        model = make_model(config.model_name, config.init_model, config.model.to_dict())
+        scheduler = make_scheduler(config.lr_scheduler_name, config.learning_rate)
+        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=rngs)
+        t0 = time.monotonic()
+        model = make_optimizer(
+            config.optimizer_name,
+            model,
+            scheduler,
+            config.optimizer.to_dict(),
+        )
+        diff = time.monotonic() - t0
+        print(f"Created optimizer and its state in {diff:.2f} seconds.")
+        callbacks = make_callbacks(config.callback)
+        if callbacks is not None:
+            model = dataclasses.replace(
+                model,
+                callback_state=callbacks.init(model.weights, model.opt_state),
+                callbacks=callbacks,
+            )
 
-        train_ds, eval_ds = load_dataset(config, config.data_name)
+        train_ds = make_dataset(
+            config.data_name,
+            config.data.load_kwargs,
+            config.data.transforms.to_dict(),
+            config.train_loader.to_dict(),
+        )
+        eval_ds = None
         _, metrics = train(config, model, train_ds, eval_ds, logger, rngs)
         return metrics
     finally:
-        if jax.process_index() == 0:
+        if logger is not None:
             logger.finish()
 
 

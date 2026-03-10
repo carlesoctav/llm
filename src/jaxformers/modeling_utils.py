@@ -50,7 +50,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "weights",
         "opt_state",
         "step",
-        "callback_state"
+        "callback_state",
     ],
     meta_fields=[
         "name",
@@ -63,8 +63,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "embed",
         "unembed",
         "lm_head_key",
-        "callback_updates",
-        "callback_process",
+        "callbacks",
     ],
 )
 @dataclass
@@ -83,8 +82,7 @@ class Model:
     step: int | None = None
 
     callback_state: PyTree | None = None
-    callback_updates: Callable | None = None
-    callback_process: Callable | None = None
+    callbacks: Any | None = None
 
     train_mask: PyTree[Bool] | None = None
     is_lora: bool = False

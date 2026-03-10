@@ -1,5 +1,6 @@
 import dataclasses
 import importlib
+import inspect
 import sys
 import time
 from functools import partial
@@ -21,6 +22,7 @@ from jaxformers.data.training import make_dataloader
 from jaxformers.dispatch.lora import loraify
 from jaxformers.logger import load as load_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
+from jaxformers.module_utils import flatten_param_tree
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizer_utils import (
     find_grad_norm,
@@ -221,12 +223,23 @@ def load_dataset(config: sws.FinalConfig, data_name: str):
 
 
 def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
+    supports_hidden_states = "return_hidden_states" in inspect.signature(
+        model.forward
+    ).parameters
+
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
 
+        forward_kwargs = dict(batch["inputs"])
+        forward_kwargs["rngs"] = rngs
+        forward_kwargs["dtype"] = forward_dtype
+        if supports_hidden_states:
+            forward_kwargs["return_hidden_states"] = True
+
         hidden_states = model.forward(
-            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
+            weights,
+            **forward_kwargs,
         )
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -250,11 +263,11 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
                 # vocab weights; avoid forcing replication for the reference
                 # implementation to match Tunix's fsdp-sharded embed/lm_head.
                 jax.reshard(
-                    weights[model.lm_head_key],
+                    flatten_param_tree(weights)[model.lm_head_key],
                     logical_to_physical(("none", "none"), model.config.sharding_rules),
                 )
                 if (config.loss_implementation or None) != "reference"
-                else weights[model.lm_head_key]
+                else flatten_param_tree(weights)[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
@@ -349,8 +362,8 @@ def train(
     ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
     ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
     to_log_later = {}
-    program_wall_t0 = None
-    first_compile_time = None
+    program_wall_t0 = time.monotonic()
+    first_compile_time = 0.0
     warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
@@ -398,7 +411,6 @@ def train(
                     )
                     first_compile_time = time.monotonic() - start_time
 
-                    program_wall_t0 = time.monotonic()
                     if jax.process_index() == 0:
                         print("compile time: ", first_compile_time)
                         compiled_analysis = train_step_fn.memory_analysis()
@@ -452,7 +464,7 @@ def train(
         to_log_later["compile_time"] = first_compile_time
         final_cum = process_aux(global_aux, "cum")
         to_log_later.update(final_cum)
-        token_count = to_log_later.get("cum/token_count")
+        token_count = to_log_later.get("cum/token_count", 0.0)
         program_time = to_log_later.get("program_time")
         to_log_later["systems/tok_s"] = token_count / program_time
 

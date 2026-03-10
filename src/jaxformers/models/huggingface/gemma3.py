@@ -274,9 +274,16 @@ def forward_layer(
 
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
+    q = reshard(q, q_sharding)
+    attention_mask = inputs["attention_mask"]
+    if attention_mask is not None:
+        attention_mask = reshard(
+            attention_mask,
+            logical_to_physical(("batch", "none", "context", "none"), rules),
+        )
 
     attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
+        q, k, v, mask=attention_mask, q_sharding=q_sharding
     )
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
@@ -678,7 +685,20 @@ def load(
         sequence_parallelism=additional_config["sequence_parallelism"],
     )
 
-    model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
+    model_path = Path(model_id)
+    if model_path.exists():
+        model_ckpt_dir = model_path
+    else:
+        try:
+            model_ckpt_dir = Path(
+                snapshot_download(
+                    repo_id=model_id,
+                    local_dir=local_dir,
+                    local_files_only=True,
+                )
+            )
+        except Exception:
+            model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
     config = AutoConfig.from_pretrained(model_ckpt_dir)
     if not isinstance(config, PreTrainedConfig):

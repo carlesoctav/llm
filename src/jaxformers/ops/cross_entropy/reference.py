@@ -2,7 +2,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import optax
 from jaxtyping import Array, Float, Int
 
 from jaxformers.dispatch import einsum
@@ -32,7 +31,11 @@ def cross_entropy_reference(
     if logit_soft_cap is not None:
         logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
     lse = jax.nn.logsumexp(logits, axis=-1)
+    label_logits = jnp.sum(
+        jax.nn.one_hot(labels, logits.shape[-1], dtype=logits.dtype) * logits,
+        axis=-1,
+    )
+    loss = lse - label_logits
 
     return loss, lse

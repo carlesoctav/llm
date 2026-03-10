@@ -272,6 +272,12 @@ def forward_layer(
 
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
+    q = reshard(q, q_sharding)
+    if attention_mask is not None:
+        attention_mask = reshard(
+            attention_mask,
+            logical_to_physical(("batch", "none", "context", "none"), rules),
+        )
 
     attn_output = attention_interface(
         q, k, v, mask=attention_mask, q_sharding=q_sharding

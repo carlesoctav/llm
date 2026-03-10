@@ -229,13 +229,7 @@ def forward_layer(
     x_norm = gemma_rms_norm(x, w["input_layernorm.weight"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
-    q_sharding = jax.NamedSharding(
-        jax.sharding.get_abstract_mesh(),
-        logical_to_physical(
-            ("batch", "context", "model", "none"), config.sharding_rules
-        ),
-    )
-
+    q_sharding = jax.typeof(x_norm).sharding
     attn_impl = config.additional_config["attn_implementation"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
 
@@ -364,6 +358,7 @@ def forward(
         x,
         **inputs,
     )
+
     input_kwargs = {
         "attention_mask": mask_mapping,
         "rope_theta": jnp.asarray([get_rope_theta(config, attention_type) for attention_type in config.layer_types]),

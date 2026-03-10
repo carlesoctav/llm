@@ -3,7 +3,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
-
+from optax import MultiSteps
 
 class DivideByState(NamedTuple):
     count: jax.Array

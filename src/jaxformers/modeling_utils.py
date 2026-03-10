@@ -1,10 +1,10 @@
-import jax.numpy as jnp
 import re
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
 import jax
+import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 from jax import P
@@ -31,23 +31,14 @@ def logical_to_physical(logical, rules):
 
 
 class AdditionalConfig(TypedDict):
-    # training
-    gradient_checkpointing: bool = True
-
-    # Rematerialization / checkpointing
     remat_layer: bool
-    remat_attention: bool
 
-    # training and inference
     attn_implementation: str = "sdpa"
     sequence_parallelism: bool = True
-    loss_parallel: True
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
-    "gradient_checkpointing": True,
     "remat_layer": False,
-    "remat_attention": False,
     "attn_implementation": "sdpa",
     "sequence_parallelism": True,
 }
@@ -55,7 +46,12 @@ DEFAULT_ADDITIONAL_CONFIG = {
 
 @partial(
     jtu.register_dataclass,
-    data_fields=["weights", "opt_state", "step"],
+    data_fields=[
+        "weights",
+        "opt_state",
+        "step",
+        "callback_state"
+    ],
     meta_fields=[
         "name",
         "tokenizer",
@@ -67,6 +63,8 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "embed",
         "unembed",
         "lm_head_key",
+        "callback_updates",
+        "callback_process",
     ],
 )
 @dataclass
@@ -84,11 +82,16 @@ class Model:
     tx: optax.GradientTransformation | None = None
     step: int | None = None
 
+    callback_state: PyTree | None = None
+    callback_updates: Callable | None = None
+    callback_process: Callable | None = None
+
     train_mask: PyTree[Bool] | None = None
     is_lora: bool = False
 
     def __repr__(self):
         return self.name + "\n" + tree_pformat(self.weights)
+
 
 def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):
     weights = {}
@@ -101,8 +104,11 @@ def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):
                 )
     return weights
 
-def load_weights_vectorize(prefix, layer_size, model_ckpt_dir, param_dtype, sharding_rules, get_sharding):
-    pattern = re.compile(fr"{re.escape(prefix)}(\d+)\.(.*)")
+
+def load_weights_vectorize(
+    prefix, layer_size, model_ckpt_dir, param_dtype, sharding_rules, get_sharding
+):
+    pattern = re.compile(rf"{re.escape(prefix)}(\d+)\.(.*)")
     weights = {}
     for file in model_ckpt_dir.glob("*.safetensors"):
         with safe_open(file, framework="numpy") as f:
@@ -111,10 +117,18 @@ def load_weights_vectorize(prefix, layer_size, model_ckpt_dir, param_dtype, shar
                 if match:
                     idx = int(match.group(1))
                     rg_key = match.group(2)
-                    weights[rg_key] = weights.get(rg_key, [None for _ in range (layer_size)])
-                    weights[rg_key][idx] = jax.device_put(f.get_tensor(key).astype(param_dtype), get_sharding(key, sharding_rules))
+                    weights[rg_key] = weights.get(
+                        rg_key, [None for _ in range(layer_size)]
+                    )
+                    weights[rg_key][idx] = jax.device_put(
+                        f.get_tensor(key).astype(param_dtype),
+                        get_sharding(key, sharding_rules),
+                    )
                 else:
-                    weights[key] = jax.device_put(f.get_tensor(key).astype(param_dtype), get_sharding(key, sharding_rules))
+                    weights[key] = jax.device_put(
+                        f.get_tensor(key).astype(param_dtype),
+                        get_sharding(key, sharding_rules),
+                    )
     for k, v in weights.items():
         if isinstance(v, list):
             weights[k] = jnp.stack(v)

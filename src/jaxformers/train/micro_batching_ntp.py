@@ -13,7 +13,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 import sws
 from jax.experimental.rnn import PRNGKeyArray
-from optax.microbatching import microbatch
+from optax import microbatch
 from tqdm.auto import tqdm
 
 from jaxformers import tree_util
@@ -202,7 +202,6 @@ def load_optimizer(config: sws.FinalConfig, model, opt_name, scheduler):
 
     train_weights, _ = tree_util.partition(model.weights, train_mask)
     optimizer_kwargs = config.optimizer.to_dict()
-    optimizer_kwargs["grad_accum"] = 1
     tx = optmizer_module.make(scheduler, **optimizer_kwargs)
     opt_state = tx.init(train_weights)
     return dataclasses.replace(model, opt_state=opt_state, tx=tx, train_mask=train_mask)
@@ -287,10 +286,12 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
             "`config.train_loader.global_batch_size` must be divisible by "
             "`config.optimizer.grad_accum`."
         )
+
+    microbatch_size = config.train_loader.global_batch_size // microbatch_count
     grad_fn = microbatch(
-        jax.jit(jax.value_and_grad(loss_fn, has_aux=True)),
+        jax.value_and_grad(loss_fn, has_aux=True),
         argnums=2,
-        microbatch_size=config.train_loader.global_batch_size // microbatch_count,
+        microbatch_size=microbatch_size,
     )
 
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
@@ -365,8 +366,8 @@ def train(
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
 
-    ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
-    ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
+    # ckpt_options = ocp.CheckpointManagerOptions(**config.checkpoint_options.to_dict())
+    # ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
     to_log_later = {}
     program_wall_t0 = None
     first_compile_time = None
@@ -413,21 +414,12 @@ def train(
                     train_step_jit = jax.jit(
                         partial(train_step, config),
                         donate_argnums=(0,),
-                        in_shardings=(
-                            _infer_jit_shardings(model),
-                            _infer_jit_shardings(batch),
-                            None,
-                        ),
-                        out_shardings=(
-                            _infer_jit_shardings(model),
-                            None,
-                        ),
                     )
                     lower = train_step_jit.lower(model, batch, loop_rngs)
-                    hlo_name = f"mnt/carles/hlo/{config.project}/{config.exp_name}"
-                    os.makedirs(os.path.dirname(hlo_name), exist_ok=True)
-                    with open(hlo_name, "w") as f:
-                        f.write(lower.as_text())
+                    # hlo_name = f"mnt/carles/hlo/{config.project_name}/{config.exp_name}"
+                    # os.makedirs(os.path.dirname(hlo_name), exist_ok=True)
+                    # with open(hlo_name, "w") as f:
+                    #     f.write(lower.as_text())
                     train_step_fn = lower.compile()
                     first_compile_time = time.monotonic() - start_time
 
@@ -470,15 +462,15 @@ def train(
                         )
                         pbar.update(1)
                 accum_aux = dict(DEFAULT_AUX)
-                ckpt_manager.save(
-                    step,
-                    args=ocp.args.Composite(
-                        weights=ocp.args.StandardSave(model.weights),
-                        opt_state=ocp.args.StandardSave(model.opt_state),
-                        step=ocp.args.JsonSave(int(step)),
-                    ),
-                )
-                step+=1
+                # ckpt_manager.save(
+                #     step,
+                #     args=ocp.args.Composite(
+                #         weights=ocp.args.StandardSave(model.weights),
+                #         opt_state=ocp.args.StandardSave(model.opt_state),
+                #         step=ocp.args.JsonSave(int(step)),
+                #     ),
+                # )
+                step += 1
 
             # mini_step = (mini_step + 1) % config.optimizer.grad_accum
             # step = emit * (step + 1) + (1 - emit) * step
@@ -501,7 +493,7 @@ def train(
                 print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
-        ckpt_manager.close()
+        # ckpt_manager.close()
 
     return model, to_log_later
 

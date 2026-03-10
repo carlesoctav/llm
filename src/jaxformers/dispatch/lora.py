@@ -383,3 +383,7 @@ def _(
     if out_sharding is not None:
         out = jax.sharding.reshard(out, out_sharding)
     return out
+
+
+def make_lora(model, lora_init, lora_config, rngs):
+    pass

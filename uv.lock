@@ -1450,7 +1450,7 @@ requires-dist = [
     { name = "grain", specifier = ">=0.2.15" },
     { name = "jax", extras = ["tpu"], specifier = "==0.9.0" },
     { name = "jaxtyping", specifier = ">=0.3.5" },
-    { name = "optax", specifier = ">=0.2.6" },
+    { name = "optax", git = "https://github.com/google-deepmind/optax" },
     { name = "orbax", specifier = ">=0.1.9" },
     { name = "orbax-checkpoint", specifier = ">=0.11.32" },
     { name = "quax", specifier = ">=0.2.1" },
@@ -1838,17 +1838,13 @@ wheels = [
 
 [[package]]
 name = "optax"
-version = "0.2.7"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.8.dev0"
+source = { git = "https://github.com/google-deepmind/optax#9ff59614f123a6631a0cc04bbd8fd7e75837ac23" }
 dependencies = [
     { name = "absl-py" },
     { name = "jax" },
     { name = "jaxlib" },
     { name = "numpy" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/de/f7/a63fc3d262d7a58d7d53050dea1408a63738739569af34f8f754cf181ab1/optax-0.2.7.tar.gz", hash = "sha256:8b6b2e5bd62bcc6c11f6172a1aff0d86da0eaeecbd5465b2b366b5d3d64f6efc", size = 297524, upload-time = "2026-02-05T20:49:28.749Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/1e/94ad43e06887244b4d25f58b689122270ba3c129d3448052958eecf7518a/optax-0.2.7-py3-none-any.whl", hash = "sha256:241f2dfa104eab4fec2e16e7919f88df24a3da1481f95e264b3db396b30d4ff6", size = 399395, upload-time = "2026-02-05T20:49:26.883Z" },
 ]
 
 [[package]]

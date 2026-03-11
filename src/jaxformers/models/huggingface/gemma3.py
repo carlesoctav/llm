@@ -206,6 +206,9 @@ def prepare_weights(
     if forward_impl is ForwardImpl.LOOP:
         return weights
 
+    if not any(LAYER_PATTERN.fullmatch(key) for key in weights):
+        return weights
+
     num_hidden_layers = int(getattr(config, "num_hidden_layers"))
     other_weights, layer_weights = split_layer_weights(weights, num_hidden_layers)
     prepared_weights = dict(other_weights)

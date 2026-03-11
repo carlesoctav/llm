@@ -6,6 +6,7 @@ import numpy as np
 from transformers import Gemma3TextConfig
 
 from jaxformers.dispatch.lora import make_lora
+from jaxformers.models import prepare_weights as prepare_model_weights
 from jaxformers.models.huggingface import gemma3
 
 
@@ -102,6 +103,7 @@ def test_scan_block_forward_handles_unstacked_lora_weights():
         },
         rngs=jax.random.key(1),
     )
+    lora_model = prepare_model_weights("huggingface.gemma3", lora_model)
 
     input_ids = (jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % config.vocab_size)
     attention_mask = jnp.ones_like(input_ids)

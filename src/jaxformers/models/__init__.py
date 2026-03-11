@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 from enum import StrEnum, auto
 
@@ -26,3 +27,15 @@ def make_model(
     else:
         raise ValueError(f"Unsupported model init method: {init_method!r}")
     return model
+
+
+def prepare_weights(model_name: str, model):
+    model_module = importlib.import_module(f"jaxformers.models.{model_name}")
+    prepare_fn = getattr(model_module, "prepare_weights", None)
+    if prepare_fn is None:
+        return model
+
+    weights = prepare_fn(model.config, model.weights)
+    if weights is model.weights:
+        return model
+    return dataclasses.replace(model, weights=weights)

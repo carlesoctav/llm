@@ -21,7 +21,7 @@ from jaxformers.data import make_dataset
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
-from jaxformers.models import make_model
+from jaxformers.models import make_model, prepare_weights as prepare_model_weights
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer, make_scheduler
 from jaxformers.sws_utils import run as sws_run
@@ -107,10 +107,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
 
-    if config.optimizer.grad_accum > 1:
-        microbatch_size = (
-            config.train_loader.global_batch_size // config.optimizer.grad_accum
-        )
+    if config.grad_accum > 1:
+        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
         grad_fn = microbatch(
             jax.value_and_grad(loss_fn, has_aux=True),
             argnums=2,
@@ -350,6 +348,7 @@ def main(config: sws.FinalConfig):
         model = make_model(config.model_name, config.init_model, config.model.to_dict())
         scheduler = make_scheduler(config.lr_scheduler_name, config.learning_rate)
         model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=rngs)
+        model = prepare_model_weights(config.model_name, model)
         t0 = time.monotonic()
         model = make_optimizer(
             config.optimizer_name,

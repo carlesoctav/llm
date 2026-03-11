@@ -1,8 +1,11 @@
 import fnmatch
+import math
+import re
 from collections import defaultdict
+from enum import StrEnum, auto
 from functools import partial
 from pathlib import Path
-from typing import Callable, TypeAlias, TypeVar
+from typing import Callable, Sequence, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +32,7 @@ from jaxformers.modeling_utils import (
     logical_to_physical,
     Model,
 )
+from jaxformers.scan_utils import make_scan_fwd
 
 from ...attention_utils import ATTENTION_INTERFACE
 from ...dispatch.einsum import einsum
@@ -45,6 +49,21 @@ from ...distributed import (
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 AxisName = str | tuple[str, ...] | None
+Config: TypeAlias = PreTrainedConfig
+Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], jax.Array]
+LAYER_PREFIX = "model.layers."
+LAYER_PATTERN = re.compile(rf"{re.escape(LAYER_PREFIX)}(\d+)\.(.*)")
+NON_LAYER_WEIGHT_KEYS = {
+    "model.embed_tokens.weight",
+    "model.norm.weight",
+    "lm_head.weight",
+}
+
+
+class ForwardImpl(StrEnum):
+    LOOP = auto()
+    SCAN_LAYER = auto()
+    SCAN_BLOCK = auto()
 
 
 SHARDING_RULES = {
@@ -79,10 +98,209 @@ def get_sharding(key, sharding_rules):
     return P()
 
 
-Config: TypeAlias = PreTrainedConfig
-Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], jax.Array]
+def get_forward_impl(config: Config | PreTrainedConfig) -> ForwardImpl:
+    return ForwardImpl(config.additional_config.get("forward_impl", ForwardImpl.LOOP))
 
 
+def get_layer_types(config: Config) -> list[str]:
+    layer_types = list(getattr(config, "layer_types", ()))
+    if not layer_types:
+        raise ValueError("Gemma-3 config must define `layer_types`.")
+
+    num_hidden_layers = int(getattr(config, "num_hidden_layers"))
+    if len(layer_types) >= num_hidden_layers:
+        return layer_types[:num_hidden_layers]
+
+    return [layer_types[idx % len(layer_types)] for idx in range(num_hidden_layers)]
+
+
+def get_layer_block_size(layer_types: Sequence[str]) -> int:
+    for block_size in range(1, len(layer_types) + 1):
+        if all(layer_types[idx] == layer_types[idx % block_size] for idx in range(len(layer_types))):
+            return block_size
+    return len(layer_types)
+
+
+def split_layer_weights(
+    weights: dict[str, Array],
+    num_hidden_layers: int,
+) -> tuple[dict[str, Array], dict[str, list[Array]]]:
+    other_weights = {}
+    layer_weights = defaultdict(lambda: [None] * num_hidden_layers)
+
+    for key, value in weights.items():
+        match = LAYER_PATTERN.fullmatch(key)
+        if match is None:
+            other_weights[key] = value
+            continue
+
+        layer_idx = int(match.group(1))
+        inner_key = match.group(2)
+        layer_weights[inner_key][layer_idx] = value
+
+    for inner_key, values in layer_weights.items():
+        missing = [idx for idx, value in enumerate(values) if value is None]
+        if missing:
+            raise KeyError(
+                f"Missing layer weights for {inner_key!r} at indices {missing!r}."
+            )
+
+    return other_weights, dict(layer_weights)
+
+
+def _with_prefix_sharding(sample: Array, value: Array) -> Array:
+    try:
+        sharding = sample.sharding
+    except AttributeError:
+        sharding = jax.typeof(sample).sharding
+    if isinstance(sharding, jax.sharding.NamedSharding):
+        prefix_ndim = value.ndim - sample.ndim
+        return jax.device_put(
+            value,
+            jax.sharding.NamedSharding(
+                sharding.mesh,
+                P(*((None,) * prefix_ndim), *sharding.spec),
+            ),
+        )
+    return value
+
+
+def zero_like_layer_value(value):
+    from jaxformers.dispatch.lora import LoraArray
+
+    if isinstance(value, LoraArray):
+        return LoraArray(
+            _w=jnp.zeros_like(value._w),
+            a=jnp.zeros_like(value.a),
+            b=jnp.zeros_like(value.b),
+            alpha=value.alpha,
+            allow_materialise=value.allow_materialise,
+        )
+    return jnp.zeros_like(value)
+
+
+def stack_layer_values(values, leading_shape: tuple[int, ...]):
+    from jaxformers.dispatch.lora import LoraArray
+
+    sample = values[0]
+    if isinstance(sample, LoraArray):
+        return LoraArray(
+            _w=stack_layer_values([value._w for value in values], leading_shape),
+            a=stack_layer_values([value.a for value in values], leading_shape),
+            b=stack_layer_values([value.b for value in values], leading_shape),
+            alpha=sample.alpha,
+            allow_materialise=sample.allow_materialise,
+        )
+
+    stacked = jnp.stack(values)
+    stacked = stacked.reshape(*leading_shape, *sample.shape)
+    return _with_prefix_sharding(sample, stacked)
+
+
+def prepare_weights(
+    config: Config,
+    weights: dict[str, Array],
+    forward_impl: ForwardImpl | str | None = None,
+) -> dict[str, Array]:
+    forward_impl = ForwardImpl(forward_impl or get_forward_impl(config))
+    if forward_impl is ForwardImpl.LOOP:
+        return weights
+
+    if not any(LAYER_PATTERN.fullmatch(key) for key in weights):
+        return weights
+
+    num_hidden_layers = int(getattr(config, "num_hidden_layers"))
+    other_weights, layer_weights = split_layer_weights(weights, num_hidden_layers)
+    prepared_weights = dict(other_weights)
+
+    if forward_impl is ForwardImpl.SCAN_LAYER:
+        for inner_key, values in layer_weights.items():
+            prepared_weights[inner_key] = stack_layer_values(
+                values, (num_hidden_layers,)
+            )
+        return prepared_weights
+
+    layer_types = get_layer_types(config)
+    block_size = get_layer_block_size(layer_types)
+    num_blocks = math.ceil(num_hidden_layers / block_size)
+    padded_layers = num_blocks * block_size
+
+    for inner_key, values in layer_weights.items():
+        if padded_layers > num_hidden_layers:
+            values = values + [
+                zero_like_layer_value(values[0])
+                for _ in range(padded_layers - num_hidden_layers)
+            ]
+        prepared_weights[inner_key] = stack_layer_values(
+            values,
+            (num_blocks, block_size),
+        )
+
+    return prepared_weights
+
+
+def get_loop_layer_weights(
+    weights: dict[str, Array],
+    layer_idx: int,
+) -> dict[str, Array]:
+    prefix = f"{LAYER_PREFIX}{layer_idx}."
+    return {
+        key.removeprefix(prefix): value
+        for key, value in weights.items()
+        if key.startswith(prefix)
+    }
+
+
+def get_scannable_layer_weights(weights: dict[str, Array]) -> dict[str, Array]:
+    return {
+        key: value
+        for key, value in weights.items()
+        if key not in NON_LAYER_WEIGHT_KEYS
+    }
+
+
+def get_layer_metadata(config: Config) -> tuple[jax.Array, jax.Array, jax.Array]:
+    layer_types = get_layer_types(config)
+    layer_idx = jnp.arange(len(layer_types), dtype=jnp.int32)
+    rope_theta = jnp.asarray(
+        [get_rope_theta(config, attention_type) for attention_type in layer_types],
+        dtype=jnp.float32,
+    )
+    is_sliding = jnp.asarray(
+        [attention_type == "sliding_attention" for attention_type in layer_types],
+        dtype=jnp.bool_,
+    )
+    return layer_idx, rope_theta, is_sliding
+
+
+def get_block_metadata(
+    config: Config,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    layer_idx, rope_theta, is_sliding = get_layer_metadata(config)
+    block_size = get_layer_block_size(get_layer_types(config))
+    num_hidden_layers = int(getattr(config, "num_hidden_layers"))
+    num_blocks = math.ceil(num_hidden_layers / block_size)
+    padded_layers = num_blocks * block_size
+    pad_size = padded_layers - num_hidden_layers
+
+    if pad_size:
+        layer_idx = jnp.pad(layer_idx, (0, pad_size))
+        rope_theta = jnp.pad(rope_theta, (0, pad_size))
+        is_sliding = jnp.pad(is_sliding, (0, pad_size))
+
+    is_valid = jnp.concatenate(
+        [
+            jnp.ones((num_hidden_layers,), dtype=jnp.bool_),
+            jnp.zeros((pad_size,), dtype=jnp.bool_),
+        ]
+    )
+
+    return (
+        layer_idx.reshape(num_blocks, block_size),
+        rope_theta.reshape(num_blocks, block_size),
+        is_sliding.reshape(num_blocks, block_size),
+        is_valid.reshape(num_blocks, block_size),
+    )
 def _match_first_initializer(
     key: str,
     initializers: dict[str, Initializer],
@@ -214,21 +432,37 @@ def linear_3d(x, w, b=None, *, out_sharding=None):
     return y
 
 
+def select_attention_mask(attention_mask, is_sliding):
+    if not isinstance(attention_mask, dict):
+        return attention_mask
+
+    full_mask = attention_mask["full_attention"]
+    sliding_mask = attention_mask["sliding_attention"]
+    if full_mask is None or sliding_mask is None:
+        return None
+
+    return jax.lax.select(jnp.asarray(is_sliding, dtype=jnp.bool_), sliding_mask, full_mask)
+
+
 def forward_layer(
     config: Config,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
-    layer_idx: int,
-    rope_theta: float,
+    layer_idx: Int[Array, ""] | int,
+    rope_theta: Float[Array, ""] | float,
     pos=0,
     **inputs,
 ):
     rules = config.sharding_rules
     act_fn = get_activation_fn(config.hidden_activation)
     head_dim = config.head_dim
+    attention_mask = select_attention_mask(
+        inputs["attention_mask"],
+        inputs["is_sliding"],
+    )
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["input_layernorm"], config.rms_norm_eps)
+    x_norm = gemma_rms_norm(x, w["input_layernorm.weight"], config.rms_norm_eps)
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
     q_sharding = jax.NamedSharding(
         jax.sharding.get_abstract_mesh(),
@@ -242,20 +476,20 @@ def forward_layer(
 
     q = linear_3d(
         x_norm,
-        w["q_proj"],
-        w.get("q_proj_bias"),
+        w["self_attn.q_proj.weight"],
+        w.get("self_attn.q_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
     k = linear_3d(
         x_norm,
-        w["k_proj"],
-        w.get("k_proj_bias"),
+        w["self_attn.k_proj.weight"],
+        w.get("self_attn.k_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
     v = linear_3d(
         x_norm,
-        w["v_proj"],
-        w.get("v_proj_bias"),
+        w["self_attn.v_proj.weight"],
+        w.get("self_attn.v_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "none"), rules),
     )
 
@@ -263,8 +497,8 @@ def forward_layer(
     k = rearrange(k, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
     v = rearrange(v, "b t (k h) -> b t k h", k=config.num_key_value_heads, h=head_dim)
 
-    q = gemma_rms_norm(q, w["q_norm"], config.rms_norm_eps)
-    k = gemma_rms_norm(k, w["k_norm"], config.rms_norm_eps)
+    q = gemma_rms_norm(q, w["self_attn.q_norm.weight"], config.rms_norm_eps)
+    k = gemma_rms_norm(k, w["self_attn.k_norm.weight"], config.rms_norm_eps)
 
     query_pre_attn_scalar = float(
         getattr(config, "query_pre_attn_scalar", config.head_dim)
@@ -275,56 +509,176 @@ def forward_layer(
     k = apply_rope(k, rope_theta, pos)
 
     attn_output = attention_interface(
-        q, k, v, mask=inputs["attention_mask"], q_sharding=q_sharding
+        q, k, v, mask=attention_mask, q_sharding=q_sharding
     )
 
     attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
     attn_output = linear_3d(
         attn_output,
-        w["o_proj"],
-        w.get("o_proj_bias"),
+        w["self_attn.o_proj.weight"],
+        w.get("self_attn.o_proj.bias"),
         out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
     )
 
     attn_output = gemma_rms_norm(
         attn_output,
-        w["post_attention_layernorm"],
+        w["post_attention_layernorm.weight"],
         config.rms_norm_eps,
     )
     x = residual + attn_output
 
     residual = x
-    x_norm = gemma_rms_norm(x, w["pre_feedforward_layernorm"], config.rms_norm_eps)
+    x_norm = gemma_rms_norm(
+        x,
+        w["pre_feedforward_layernorm.weight"],
+        config.rms_norm_eps,
+    )
     x_norm = reshard(x_norm, logical_to_physical(("batch", "context", "none"), rules))
 
     gate = act_fn(
         linear_3d(
             x_norm,
-            w["gate_proj"],
-            w.get("gate_proj_bias"),
+            w["mlp.gate_proj.weight"],
+            w.get("mlp.gate_proj.bias"),
             out_sharding=logical_to_physical(("batch", "context", "model"), rules),
         )
     )
     up = linear_3d(
         x_norm,
-        w["up_proj"],
-        w.get("up_proj_bias"),
+        w["mlp.up_proj.weight"],
+        w.get("mlp.up_proj.bias"),
         out_sharding=logical_to_physical(("batch", "context", "model"), rules),
     )
 
     ffw = einsum(
         "btf,df->btd",
         gate * up,
-        w["down_proj"],
+        w["mlp.down_proj.weight"],
         preferred_element_type=x.dtype,
         out_sharding=logical_to_physical(("batch", "sequence", "none"), rules),
     )
-    if w.get("down_proj_bias") is not None:
-        ffw = ffw + w["down_proj_bias"][None, None, :]
+    if w.get("mlp.down_proj.bias") is not None:
+        ffw = ffw + w["mlp.down_proj.bias"][None, None, :]
 
-    ffw = gemma_rms_norm(ffw, w["post_feedforward_layernorm"], config.rms_norm_eps)
+    ffw = gemma_rms_norm(
+        ffw,
+        w["post_feedforward_layernorm.weight"],
+        config.rms_norm_eps,
+    )
     x = residual + ffw
     return x
+
+
+def make_layer_fwd(config: Config):
+    layer_fwd = partial(forward_layer, config)
+    if config.additional_config["remat_layer"]:
+        return jax.remat(layer_fwd)
+    return layer_fwd
+
+
+def forward_block(
+    layer_fwd,
+    x: Float[Array, "B T D"],
+    w: PyTree[Array, "LayerWeights"],
+    layer_idx: Int[Array, "L"],
+    rope_theta: Float[Array, "L"],
+    is_sliding: Int[Array, "L"],
+    is_valid: Int[Array, "L"],
+    pos=0,
+    **inputs,
+):
+    block_size = int(layer_idx.shape[0])
+    for block_idx in range(block_size):
+        layer_weights = jax.tree.map(lambda leaf: leaf[block_idx], w)
+        x = jax.lax.cond(
+            is_valid[block_idx],
+            lambda carry: layer_fwd(
+                carry,
+                layer_weights,
+                layer_idx[block_idx],
+                rope_theta[block_idx],
+                pos=pos,
+                attention_mask=inputs["attention_mask"],
+                is_sliding=is_sliding[block_idx],
+            ),
+            lambda carry: carry,
+            x,
+        )
+    return x
+
+
+def forward_loop(
+    config: Config,
+    layer_fwd,
+    x: Float[Array, "B T D"],
+    weights: dict[str, Array],
+    mask_mapping,
+    pos: int,
+):
+    for layer_idx, attention_type in enumerate(get_layer_types(config)):
+        x = layer_fwd(
+            x,
+            get_loop_layer_weights(weights, layer_idx),
+            layer_idx,
+            get_rope_theta(config, attention_type),
+            pos=pos,
+            attention_mask=mask_mapping,
+            is_sliding=attention_type == "sliding_attention",
+        )
+    return x
+
+
+def forward_scan_layer(
+    config: Config,
+    layer_fwd,
+    x: Float[Array, "B T D"],
+    weights: dict[str, Array],
+    mask_mapping,
+    pos: int,
+):
+    layer_idx, rope_theta, is_sliding = get_layer_metadata(config)
+    scan_fwd = make_scan_fwd(
+        layer_fwd,
+        int(layer_idx.shape[0]),
+        argnums=0,
+        argnames=("layer_idx", "rope_theta", "is_sliding"),
+    )
+    return scan_fwd(
+        x,
+        get_scannable_layer_weights(weights),
+        layer_idx=layer_idx,
+        rope_theta=rope_theta,
+        is_sliding=is_sliding,
+        pos=pos,
+        attention_mask=mask_mapping,
+    )
+
+
+def forward_scan_block(
+    config: Config,
+    layer_fwd,
+    x: Float[Array, "B T D"],
+    weights: dict[str, Array],
+    mask_mapping,
+    pos: int,
+):
+    layer_idx, rope_theta, is_sliding, is_valid = get_block_metadata(config)
+    scan_fwd = make_scan_fwd(
+        partial(forward_block, layer_fwd),
+        int(layer_idx.shape[0]),
+        argnums=0,
+        argnames=("layer_idx", "rope_theta", "is_sliding", "is_valid"),
+    )
+    return scan_fwd(
+        x,
+        get_scannable_layer_weights(weights),
+        layer_idx=layer_idx,
+        rope_theta=rope_theta,
+        is_sliding=is_sliding,
+        is_valid=is_valid,
+        pos=pos,
+        attention_mask=mask_mapping,
+    )
 
 
 def forward(
@@ -358,55 +712,19 @@ def forward(
         **inputs,
     )
 
-    layer_types = config.layer_types
-    for layer_idx in range(int(config.num_hidden_layers)):
-        attention_type = layer_types[layer_idx % len(layer_types)]
-        rope_theta = get_rope_theta(config, attention_type)
+    layer_fwd = make_layer_fwd(config)
+    forward_impl = get_forward_impl(config)
+    if forward_impl is not ForwardImpl.LOOP:
+        weights = prepare_weights(config, weights, forward_impl)
 
-        prefix = f"{model_prefix}.layers.{layer_idx}."
-        layer_weights = {
-            "input_layernorm": weights[f"{prefix}input_layernorm.weight"],
-            "post_attention_layernorm": weights[
-                f"{prefix}post_attention_layernorm.weight"
-            ],
-            "pre_feedforward_layernorm": weights[
-                f"{prefix}pre_feedforward_layernorm.weight"
-            ],
-            "post_feedforward_layernorm": weights[
-                f"{prefix}post_feedforward_layernorm.weight"
-            ],
-            "q_proj": weights[f"{prefix}self_attn.q_proj.weight"],
-            "q_proj_bias": weights.get(f"{prefix}self_attn.q_proj.bias"),
-            "k_proj": weights[f"{prefix}self_attn.k_proj.weight"],
-            "k_proj_bias": weights.get(f"{prefix}self_attn.k_proj.bias"),
-            "v_proj": weights[f"{prefix}self_attn.v_proj.weight"],
-            "v_proj_bias": weights.get(f"{prefix}self_attn.v_proj.bias"),
-            "o_proj": weights[f"{prefix}self_attn.o_proj.weight"],
-            "o_proj_bias": weights.get(f"{prefix}self_attn.o_proj.bias"),
-            "q_norm": weights[f"{prefix}self_attn.q_norm.weight"],
-            "k_norm": weights[f"{prefix}self_attn.k_norm.weight"],
-            "gate_proj": weights[f"{prefix}mlp.gate_proj.weight"],
-            "gate_proj_bias": weights.get(f"{prefix}mlp.gate_proj.bias"),
-            "up_proj": weights[f"{prefix}mlp.up_proj.weight"],
-            "up_proj_bias": weights.get(f"{prefix}mlp.up_proj.bias"),
-            "down_proj": weights[f"{prefix}mlp.down_proj.weight"],
-            "down_proj_bias": weights.get(f"{prefix}mlp.down_proj.bias"),
-        }
-
-        if config.additional_config["remat_layer"]:
-            fwd = jax.remat(partial(forward_layer, config))
-        else:
-            fwd = partial(forward_layer, config)
-
-        layer_inputs = {**inputs, "attention_mask": mask_mapping.get(attention_type)}
-        x = fwd(
-            x,
-            layer_weights,
-            layer_idx,
-            rope_theta,
-            pos,
-            **layer_inputs,
-        )
+    if forward_impl is ForwardImpl.LOOP:
+        x = forward_loop(config, layer_fwd, x, weights, mask_mapping, pos)
+    elif forward_impl is ForwardImpl.SCAN_LAYER:
+        x = forward_scan_layer(config, layer_fwd, x, weights, mask_mapping, pos)
+    elif forward_impl is ForwardImpl.SCAN_BLOCK:
+        x = forward_scan_block(config, layer_fwd, x, weights, mask_mapping, pos)
+    else:  # pragma: no cover
+        raise ValueError(f"Unsupported Gemma-3 forward implementation: {forward_impl!r}")
 
     x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
     # Note: x[1] are sharded across the tensor-parallel (TP) axis.
@@ -635,11 +953,10 @@ def init(
             f"{prefix}mlp.down_proj.weight", (hidden_size, intermediate_size)
         )
 
-    weights["model.norm.weight"] = init_param("model.norm.weight", (hidden_size,))
-
     config.additional_config = additional_config
     config.parallel_dims = parallel_dims
     config.sharding_rules = sharding_rules
+    weights["model.norm.weight"] = init_param("model.norm.weight", (hidden_size,))
 
     return Model(
         name=__name__,

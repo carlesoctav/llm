@@ -1,34 +1,12 @@
-import os
-import runpy
 from collections.abc import Iterable, Mapping
 from itertools import product
 from typing import Any
 
-import sws
-
-
-class ConfigLoadError(RuntimeError):
-    pass
+from jaxformers.sws_utils import ConfigLoadError, load_config_builder
 
 
 class SweepConfigError(ValueError):
     pass
-
-
-def load_config_builder(config_path: str, *, default_func: str = "get_config") -> sws.Config:
-    path = config_path
-    func_name = default_func
-    if ":" in path:
-        path, func_name = path.split(":", 1)
-
-    path = os.path.abspath(path)
-    factory = runpy.run_path(path).get(func_name)
-    if not callable(factory):
-        raise ConfigLoadError(f"Function {func_name!r} not found in {path}")
-    builder = factory()
-    if not isinstance(builder, sws.Config):
-        raise ConfigLoadError(f"Config factory in {path} must return a sws.Config")
-    return builder
 
 
 def build_sweep_space(

@@ -24,6 +24,7 @@ from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer, make_scheduler
+from jaxformers.sws_utils import run as sws_run
 
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
@@ -381,4 +382,4 @@ def main(config: sws.FinalConfig):
 
 
 if __name__ == "__main__":
-    sws.run(main)
+    sws_run(main)

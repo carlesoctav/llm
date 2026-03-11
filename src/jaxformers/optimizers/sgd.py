@@ -2,7 +2,6 @@ from typing import Callable
 
 import optax
 
-from .base import make_opt_base_components
 from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
 
 
@@ -14,7 +13,7 @@ def make(
     nesterov: bool = False,
     **kwargs,
 ):
-    components = make_opt_base_components(grad_accum)
+    components = []
     if max_grad_norm:
         components.append(optax.clip_by_global_norm(max_grad_norm))
 
@@ -23,4 +22,3 @@ def make(
 
     components.append(custom_scale_by_learning_rate(learning_rate))
     return optax.chain(*components)
-

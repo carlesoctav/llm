@@ -18,8 +18,8 @@ def get_config():
     config.model.additional_config.forward_impl = "scan_layer"
 
     config.loss_implementation = "reference"
+    config.grad_accum = 4
     config.optimizer_name = "adam"
-    config.optimizer.grad_accum = 4
     config.optimizer.microbatch_impl = "optax"
     config.train_loader.global_batch_size = 32
     config.data.transforms.packing = True

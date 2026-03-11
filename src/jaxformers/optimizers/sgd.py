@@ -7,7 +7,6 @@ from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
 
 def make(
     learning_rate: float | Callable[[int], float],
-    grad_accum: int,
     max_grad_norm: float | None = 1.0,
     momentum: float = 0.0,
     nesterov: bool = False,

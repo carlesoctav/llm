@@ -68,7 +68,7 @@ Additional `scan_block` smoke:
 
 ### Prepare outside JIT follow-up
 
-All runs below used the current `scan_layer` + `fori_loop` path, `global_batch_size=32`, `optimizer.grad_accum=4`, `remat_layer=True`, and `max_train_step=2`.
+All runs below used the current `scan_layer` path, `global_batch_size=32`, `grad_accum=4`, `remat_layer=True`, and `max_train_step=2`.
 
 | Setup | LoRA | Optimizer | Attn/loss | Compile | Total mem | Temp mem | Tok/s | Notes |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |

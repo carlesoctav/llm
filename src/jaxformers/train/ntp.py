@@ -106,10 +106,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
 
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
 
-    if config.optimizer.grad_accum > 1:
-        microbatch_size = (
-            config.train_loader.global_batch_size // config.optimizer.grad_accum
-        )
+    if config.grad_accum > 1:
+        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
         grad_fn = microbatch(
             jax.value_and_grad(loss_fn, has_aux=True),
             argnums=2,

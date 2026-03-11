@@ -49,9 +49,9 @@ def get_config():
     config.lr_scheduler_name = None
     # config.lr_scheduler.xx = xx
 
+    config.grad_accum = 4
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0
-    config.optimizer.grad_accum = 4
 
     config.data_name = "huggingface"
     config.data.load_kwargs = [
@@ -73,7 +73,7 @@ def get_config():
     config.data.transforms.packing = False
     config.data.transforms.packing_bins = 64
 
-    # total batch size is global_batch_size * config.optimizer.grad_accum
+    # total batch size is global_batch_size * config.grad_accum
     config.train_loader.global_batch_size = 32
     config.train_loader.seed = 42
 

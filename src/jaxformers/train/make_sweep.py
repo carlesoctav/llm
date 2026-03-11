@@ -19,12 +19,14 @@ the run overrides.
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from etils import epath
 import sws
 
 from jaxformers.sweep_utils import build_sweep_space
+from jaxformers.sws_utils import run as sws_run
 
 
 _META_KEYS = {
@@ -48,11 +50,13 @@ def get_config() -> sws.Config:
 
 def render_config_file(base_config_path: str, overrides: dict[str, Any]) -> str:
     lines: list[str] = []
+    base_config_name = Path(base_config_path).name
     lines.append("import sws")
+    lines.append("from pathlib import Path")
     lines.append("")
-    lines.append("from jaxformers.sweep_utils import load_config_builder")
+    lines.append("from jaxformers.sws_utils import load_config_builder")
     lines.append("")
-    lines.append("BASE_CONFIG_PATH = " + repr(base_config_path))
+    lines.append(f"BASE_CONFIG_PATH = str(Path(__file__).with_name({base_config_name!r}))")
     lines.append("OVERRIDES = " + repr(list(overrides.items())))
     lines.append("")
     lines.append("def get_config() -> sws.Config:")
@@ -86,6 +90,16 @@ def split_overrides(
 
 def resolve_output_dir(dir_path: str, name: str) -> epath.Path:
     return epath.Path(dir_path) / name
+
+
+def copy_base_config(base_config_path: str, out_dir: epath.Path) -> epath.Path:
+    source = epath.Path(base_config_path)
+    destination = out_dir / Path(base_config_path).name
+
+    if source != destination:
+        destination.write_text(source.read_text())
+
+    return destination
 
 
 def main(config: sws.FinalConfig) -> None:
@@ -126,10 +140,11 @@ def main(config: sws.FinalConfig) -> None:
         return
 
     base_config_path = os.path.abspath(str(flat["base_config"]))
+    copied_base_config_path = copy_base_config(base_config_path, out_dir)
     manifest: list[dict[str, Any]] = []
     for run_idx, (group_idx, run_overrides) in enumerate(run_items):
         cfg_path = out_dir / f"{run_idx}.py"
-        cfg_path.write_text(render_config_file(base_config_path, run_overrides))
+        cfg_path.write_text(render_config_file(str(copied_base_config_path), run_overrides))
         manifest.append(
             {
                 "run_idx": run_idx,
@@ -144,4 +159,4 @@ def main(config: sws.FinalConfig) -> None:
 
 
 if __name__ == "__main__":
-    sws.run(main)
+    sws_run(main)

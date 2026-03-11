@@ -19,8 +19,8 @@ def _get_scan_lengths(values, axes):
     return lengths
 
 
-def _take_scan_slice(tree, index: int, axis: int):
-    return jax.tree.map(lambda leaf: jnp.take(leaf, indices=index, axis=axis), tree)
+def _move_scan_axis(tree, axis: int):
+    return jax.tree.map(lambda leaf: jnp.moveaxis(leaf, axis, 0), tree)
 
 
 def make_scan_fwd(
@@ -68,22 +68,34 @@ def make_scan_fwd(
             )
 
         base_args = list(fwd_args)
+        scan_args = tuple(
+            _move_scan_axis(fwd_args[idx], axis)
+            for idx, axis in zip(argnums, in_axes[: len(argnums)])
+        )
+        scan_kwargs = {
+            name: _move_scan_axis(kwargs[name], axis)
+            for name, axis in zip(argnames, in_axes[len(argnums) :])
+        }
         nonscan_kwargs = {
             name: value for name, value in kwargs.items() if name not in argnames
         }
-        arg_axes = tuple(in_axes[: len(argnums)])
-        kw_axes = tuple(in_axes[len(argnums) :])
 
-        def body_fun(index, carry):
+        def scan_body(carry, xs):
+            step_args, step_kwargs = xs
             call_args = list(base_args)
-            for idx, axis in zip(argnums, arg_axes):
-                call_args[idx] = _take_scan_slice(fwd_args[idx], index, axis)
+            for idx, value in zip(argnums, step_args):
+                call_args[idx] = value
 
             call_kwargs = dict(nonscan_kwargs)
-            for name, axis in zip(argnames, kw_axes):
-                call_kwargs[name] = _take_scan_slice(kwargs[name], index, axis)
-            return fwd(carry, *call_args, **call_kwargs)
+            call_kwargs.update(step_kwargs)
+            return fwd(carry, *call_args, **call_kwargs), None
 
-        return jax.lax.fori_loop(0, length, body_fun, carry)
+        carry, _ = jax.lax.scan(
+            scan_body,
+            init=carry,
+            xs=(scan_args, scan_kwargs),
+            length=length,
+        )
+        return carry
 
     return scan_fwd

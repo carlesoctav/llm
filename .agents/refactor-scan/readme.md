@@ -11,7 +11,7 @@ Date: 2026-03-11
 - Stacked scan views are now prepared outside the train-step JIT, after `make_lora(...)` and before optimizer init, via `jaxformers.models.prepare_weights(...)`.
 - Gemma forward still has a fallback prepare path, but the common training path now hits an already-prepared tree.
 - `make_scan_fwd` was refactored to use explicit `argnums`, `argnames`, and `in_axes`.
-- Current local state: `scan_layer` uses `jax.lax.fori_loop`.
+- Current local state: `scan_layer` uses `jax.lax.scan`.
 
 ## Validation
 
@@ -92,6 +92,7 @@ attn_implementation=xla_chunked loss_implementation=xla_chunked
 | `scan_layer` | `lax.scan` | `30` | `83.68s` | `5.6 GB` | `4.2 GB` | `45.903s` | `29540.91` |
 | `scan_layer` | `fori_loop` | `30` | `80.89s` | `6.5 GB` | `5.1 GB` | `45.858s` | `29570.14` |
 | `scan_layer` | `lax.scan` | `30` | `81.95s` | `5.6 GB` | `4.2 GB` | `45.861s` | `29568.29` |
+| `scan_layer` | `lax.scan` | `2` | `33.23s` | `4.3 GB` | `2.9 GB` | `2.647s` | `33928.20` |
 
 ## Main conclusions
 
@@ -107,7 +108,7 @@ attn_implementation=xla_chunked loss_implementation=xla_chunked
 - Moving `prepare_weights` out of JIT materially reduced compile time on the current `fori_loop` path:
   - no LoRA + `sgd`: `34.63s -> 9.87s`
   - LoRA + `adam` + `xla_chunked`: `81.95s -> 33.20s`
-- Current local state: `scan_layer` uses `fori_loop`, and the stacked weights are prepared after LoRA and before optimizer init.
+- Current local state: `scan_layer` uses `scan`, and the stacked weights are prepared after LoRA and before optimizer init.
 
 ## Why compile time jumped from ~16s to ~80s
 

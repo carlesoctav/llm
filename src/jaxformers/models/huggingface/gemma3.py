@@ -275,7 +275,7 @@ def get_layer_metadata(config: Config) -> tuple[jax.Array, jax.Array, jax.Array]
 
 def get_block_metadata(
     config: Config,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     layer_idx, rope_theta, is_sliding = get_layer_metadata(config)
     block_size = get_layer_block_size(get_layer_types(config))
     num_hidden_layers = int(getattr(config, "num_hidden_layers"))
@@ -288,18 +288,10 @@ def get_block_metadata(
         rope_theta = jnp.pad(rope_theta, (0, pad_size))
         is_sliding = jnp.pad(is_sliding, (0, pad_size))
 
-    is_valid = jnp.concatenate(
-        [
-            jnp.ones((num_hidden_layers,), dtype=jnp.bool_),
-            jnp.zeros((pad_size,), dtype=jnp.bool_),
-        ]
-    )
-
     return (
         layer_idx.reshape(num_blocks, block_size),
         rope_theta.reshape(num_blocks, block_size),
         is_sliding.reshape(num_blocks, block_size),
-        is_valid.reshape(num_blocks, block_size),
     )
 def _match_first_initializer(
     key: str,
@@ -568,55 +560,44 @@ def forward_layer(
     x = residual + ffw
     return x
 
-
-def make_layer_fwd(config: Config):
-    layer_fwd = partial(forward_layer, config)
-    if config.additional_config["remat_layer"]:
-        return jax.remat(layer_fwd)
-    return layer_fwd
-
-
 def forward_block(
     layer_fwd,
     x: Float[Array, "B T D"],
     w: PyTree[Array, "LayerWeights"],
-    layer_idx: Int[Array, "L"],
-    rope_theta: Float[Array, "L"],
-    is_sliding: Int[Array, "L"],
-    is_valid: Int[Array, "L"],
+    layer_idx: Int[Array, " L"],
+    rope_theta: Float[Array, " L"],
+    is_sliding: Int[Array, " L"],
     pos=0,
     **inputs,
 ):
     block_size = int(layer_idx.shape[0])
     for block_idx in range(block_size):
         layer_weights = jax.tree.map(lambda leaf: leaf[block_idx], w)
-        x = jax.lax.cond(
-            is_valid[block_idx],
-            lambda carry: layer_fwd(
-                carry,
-                layer_weights,
-                layer_idx[block_idx],
-                rope_theta[block_idx],
-                pos=pos,
-                attention_mask=inputs["attention_mask"],
-                is_sliding=is_sliding[block_idx],
-            ),
-            lambda carry: carry,
+        x = layer_fwd(
             x,
+            layer_weights,
+            layer_idx[block_idx],
+            rope_theta[block_idx],
+            pos=pos,
+            attention_mask=inputs["attention_mask"],
+            is_sliding=is_sliding[block_idx],
         )
     return x
 
 
 def forward_loop(
     config: Config,
-    layer_fwd,
     x: Float[Array, "B T D"],
     weights: dict[str, Array],
     mask_mapping,
     pos: int,
 ):
+    fwd = partial(forward_layer, config)
+    if config.additional_config["remat_layer"]:
+        fwd = jax.remat(fwd)
+
     for layer_idx, attention_type in enumerate(get_layer_types(config)):
-        x = layer_fwd(
+        x = fwd(
             x,
             get_loop_layer_weights(weights, layer_idx),
             layer_idx,
@@ -630,15 +611,18 @@ def forward_loop(
 
 def forward_scan_layer(
     config: Config,
-    layer_fwd,
     x: Float[Array, "B T D"],
     weights: dict[str, Array],
     mask_mapping,
     pos: int,
 ):
+    fwd = partial(forward_layer, config)
+    if config.additional_config["remat_layer"]:
+        fwd = jax.remat(fwd)
+
     layer_idx, rope_theta, is_sliding = get_layer_metadata(config)
     scan_fwd = make_scan_fwd(
-        layer_fwd,
+        fwd,
         int(layer_idx.shape[0]),
         argnums=0,
         argnames=("layer_idx", "rope_theta", "is_sliding"),
@@ -656,29 +640,61 @@ def forward_scan_layer(
 
 def forward_scan_block(
     config: Config,
-    layer_fwd,
     x: Float[Array, "B T D"],
     weights: dict[str, Array],
     mask_mapping,
     pos: int,
 ):
-    layer_idx, rope_theta, is_sliding, is_valid = get_block_metadata(config)
-    scan_fwd = make_scan_fwd(
-        partial(forward_block, layer_fwd),
-        int(layer_idx.shape[0]),
-        argnums=0,
-        argnames=("layer_idx", "rope_theta", "is_sliding", "is_valid"),
-    )
-    return scan_fwd(
-        x,
-        get_scannable_layer_weights(weights),
-        layer_idx=layer_idx,
-        rope_theta=rope_theta,
-        is_sliding=is_sliding,
-        is_valid=is_valid,
-        pos=pos,
-        attention_mask=mask_mapping,
-    )
+    layer_fwd = partial(forward_layer, config)
+    if config.additional_config["remat_layer"]:
+        layer_fwd = jax.remat(layer_fwd)
+    block_fwd = partial(forward_block, layer_fwd)
+
+    layer_idx, rope_theta, is_sliding = get_block_metadata(config)
+    block_weights = get_scannable_layer_weights(weights)
+    block_size = int(layer_idx.shape[1])
+    num_hidden_layers = int(getattr(config, "num_hidden_layers"))
+    remainder = num_hidden_layers % block_size
+    num_blocks = int(layer_idx.shape[0])
+    num_scanned_blocks = num_blocks if remainder == 0 else num_blocks - 1
+
+    if num_scanned_blocks > 0:
+        scan_fwd = make_scan_fwd(
+            block_fwd,
+            num_scanned_blocks,
+            argnums=0,
+            argnames=("layer_idx", "rope_theta", "is_sliding"),
+        )
+        x = scan_fwd(
+            x,
+            jax.tree.map(lambda leaf: leaf[:num_scanned_blocks], block_weights),
+            layer_idx=layer_idx[:num_scanned_blocks],
+            rope_theta=rope_theta[:num_scanned_blocks],
+            is_sliding=is_sliding[:num_scanned_blocks],
+            pos=pos,
+            attention_mask=mask_mapping,
+        )
+
+    if remainder:
+        tail_block_idx = num_blocks - 1
+        tail_block_weights = jax.tree.map(
+            lambda leaf: leaf[tail_block_idx], block_weights
+        )
+        for layer_offset in range(remainder):
+            tail_layer_weights = jax.tree.map(
+                lambda leaf: leaf[layer_offset], tail_block_weights
+            )
+            x = layer_fwd(
+                x,
+                tail_layer_weights,
+                layer_idx[tail_block_idx, layer_offset],
+                rope_theta[tail_block_idx, layer_offset],
+                pos=pos,
+                attention_mask=mask_mapping,
+                is_sliding=is_sliding[tail_block_idx, layer_offset],
+            )
+
+    return x
 
 
 def forward(
@@ -712,17 +728,16 @@ def forward(
         **inputs,
     )
 
-    layer_fwd = make_layer_fwd(config)
     forward_impl = get_forward_impl(config)
     if forward_impl is not ForwardImpl.LOOP:
         weights = prepare_weights(config, weights, forward_impl)
 
     if forward_impl is ForwardImpl.LOOP:
-        x = forward_loop(config, layer_fwd, x, weights, mask_mapping, pos)
+        x = forward_loop(config, x, weights, mask_mapping, pos)
     elif forward_impl is ForwardImpl.SCAN_LAYER:
-        x = forward_scan_layer(config, layer_fwd, x, weights, mask_mapping, pos)
+        x = forward_scan_layer(config, x, weights, mask_mapping, pos)
     elif forward_impl is ForwardImpl.SCAN_BLOCK:
-        x = forward_scan_block(config, layer_fwd, x, weights, mask_mapping, pos)
+        x = forward_scan_block(config, x, weights, mask_mapping, pos)
     else:  # pragma: no cover
         raise ValueError(f"Unsupported Gemma-3 forward implementation: {forward_impl!r}")
 

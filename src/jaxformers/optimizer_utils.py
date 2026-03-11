@@ -20,19 +20,3 @@ def mask_trainable_lora(params):
         return False
 
     return jtu.tree_map(label, params, is_leaf=is_lora_array)
-
-
-def find_learning_rate(opt_state):
-    is_lr_state = lambda x: isinstance(x, ScaleByLearningRateState)
-    res = {}
-    def f(path, leaf):
-        if is_lr_state(leaf):
-            log_key = tree_util.optimizerstr(path)
-            log_key = f"{log_key}/lr" if log_key else "lr"
-            res[f"optim/{log_key}"] = leaf.learning_rate
-
-    jax.tree.map_with_path(f, opt_state, is_leaf=is_lr_state)
-    return res
-
-def find_grad_norm(opt_state):
-    return {"grad/grad_norm": opt_state[0].grad_norm}

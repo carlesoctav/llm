@@ -2,7 +2,7 @@ import fnmatch
 import math
 import re
 from collections import defaultdict
-from enum import StrEnum, auto
+from enum import auto, StrEnum
 from functools import partial
 from pathlib import Path
 from typing import Callable, Sequence, TypeAlias, TypeVar
@@ -116,7 +116,10 @@ def get_layer_types(config: Config) -> list[str]:
 
 def get_layer_block_size(layer_types: Sequence[str]) -> int:
     for block_size in range(1, len(layer_types) + 1):
-        if all(layer_types[idx] == layer_types[idx % block_size] for idx in range(len(layer_types))):
+        if all(
+            layer_types[idx] == layer_types[idx % block_size]
+            for idx in range(len(layer_types))
+        ):
             return block_size
     return len(layer_types)
 
@@ -253,9 +256,7 @@ def get_loop_layer_weights(
 
 def get_scannable_layer_weights(weights: dict[str, Array]) -> dict[str, Array]:
     return {
-        key: value
-        for key, value in weights.items()
-        if key not in NON_LAYER_WEIGHT_KEYS
+        key: value for key, value in weights.items() if key not in NON_LAYER_WEIGHT_KEYS
     }
 
 
@@ -293,6 +294,8 @@ def get_block_metadata(
         rope_theta.reshape(num_blocks, block_size),
         is_sliding.reshape(num_blocks, block_size),
     )
+
+
 def _match_first_initializer(
     key: str,
     initializers: dict[str, Initializer],
@@ -433,7 +436,9 @@ def select_attention_mask(attention_mask, is_sliding):
     if full_mask is None or sliding_mask is None:
         return None
 
-    return jax.lax.select(jnp.asarray(is_sliding, dtype=jnp.bool_), sliding_mask, full_mask)
+    return jax.lax.select(
+        jnp.asarray(is_sliding, dtype=jnp.bool_), sliding_mask, full_mask
+    )
 
 
 def forward_layer(
@@ -559,6 +564,7 @@ def forward_layer(
     )
     x = residual + ffw
     return x
+
 
 def forward_block(
     layer_fwd,
@@ -721,7 +727,6 @@ def forward(
     )
     x *= jnp.sqrt(jnp.array(config.hidden_size, dtype=dtype))
 
-
     mask_mapping = make_mask(
         config,
         x,
@@ -739,7 +744,9 @@ def forward(
     elif forward_impl is ForwardImpl.SCAN_BLOCK:
         x = forward_scan_block(config, x, weights, mask_mapping, pos)
     else:  # pragma: no cover
-        raise ValueError(f"Unsupported Gemma-3 forward implementation: {forward_impl!r}")
+        raise ValueError(
+            f"Unsupported Gemma-3 forward implementation: {forward_impl!r}"
+        )
 
     x = gemma_rms_norm(x, weights[final_norm_key], config.rms_norm_eps)
     # Note: x[1] are sharded across the tensor-parallel (TP) axis.

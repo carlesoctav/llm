@@ -1,3 +1,4 @@
+from beartype.vale import IsInstance
 import dataclasses
 import sys
 import time
@@ -29,7 +30,7 @@ from jaxformers.sws_utils import run as sws_run
 
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
-DEFAULT_AUX = {"loss": (0, 0), "token": 0, "batch": 0}
+DEFAULT_AUX = {"loss": (0.0, 0), "token": 0, "batch": 0}
 
 
 def _preparse_absl_flags() -> None:
@@ -148,14 +149,26 @@ def eval(model, eval_ds):
     raise NotImplementedError
 
 
+
 def process_aux(accum_aux: dict[str, Any], namespace=""):
     def finalize(v: Any) -> Any:
         if isinstance(v, tuple):
-            return v[0] / v[1]
+            numer, denom = v
+            return numer / denom if denom else 0.0
         return v
+    prefix = f"{namespace}/" if namespace else ""
+    return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
 
-    return {f"{namespace}/{k}": finalize(v) for k, v in accum_aux.items()}
 
+def _to_host(tree):
+    tree = jax.device_get(tree)
+    def _item(value):
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return value.item()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+    return jtu.tree_map(_item, tree)
 
 def add_aux(accum_aux, aux):
     is_tuple = lambda x: isinstance(x, tuple)
@@ -164,11 +177,11 @@ def add_aux(accum_aux, aux):
         method = DEFAULT_REDUCED[jtu.keystr(path, simple=True)]
         match method:
             case "max":
-                return jnp.maximum(accum_leaf, leaf)
+                return max(accum_leaf, leaf)
             case "sum":
                 return accum_leaf + leaf
             case "min":
-                return jnp.minimum(accum_leaf, leaf)
+                return min(accum_leaf, leaf)
             case "mean":
                 return (accum_leaf[0] + leaf[0], accum_leaf[1] + leaf[1])
 
@@ -230,7 +243,7 @@ def train(
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(eval_aux)
+                processed_aux = process_aux(jax.device_get(eval_aux))
 
             try:
                 batch = next(train_iterator)
@@ -289,8 +302,9 @@ def train(
                     aux,
                 )
                 model = dataclasses.replace(model, callback_state=callback_state)
-            global_aux = add_aux(global_aux, aux)
-            processed_aux = process_aux(aux, "step")
+            host_aux = _to_host(aux)
+            global_aux = add_aux(global_aux, host_aux)
+            processed_aux = process_aux(host_aux, "step")
             cum_processed_aux = process_aux(global_aux, "cum")
             if jax.process_index() == 0:
                 logger.log(processed_aux, step=step)

@@ -1,4 +1,4 @@
-from beartype.vale import IsInstance
+from jaxformers.print_utils import tree_pprint
 import dataclasses
 import sys
 import time
@@ -149,26 +149,29 @@ def eval(model, eval_ds):
     raise NotImplementedError
 
 
-
 def process_aux(accum_aux: dict[str, Any], namespace=""):
     def finalize(v: Any) -> Any:
         if isinstance(v, tuple):
             numer, denom = v
             return numer / denom if denom else 0.0
         return v
+
     prefix = f"{namespace}/" if namespace else ""
     return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
 
 
 def _to_host(tree):
     tree = jax.device_get(tree)
+
     def _item(value):
         if isinstance(value, np.ndarray) and value.shape == ():
             return value.item()
         if isinstance(value, np.generic):
             return value.item()
         return value
+
     return jtu.tree_map(_item, tree)
+
 
 def add_aux(accum_aux, aux):
     is_tuple = lambda x: isinstance(x, tuple)
@@ -270,7 +273,7 @@ def train(
                         partial(train_step, config),
                         donate_argnums=(0,),
                     )
-                    lower = train_step_jit.lower(model, batch, rngs = loop_rngs)
+                    lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
                     train_step_fn = lower.compile()
                     first_compile_time = time.monotonic() - start_time
 
@@ -285,14 +288,14 @@ def train(
                         to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch,  rngs = loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                 ):
-                    model, aux = train_step_fn(model, batch, rngs = loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
 
             callback_output = {}
             if model.callback_state is not None:
@@ -361,16 +364,27 @@ def main(config: sws.FinalConfig):
         logger.config.update(config.to_dict())
     try:
         rngs = jax.random.key(config.seed) if config.seed else None
-        model_rngs, lora_rngs, train_rngs = jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
-        model = make_model(config.model_name, config.init_model, config.model.to_dict(), rngs = model_rngs)
-        scheduler_config = config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
+        model_rngs, lora_rngs, train_rngs = (
+            jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
+        )
+        model = make_model(
+            config.model_name,
+            config.init_model,
+            config.model.to_dict(),
+            rngs=model_rngs,
+        )
+        scheduler_config = (
+            config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
+        )
         scheduler = make_scheduler(
             config.lr_scheduler_name,
             config.learning_rate,
             config.max_train_step,
             scheduler_config=scheduler_config,
         )
-        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs)
+        model = make_lora(
+            model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+        )
         model = prepare_model_weights(config.model_name, model)
         t0 = time.monotonic()
         model = make_optimizer(
@@ -396,7 +410,7 @@ def main(config: sws.FinalConfig):
             config.train_loader.to_dict(),
         )
         eval_ds = None
-        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs = train_rngs)
+        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs=train_rngs)
         return metrics
     finally:
         if logger is not None:

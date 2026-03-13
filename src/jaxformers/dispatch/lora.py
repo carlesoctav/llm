@@ -21,11 +21,12 @@ from jax import P
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.modeling_utils import Model
-from jaxformers.models.huggingface.gemma3 import Initializer
 from jaxformers.print_utils import tree_pformat
 
 
-default_init = jax.nn.initializers.he_normal(in_axis=-1, out_axis=-2)
+default_init = jax.nn.initializers.variance_scaling(
+    1 / 3.0, "fan_in", "uniform", in_axis=-1, out_axis=-2, batch_axis=()
+)
 
 
 class InitLora(StrEnum):
@@ -55,25 +56,25 @@ def make_lora(
 
 
 class LoraArray(quax.ArrayValue):
-    """Replaces a matrix `w in R^{n x m}` with `w + a @ b`, where `a in R^{n x k}` and
-    `b in R^{k x m}`.
+    """Replaces a matrix `w in R^{n x m}` with `w + b @ a`, where `a in R^{k x m}` and
+    `b in R^{n x k}`.
 
-    Typically `k` is much smaller than `n` or `m`, and so `w + a @ b` is described as a
+    Typically `k` is much smaller than `n` or `m`, and so `w + b @ a` is described as a
     "low rank adaptation" of `w`. The value of `k` is the "rank" of the adaptation.
 
-    Note that this does not materialise the sum `w + a @ b` into a single matrix, but
+    Note that this does not materialise the sum `w + b @ a` into a single matrix, but
     instead stores it as three separate `w`, `a`, `b` matrices. This is because the
     typical use-case for LoRA is to update just the `a` and `b` matrices when
     fine-tuning a neural network.
 
     This implementation makes use of Quax's multiple-dispatch capabilities to calculate
-    matrix-vector products `(w + a @ b) @ x` via `w @ x + a @ (b @ x)`, which turns out
+    matrix-vector products `(w + b @ a) @ x` via `w @ x + b @ (a @ x)`, which turns out
     to be computationally cheaper.
     """
 
     _w: Shaped[Array, "*batch x y"]
-    a: Shaped[Array, "*batch x z"]
-    b: Shaped[Array, "*batch z y"]
+    a: Shaped[Array, "*batch z y"]
+    b: Shaped[Array, "*batch x z"]
     alpha: float = eqx.field(static=True)
     allow_materialise: bool = eqx.field(static=True)
 
@@ -84,11 +85,11 @@ class LoraArray(quax.ArrayValue):
     def materialise(self):
         if self.allow_materialise:
             batch = tuple(range(self.w.ndim - 2))
-            lhs_contract = (self.a.ndim - 1,)
-            rhs_contract = (self.b.ndim - 2,)
+            lhs_contract = (self.b.ndim - 1,)
+            rhs_contract = (self.a.ndim - 2,)
             dimension_numbers = ((lhs_contract, rhs_contract), (batch, batch))
-            scaling = jnp.asarray(self.alpha / self.a.shape[-1], dtype=self.w.dtype)
-            return self.w + scaling * lax.dot_general(self.a, self.b, dimension_numbers)
+            scaling = jnp.asarray(self.alpha / self.a.shape[-2], dtype=self.w.dtype)
+            return self.w + scaling * lax.dot_general(self.b, self.a, dimension_numbers)
         else:
             raise RuntimeError(
                 "Refusing to materialise `LoraArray` with `allow_materialise=False`."
@@ -185,21 +186,16 @@ def loraify(
         nonlocal rngs, counter
         keystr = jtu.keystr(path, simple=True)
         if _is_match(keystr, weights_path):
-            *B, X, Y = weight.shape
-            *s3, s0, s1 = tuple(weight.sharding.spec)
-            a_sharding = P(s0, None)
-            b_sharding = P(*s3, None, s1)
-            a_shape = (X, rank)
-            b_shape = (*B, rank, Y)
+            out_features, in_features = weight.shape
+            s0, s1 = tuple(weight.sharding.spec)
+            a_sharding = P(None, s1)
+            b_sharding = P(s0, None)
+            a_shape = (rank, in_features)
+            b_shape = (out_features, rank)
 
-            if len(B):
-                init_fn = jax.vmap(default_init, in_axes=(0, None, None, None))
-                lora_key = jax.random.split(jax.random.fold_in(rngs, counter), B)
-                counter += 1
-            else:
-                init_fn = default_init
-                lora_key = jax.random.fold_in(rngs, counter)
-                counter += 1
+            init_fn = default_init
+            lora_key = jax.random.fold_in(rngs, counter)
+            counter += 1
 
             a = init_fn(lora_key, a_shape, weight.dtype, a_sharding)
             b = jnp.zeros(b_shape, weight.dtype, out_sharding=b_sharding)
@@ -256,7 +252,7 @@ def _lora_array_matmul_impl(
     # `kwargs` must not include `out_sharding` here; `out2` has a different shape
     # from the outer dot_general output.
     out2 = lax.dot_general(
-        b, rhs, dimension_numbers, out_sharding=out2_sharding, **kwargs
+        a, rhs, dimension_numbers, out_sharding=out2_sharding, **kwargs
     )
     # out2 has shape(*sharedbatch, *lorabatch, z, *otherbatch)
     lhs_contract2 = (w.ndim - 1,)
@@ -265,7 +261,7 @@ def _lora_array_matmul_impl(
     lhs_batch2 = lhs_batch + tuple(i for i in rhs_batch2 if i not in lhs_batch)
     dimension_numbers2 = ((lhs_contract2, rhs_contract2), (lhs_batch2, rhs_batch2))
     out3 = lax.dot_general(
-        a, out2, dimension_numbers2, out_sharding=out_sharding, **kwargs
+        b, out2, dimension_numbers2, out_sharding=out_sharding, **kwargs
     )
     # out3 has shape (*sharedbatch, *lorabatch, x, *otherbatch)
     return out1 + scaling * out3
@@ -289,7 +285,7 @@ def _lora_array_matmul(
     inner_kwargs = dict(kwargs)
     inner_kwargs.pop("out_sharding", None)
 
-    scaling = jnp.asarray(lhs.alpha / lhs.a.shape[-1], dtype=lhs.w.dtype)
+    scaling = jnp.asarray(lhs.alpha / lhs.a.shape[-2], dtype=lhs.w.dtype)
     # `out2` replaces the lhs uncontracted dimension with `rank`; shard it with
     # replication by default.
     if out_sharding is None:

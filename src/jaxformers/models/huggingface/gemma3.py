@@ -812,18 +812,51 @@ def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
     pass
 
 
+def _resolve_config(
+    config: Config | None,
+    model_id: str | None,
+    local_dir: str | None = None,
+) -> Config:
+    if (config is None) == (model_id is None):
+        raise ValueError(
+            "Exactly one of `config` or `model_id` must be provided to gemma3.init()."
+        )
+
+    if config is not None:
+        if not isinstance(config, PreTrainedConfig):
+            raise TypeError(f"Expected HF config, got {type(config)!r}")
+        return config
+
+    model_source: str | Path = model_id
+    if local_dir is not None:
+        local_path = Path(local_dir).expanduser() / model_id
+        if local_path.exists():
+            model_source = local_path
+
+    config = AutoConfig.from_pretrained(model_source)
+    if not isinstance(config, PreTrainedConfig):
+        raise TypeError(f"Expected HF config, got {type(config)!r}")
+    return config
+
+
 def init(
-    config: Config,
-    parallel_dims: ParallelDims,
+    config: Config | None = None,
+    parallel_dims: ParallelDims | None = None,
     devices: list | None = None,
     multihost: bool = False,
     additional_config: AdditionalConfig | None = None,
     param_dtype: jnp.dtype = jnp.bfloat16,
     *,
+    local_dir: str | None = None,
     rngs: PRNGKeyArray,
     initializers: dict[str, Initializer] | None = None,
     tokenizer=None,
+    model_id: str | None = None,
 ) -> Model:
+    config = _resolve_config(config, model_id, local_dir)
+    if parallel_dims is None:
+        raise ValueError("`parallel_dims` must be provided to gemma3.init().")
+
     additional_config = {
         **DEFAULT_ADDITIONAL_CONFIG,
         **(additional_config or {}),

@@ -1,3 +1,4 @@
+from beartype.vale import IsInstance
 import dataclasses
 import sys
 import time
@@ -23,12 +24,13 @@ from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model, prepare_weights as prepare_model_weights
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
-from jaxformers.optimizers import make_optimizer, make_scheduler
+from jaxformers.optimizers import make_optimizer
+from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
-DEFAULT_AUX = {"loss": (0, 0), "token": 0, "batch": 0}
+DEFAULT_AUX = {"loss": (0.0, 0), "token": 0, "batch": 0}
 
 
 def _preparse_absl_flags() -> None:
@@ -59,7 +61,7 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
+def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
@@ -120,13 +122,13 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
 
     token_count = aux["token"]
-    inv_token_count = (1 / token_count).astype(jnp.bfloat16)
+    inv_token_count = (1 / token_count).astype(config.forward_dtype)
     grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
 
     updates, nst = model.tx.update(
         grad, model.opt_state, model.weights, count=token_count
     )
-    nweights = tree_util.apply_updates(model.weights, updates)
+    nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
     callback_state = model.callback_state
     if model.callback_state is not None:
         callback_state = model.callbacks.update(
@@ -147,14 +149,26 @@ def eval(model, eval_ds):
     raise NotImplementedError
 
 
+
 def process_aux(accum_aux: dict[str, Any], namespace=""):
     def finalize(v: Any) -> Any:
         if isinstance(v, tuple):
-            return v[0] / v[1]
+            numer, denom = v
+            return numer / denom if denom else 0.0
         return v
+    prefix = f"{namespace}/" if namespace else ""
+    return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
 
-    return {f"{namespace}/{k}": finalize(v) for k, v in accum_aux.items()}
 
+def _to_host(tree):
+    tree = jax.device_get(tree)
+    def _item(value):
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return value.item()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+    return jtu.tree_map(_item, tree)
 
 def add_aux(accum_aux, aux):
     is_tuple = lambda x: isinstance(x, tuple)
@@ -163,11 +177,11 @@ def add_aux(accum_aux, aux):
         method = DEFAULT_REDUCED[jtu.keystr(path, simple=True)]
         match method:
             case "max":
-                return jnp.maximum(accum_leaf, leaf)
+                return max(accum_leaf, leaf)
             case "sum":
                 return accum_leaf + leaf
             case "min":
-                return jnp.minimum(accum_leaf, leaf)
+                return min(accum_leaf, leaf)
             case "mean":
                 return (accum_leaf[0] + leaf[0], accum_leaf[1] + leaf[1])
 
@@ -192,6 +206,7 @@ def train(
     train_ds,
     eval_ds,
     logger,
+    *,
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
@@ -228,7 +243,7 @@ def train(
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(eval_aux)
+                processed_aux = process_aux(jax.device_get(eval_aux))
 
             try:
                 batch = next(train_iterator)
@@ -255,7 +270,7 @@ def train(
                         partial(train_step, config),
                         donate_argnums=(0,),
                     )
-                    lower = train_step_jit.lower(model, batch, loop_rngs)
+                    lower = train_step_jit.lower(model, batch, rngs = loop_rngs)
                     train_step_fn = lower.compile()
                     first_compile_time = time.monotonic() - start_time
 
@@ -270,14 +285,14 @@ def train(
                         to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, loop_rngs)
+                    model, aux = train_step_fn(model, batch,  rngs = loop_rngs)
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                 ):
-                    model, aux = train_step_fn(model, batch, loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs = loop_rngs)
 
             callback_output = {}
             if model.callback_state is not None:
@@ -287,8 +302,9 @@ def train(
                     aux,
                 )
                 model = dataclasses.replace(model, callback_state=callback_state)
-            global_aux = add_aux(global_aux, aux)
-            processed_aux = process_aux(aux, "step")
+            host_aux = _to_host(aux)
+            global_aux = add_aux(global_aux, host_aux)
+            processed_aux = process_aux(host_aux, "step")
             cum_processed_aux = process_aux(global_aux, "cum")
             if jax.process_index() == 0:
                 logger.log(processed_aux, step=step)
@@ -344,10 +360,17 @@ def main(config: sws.FinalConfig):
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
-        rngs = jax.random.key(config.train_seed) if config.train_seed else None
-        model = make_model(config.model_name, config.init_model, config.model.to_dict())
-        scheduler = make_scheduler(config.lr_scheduler_name, config.learning_rate)
-        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=rngs)
+        rngs = jax.random.key(config.seed) if config.seed else None
+        model_rngs, lora_rngs, train_rngs = jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
+        model = make_model(config.model_name, config.init_model, config.model.to_dict(), rngs = model_rngs)
+        scheduler_config = config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
+        scheduler = make_scheduler(
+            config.lr_scheduler_name,
+            config.learning_rate,
+            config.max_train_step,
+            scheduler_config=scheduler_config,
+        )
+        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs)
         model = prepare_model_weights(config.model_name, model)
         t0 = time.monotonic()
         model = make_optimizer(
@@ -373,7 +396,7 @@ def main(config: sws.FinalConfig):
             config.train_loader.to_dict(),
         )
         eval_ds = None
-        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs)
+        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs = train_rngs)
         return metrics
     finally:
         if logger is not None:

@@ -36,12 +36,12 @@ def combine(left, right, is_leaf=None):
     return jtu.tree_map(_combine, left, right, is_leaf=_is_leaf)
 
 
-def apply_updates(weights, updates):
+def apply_updates(weights, updates, dtype):
     def _f(w, u):
         if u is None:
             return w
         else:
-            return w + u
+            return (w + u).astype(dtype)
 
     is_none = lambda x: x is None
     return jtu.tree_map(_f, weights, updates, is_leaf=is_none)

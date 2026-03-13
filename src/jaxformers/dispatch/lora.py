@@ -1,13 +1,11 @@
 """
 copied from quax.examples.lora
 """
-from enum import StrEnum, auto
-
-from jaxformers.models.huggingface.gemma3 import Initializer
 
 import fnmatch
 import time
 from dataclasses import replace
+from enum import auto, StrEnum
 from typing import cast
 
 import equinox as eqx
@@ -15,14 +13,15 @@ import jax
 import jax.core
 import jax.extend.core as jexc
 import jax.lax as lax
-from jax import P
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import quax
+from jax import P
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.modeling_utils import Model
+from jaxformers.models.huggingface.gemma3 import Initializer
 from jaxformers.print_utils import tree_pformat
 
 

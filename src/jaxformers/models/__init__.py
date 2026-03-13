@@ -1,6 +1,7 @@
 import dataclasses
 import importlib
 from enum import StrEnum, auto
+from jaxtyping import PRNGKeyArray
 
 
 class InitMethod(StrEnum):
@@ -13,6 +14,8 @@ def make_model(
     model_name: str,
     init_method: InitMethod | str | None,
     model_config: dict,
+    *,
+    rngs:PRNGKeyArray | None = None
 ):
     model_module = importlib.import_module(
         f"jaxformers.models.{model_name}"
@@ -21,7 +24,7 @@ def make_model(
     if init_method in (None, InitMethod.PRETRAINED, "pretrained"):
         model = model_module.load(**model_config)
     elif init_method in (InitMethod.RANDOM, "random"):
-        model = model_module.init(**model_config)
+        model = model_module.init(**model_config, rngs = rngs)
     elif init_method in (InitMethod.PYTREE, "pytree"):
         model = model_module.load_pytree(**model_config)
     else:

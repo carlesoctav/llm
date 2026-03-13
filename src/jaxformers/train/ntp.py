@@ -23,7 +23,8 @@ from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model, prepare_weights as prepare_model_weights
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
-from jaxformers.optimizers import make_optimizer, make_scheduler
+from jaxformers.optimizers import make_optimizer
+from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 
 
@@ -59,7 +60,7 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
+def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     def loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
@@ -120,13 +121,13 @@ def train_step(config: sws.FinalConfig, model: Model, batch, rngs):
     (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
 
     token_count = aux["token"]
-    inv_token_count = (1 / token_count).astype(jnp.bfloat16)
+    inv_token_count = (1 / token_count).astype(config.forward_dtype)
     grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
 
     updates, nst = model.tx.update(
         grad, model.opt_state, model.weights, count=token_count
     )
-    nweights = tree_util.apply_updates(model.weights, updates)
+    nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
     callback_state = model.callback_state
     if model.callback_state is not None:
         callback_state = model.callbacks.update(
@@ -192,6 +193,7 @@ def train(
     train_ds,
     eval_ds,
     logger,
+    *,
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
@@ -255,7 +257,7 @@ def train(
                         partial(train_step, config),
                         donate_argnums=(0,),
                     )
-                    lower = train_step_jit.lower(model, batch, loop_rngs)
+                    lower = train_step_jit.lower(model, batch, rngs = loop_rngs)
                     train_step_fn = lower.compile()
                     first_compile_time = time.monotonic() - start_time
 
@@ -270,14 +272,14 @@ def train(
                         to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, loop_rngs)
+                    model, aux = train_step_fn(model, batch,  rngs = loop_rngs)
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                 ):
-                    model, aux = train_step_fn(model, batch, loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs = loop_rngs)
 
             callback_output = {}
             if model.callback_state is not None:
@@ -344,10 +346,17 @@ def main(config: sws.FinalConfig):
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
-        rngs = jax.random.key(config.train_seed) if config.train_seed else None
-        model = make_model(config.model_name, config.init_model, config.model.to_dict())
-        scheduler = make_scheduler(config.lr_scheduler_name, config.learning_rate)
-        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=rngs)
+        rngs = jax.random.key(config.seed) if config.seed else None
+        model_rngs, lora_rngs, train_rngs = jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
+        model = make_model(config.model_name, config.init_model, config.model.to_dict(), rngs = model_rngs)
+        scheduler_config = config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
+        scheduler = make_scheduler(
+            config.lr_scheduler_name,
+            config.learning_rate,
+            config.max_train_step,
+            scheduler_config=scheduler_config,
+        )
+        model = make_lora(model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs)
         model = prepare_model_weights(config.model_name, model)
         t0 = time.monotonic()
         model = make_optimizer(
@@ -373,7 +382,7 @@ def main(config: sws.FinalConfig):
             config.train_loader.to_dict(),
         )
         eval_ds = None
-        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs)
+        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs = train_rngs)
         return metrics
     finally:
         if logger is not None:

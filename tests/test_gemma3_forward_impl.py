@@ -3,6 +3,7 @@ from copy import deepcopy
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from transformers import Gemma3TextConfig
 
 from jaxformers.dispatch.lora import make_lora
@@ -116,3 +117,66 @@ def test_scan_block_forward_handles_unstacked_lora_weights():
 
     assert lora_model.is_lora
     assert hidden.shape == (2, 8, config.hidden_size)
+
+
+def test_init_accepts_model_id_without_explicit_config(monkeypatch):
+    config = Gemma3TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        sliding_window=4,
+        sliding_window_pattern=3,
+    )
+    called_with = []
+
+    def fake_from_pretrained(model_source):
+        called_with.append(model_source)
+        return config
+
+    monkeypatch.setattr(gemma3.AutoConfig, "from_pretrained", fake_from_pretrained)
+
+    model = gemma3.init(
+        model_id="google/gemma-3-1b-it",
+        parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
+        devices=jax.devices("cpu"),
+        additional_config={
+            "attn_implementation": "eager",
+            "sequence_parallelism": False,
+        },
+        param_dtype=jnp.float32,
+        rngs=jax.random.key(0),
+        tokenizer=None,
+    )
+
+    assert called_with == ["google/gemma-3-1b-it"]
+    assert model.config is config
+    assert model.weights["model.embed_tokens.weight"].shape == (
+        config.vocab_size,
+        config.hidden_size,
+    )
+
+
+def test_init_rejects_config_and_model_id_together():
+    config = Gemma3TextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        sliding_window=4,
+        sliding_window_pattern=3,
+    )
+
+    with pytest.raises(ValueError, match="Exactly one of `config` or `model_id`"):
+        gemma3.init(
+            config=config,
+            model_id="google/gemma-3-1b-it",
+            parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
+            rngs=jax.random.key(0),
+        )

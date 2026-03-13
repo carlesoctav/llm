@@ -5,17 +5,12 @@ from jaxformers import tree_util
 from jaxformers.optimizer_utils import mask_trainable_lora
 
 
-def make_scheduler(scheduler_name: str | None, learning_rate):
-    if scheduler_name in (None, "constant"):
-        return learning_rate
-
-    raise NotImplementedError(
-        f"Unsupported lr scheduler {scheduler_name!r}; only constant is supported."
-    )
 
 
 def make_optimizer(optimizer_name: str, model, scheduler, optimizer_config: dict):
     optimizer_module = importlib.import_module(f"jaxformers.optimizers.{optimizer_name}")
+    if not getattr(optimizer_module, "make"):
+        raise ValueError(f"{optimizer_module!r} does not have a 'make' method; please ensure you're using the correct optimizer_name.")
 
     train_mask = None
     if model.is_lora:

@@ -23,7 +23,7 @@ def custom_scale_by_learning_rate(
         return optax.identity()
     m = -1 if flip_sign else 1
     if callable(learning_rate):
-        step_size_fn = lambda count: m * learning_rate(count)
+        step_size_fn = lambda count: learning_rate(count)
 
         def init_fn(params):
             del params
@@ -33,7 +33,7 @@ def custom_scale_by_learning_rate(
 
         def update_fn(updates, state, params=None):
             step_size = step_size_fn(state.count)
-            updates = jtu.tree_map(lambda g: jnp.array(step_size) * g, updates)
+            updates = jtu.tree_map(lambda g: jnp.array(m * step_size) * g, updates)
             return updates, ScaleByLearningRateState(count = optax.safe_increment(state.count), learning_rate = jnp.array(step_size))
 
         return optax.GradientTransformation(init_fn, update_fn)

@@ -16,7 +16,7 @@ def get_config():
     config.project_name = ""
     config.dir = "gs://carles-git-good"
     config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
-    config.train_seed = 42
+    config.seed = 42
     config.eval_every = None
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16

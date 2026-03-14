@@ -99,7 +99,7 @@ def get_config():
     # see orbax checkpointmanager options
     config.use_checkpoint = False
     config.checkpoint_options.save_interval_steps = 2500
-    config.checkpoint_options.max_to_keep = 1
+    config.checkpoint_options.max_to_keep = 4
 
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name

@@ -1,11 +1,14 @@
-from jaxformers.utils import GeneralInterface
+from functools import partial
+from typing import Protocol
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, PRNGKeyArray
 import tokamax
+from jaxtyping import Array, Bool, Float, PRNGKeyArray
+
+from jaxformers.modeling_utils import logical_to_physical, make_mesh
 from jaxformers.ops.attention import chunked_manual_dot_product_attention
-from typing import Protocol
-from functools import partial
+from jaxformers.utils import GeneralInterface
 
 
 class AttentionImpl(Protocol):
@@ -99,3 +102,64 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     }
 
 ATTENTION_INTERFACE = AttentionInterface()
+
+
+def _get_cache_sharding(config):
+    rules = getattr(config, "sharding_rules", None)
+    if rules is None:
+        return None
+
+    mesh = getattr(config, "mesh", None)
+    if mesh is None:
+        parallel_dims = getattr(config, "parallel_dims", None)
+        if parallel_dims is None:
+            return None
+        mesh = make_mesh(parallel_dims)
+
+    return jax.NamedSharding(
+        mesh,
+        logical_to_physical(("batch", "context", "model", "none"), rules),
+    )
+
+
+def init_kv_cache(
+    config,
+    *,
+    batch_size: int,
+    cache_len: int,
+    dtype: jnp.dtype,
+):
+    num_layers = int(getattr(config, "num_hidden_layers"))
+    num_attention_heads = int(getattr(config, "num_attention_heads"))
+    num_kv_heads = int(getattr(config, "num_key_value_heads", num_attention_heads))
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is None:
+        head_dim = int(getattr(config, "hidden_size") // num_attention_heads)
+    head_dim = int(head_dim)
+    cache_shape = (batch_size, cache_len, num_kv_heads, head_dim)
+    sharding = _get_cache_sharding(config)
+
+    def make_layer():
+        key_cache = jnp.zeros(cache_shape, dtype=dtype)
+        value_cache = jnp.zeros(cache_shape, dtype=dtype)
+        if sharding is not None:
+            try:
+                key_cache = jax.device_put(key_cache, sharding)
+                value_cache = jax.device_put(value_cache, sharding)
+            except ValueError:
+                pass
+        return (key_cache, value_cache)
+
+    return tuple(make_layer() for _ in range(num_layers))
+
+
+def update_kv_cache(key, value, cache, pos):
+    cache_key, cache_value = cache
+    try:
+        key = jax.device_put(key, cache_key.sharding)
+        value = jax.device_put(value, cache_value.sharding)
+    except Exception:
+        pass
+    cache_key = jax.lax.dynamic_update_slice_in_dim(cache_key, key, pos, axis=1)
+    cache_value = jax.lax.dynamic_update_slice_in_dim(cache_value, value, pos, axis=1)
+    return cache_key, cache_value, (cache_key, cache_value)

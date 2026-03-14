@@ -1,6 +1,7 @@
 import dataclasses
 import sys
 import time
+from contextlib import nullcontext
 from functools import partial
 from typing import Any
 
@@ -224,93 +225,95 @@ def train(
             dynamic_ncols=True,
         )
 
+    mesh_ctx = jax.set_mesh(model.mesh) if model.mesh is not None else nullcontext()
     try:
-        while step < config.max_train_step:
-            if not skip_eval and (step % config.eval_every) == 0:
-                eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(eval_aux)
+        with mesh_ctx:
+            while step < config.max_train_step:
+                if not skip_eval and (step % config.eval_every) == 0:
+                    eval_aux = eval(model, eval_ds)
+                    processed_aux = process_aux(eval_aux)
 
-            try:
-                batch = next(train_iterator)
-                if warn_assitant_loss and "assistant_masks" in batch["inputs"]:
-                    check_ast_token = np.any(batch["inputs"]["assistant_masks"])
-                    if not check_ast_token and jax.process_index() == 0:
-                        raise RuntimeError(
-                            "assistant_loss=True was requested but no assistant token was found. "
-                            "This can occur if the chat template does not distinguish assistant vs user tokens "
-                            "or if truncation (max_length) removed the assistant token. "
-                            "please fix this issue before proceeding"
-                        )
-                    warn_assitant_loss = False
-            except StopIteration:
-                if jax.process_index() == 0:
-                    print("dataloader is exhausted")
-                break
-
-            loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
-            if first_step:
-                with jax.named_scope("compile train step"):
-                    start_time = time.monotonic()
-                    train_step_jit = jax.jit(
-                        partial(train_step, config),
-                        donate_argnums=(0,),
-                    )
-                    lower = train_step_jit.lower(model, batch, loop_rngs)
-                    train_step_fn = lower.compile()
-                    first_compile_time = time.monotonic() - start_time
-
+                try:
+                    batch = next(train_iterator)
+                    if warn_assitant_loss and "assistant_masks" in batch["inputs"]:
+                        check_ast_token = np.any(batch["inputs"]["assistant_masks"])
+                        if not check_ast_token and jax.process_index() == 0:
+                            raise RuntimeError(
+                                "assistant_loss=True was requested but no assistant token was found. "
+                                "This can occur if the chat template does not distinguish assistant vs user tokens "
+                                "or if truncation (max_length) removed the assistant token. "
+                                "please fix this issue before proceeding"
+                            )
+                        warn_assitant_loss = False
+                except StopIteration:
                     if jax.process_index() == 0:
-                        print("compile time: ", first_compile_time)
-                        memory_stats = print_compiled_memory_stats(
-                            train_step_fn.memory_analysis()
+                        print("dataloader is exhausted")
+                    break
+
+                loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
+                if first_step:
+                    with jax.named_scope("compile train step"):
+                        start_time = time.monotonic()
+                        train_step_jit = jax.jit(
+                            partial(train_step, config),
+                            donate_argnums=(0,),
                         )
-                        cost = print_flops(train_step_fn.cost_analysis())
+                        lower = train_step_jit.lower(model, batch, loop_rngs)
+                        train_step_fn = lower.compile()
+                        first_compile_time = time.monotonic() - start_time
 
-                        to_log_later.update(memory_stats)
-                        to_log_later.update(cost)
+                        if jax.process_index() == 0:
+                            print("compile time: ", first_compile_time)
+                            memory_stats = print_compiled_memory_stats(
+                                train_step_fn.memory_analysis()
+                            )
+                            cost = print_flops(train_step_fn.cost_analysis())
 
-                    program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, loop_rngs)
-                    first_step = False
-            else:
-                with (
-                    jax.named_scope("train_step"),
-                    jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                ):
-                    model, aux = train_step_fn(model, batch, loop_rngs)
+                            to_log_later.update(memory_stats)
+                            to_log_later.update(cost)
 
-            callback_output = {}
-            if model.callback_state is not None:
-                callback_output, callback_state = model.callbacks.process(
-                    {},
-                    model.callback_state,
-                    aux,
-                )
-                model = dataclasses.replace(model, callback_state=callback_state)
-            global_aux = add_aux(global_aux, aux)
-            processed_aux = process_aux(aux, "step")
-            cum_processed_aux = process_aux(global_aux, "cum")
-            if jax.process_index() == 0:
-                logger.log(processed_aux, step=step)
-                logger.log(cum_processed_aux, step=step)
-                logger.log(callback_output, step=step)
-                if pbar is not None:
-                    pbar.set_postfix(
-                        pbar_display(
-                            {**cum_processed_aux, **processed_aux, **callback_output}
-                        )
+                        program_wall_t0 = time.monotonic()
+                        model, aux = train_step_fn(model, batch, loop_rngs)
+                        first_step = False
+                else:
+                    with (
+                        jax.named_scope("train_step"),
+                        jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
+                    ):
+                        model, aux = train_step_fn(model, batch, loop_rngs)
+
+                callback_output = {}
+                if model.callback_state is not None:
+                    callback_output, callback_state = model.callbacks.process(
+                        {},
+                        model.callback_state,
+                        aux,
                     )
-                    pbar.update(1)
-            if need_save:
-                ckpt_manager.save(
-                    step,
-                    args=ocp.args.Composite(
-                        weights=ocp.args.StandardSave(model.weights),
-                        opt_state=ocp.args.StandardSave(model.opt_state),
-                        step=ocp.args.JsonSave(int(step)),
-                    ),
-                )
-            step += 1
+                    model = dataclasses.replace(model, callback_state=callback_state)
+                global_aux = add_aux(global_aux, aux)
+                processed_aux = process_aux(aux, "step")
+                cum_processed_aux = process_aux(global_aux, "cum")
+                if jax.process_index() == 0:
+                    logger.log(processed_aux, step=step)
+                    logger.log(cum_processed_aux, step=step)
+                    logger.log(callback_output, step=step)
+                    if pbar is not None:
+                        pbar.set_postfix(
+                            pbar_display(
+                                {**cum_processed_aux, **processed_aux, **callback_output}
+                            )
+                        )
+                        pbar.update(1)
+                if need_save:
+                    ckpt_manager.save(
+                        step,
+                        args=ocp.args.Composite(
+                            weights=ocp.args.StandardSave(model.weights),
+                            opt_state=ocp.args.StandardSave(model.opt_state),
+                            step=ocp.args.JsonSave(int(step)),
+                        ),
+                    )
+                step += 1
 
     finally:
         to_log_later["program_time"] = time.monotonic() - program_wall_t0

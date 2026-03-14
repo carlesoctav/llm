@@ -23,6 +23,7 @@ from jaxformers.distributed.parallel import ParallelDims
 from jaxformers.masking_utils import (
     ATTENTION_MASK_INTERFACE,
     make_causal_mask,
+    make_decode_mask,
     make_sliding_window_causal_mask,
 )
 from jaxformers.modeling_utils import (
@@ -34,7 +35,7 @@ from jaxformers.modeling_utils import (
 )
 from jaxformers.scan_utils import make_scan_fwd
 
-from ...attention_utils import ATTENTION_INTERFACE
+from ...attention_utils import ATTENTION_INTERFACE, update_kv_cache
 from ...dispatch.einsum import einsum
 from ...distributed import (
     BATCH,
@@ -392,6 +393,32 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
             "sliding_attention": None,
         }
 
+    kv = kwargs.get("kv")
+    if kv is not None and input_embeds.shape[1] == 1:
+        cache_len = kv[0][0].shape[1]
+        full_mask = make_decode_mask(
+            batch_size=input_embeds.shape[0],
+            q_length=input_embeds.shape[1],
+            kv_length=cache_len,
+            pos=kwargs.get("pos", 0),
+        )
+        window_size = getattr(config, "sliding_window", None)
+        sliding_mask = (
+            full_mask
+            if window_size is None
+            else make_decode_mask(
+                batch_size=input_embeds.shape[0],
+                q_length=input_embeds.shape[1],
+                kv_length=cache_len,
+                pos=kwargs.get("pos", 0),
+                window_size=int(window_size),
+            )
+        )
+        return {
+            "full_attention": full_mask,
+            "sliding_attention": sliding_mask,
+        }
+
     if attention_mask is not None:
         attention_mask = attention_mask.astype(jnp.bool_)
 
@@ -447,6 +474,7 @@ def forward_layer(
     w: PyTree[Array, "LayerWeights"],
     layer_idx: Int[Array, ""] | int,
     rope_theta: Float[Array, ""] | float,
+    kv=None,
     pos=0,
     **inputs,
 ):
@@ -504,6 +532,12 @@ def forward_layer(
 
     q = apply_rope(q, rope_theta, pos)
     k = apply_rope(k, rope_theta, pos)
+
+    if kv is not None:
+        cache_k, cache_v, kv = update_kv_cache(k, v, kv, pos)
+        if x.shape[1] == 1:
+            k = cache_k
+            v = cache_v
 
     attn_output = attention_interface(
         q, k, v, mask=attention_mask, q_sharding=q_sharding
@@ -563,7 +597,7 @@ def forward_layer(
         config.rms_norm_eps,
     )
     x = residual + ffw
-    return x
+    return (x, kv) if kv is not None else x
 
 
 def forward_block(
@@ -573,22 +607,38 @@ def forward_block(
     layer_idx: Int[Array, " L"],
     rope_theta: Float[Array, " L"],
     is_sliding: Int[Array, " L"],
+    kv=None,
     pos=0,
     **inputs,
 ):
     block_size = int(layer_idx.shape[0])
+    next_kv = [] if kv is not None else None
     for block_idx in range(block_size):
         layer_weights = jax.tree.map(lambda leaf: leaf[block_idx], w)
-        x = layer_fwd(
-            x,
-            layer_weights,
-            layer_idx[block_idx],
-            rope_theta[block_idx],
-            pos=pos,
-            attention_mask=inputs["attention_mask"],
-            is_sliding=is_sliding[block_idx],
-        )
-    return x
+        layer_cache = None if kv is None else kv[block_idx]
+        if layer_cache is None:
+            x = layer_fwd(
+                x,
+                layer_weights,
+                layer_idx[block_idx],
+                rope_theta[block_idx],
+                pos=pos,
+                attention_mask=inputs["attention_mask"],
+                is_sliding=is_sliding[block_idx],
+            )
+        else:
+            x, layer_cache = layer_fwd(
+                x,
+                layer_weights,
+                layer_idx[block_idx],
+                rope_theta[block_idx],
+                kv=layer_cache,
+                pos=pos,
+                attention_mask=inputs["attention_mask"],
+                is_sliding=is_sliding[block_idx],
+            )
+            next_kv.append(layer_cache)
+    return (x, tuple(next_kv)) if next_kv is not None else x
 
 
 def forward_loop(
@@ -597,22 +647,38 @@ def forward_loop(
     weights: dict[str, Array],
     mask_mapping,
     pos: int,
+    kv=None,
 ):
     fwd = partial(forward_layer, config)
-    if config.additional_config["remat_layer"]:
+    if config.additional_config["remat_layer"] and kv is None:
         fwd = jax.remat(fwd)
 
+    next_kv = [] if kv is not None else None
     for layer_idx, attention_type in enumerate(get_layer_types(config)):
-        x = fwd(
-            x,
-            get_loop_layer_weights(weights, layer_idx),
-            layer_idx,
-            get_rope_theta(config, attention_type),
-            pos=pos,
-            attention_mask=mask_mapping,
-            is_sliding=attention_type == "sliding_attention",
-        )
-    return x
+        layer_cache = None if kv is None else kv[layer_idx]
+        if layer_cache is None:
+            x = fwd(
+                x,
+                get_loop_layer_weights(weights, layer_idx),
+                layer_idx,
+                get_rope_theta(config, attention_type),
+                pos=pos,
+                attention_mask=mask_mapping,
+                is_sliding=attention_type == "sliding_attention",
+            )
+        else:
+            x, layer_cache = fwd(
+                x,
+                get_loop_layer_weights(weights, layer_idx),
+                layer_idx,
+                get_rope_theta(config, attention_type),
+                kv=layer_cache,
+                pos=pos,
+                attention_mask=mask_mapping,
+                is_sliding=attention_type == "sliding_attention",
+            )
+            next_kv.append(layer_cache)
+    return x, tuple(next_kv) if next_kv is not None else None
 
 
 def forward_scan_layer(
@@ -707,6 +773,7 @@ def forward(
     config: Config,
     weights: PyTree[Array, "ModelWeights"],
     input_ids: Int[Array, "B T"],
+    kv: PyTree | None = None,
     pos: int = 0,
     dtype: jnp.dtype = jnp.float32,
     *,
@@ -730,15 +797,18 @@ def forward(
     mask_mapping = make_mask(
         config,
         x,
+        kv=kv,
+        pos=pos,
         **inputs,
     )
 
-    forward_impl = get_forward_impl(config)
+    return_kv = kv is not None
+    forward_impl = ForwardImpl.LOOP if return_kv else get_forward_impl(config)
     if forward_impl is not ForwardImpl.LOOP:
         weights = prepare_weights(config, weights, forward_impl)
 
     if forward_impl is ForwardImpl.LOOP:
-        x = forward_loop(config, x, weights, mask_mapping, pos)
+        x, kv = forward_loop(config, x, weights, mask_mapping, pos, kv=kv)
     elif forward_impl is ForwardImpl.SCAN_LAYER:
         x = forward_scan_layer(config, x, weights, mask_mapping, pos)
     elif forward_impl is ForwardImpl.SCAN_BLOCK:
@@ -759,7 +829,7 @@ def forward(
         x, logical_to_physical(("batch", "context", "none"), config.sharding_rules)
     )
 
-    return x
+    return (x, kv) if return_kv else x
 
 
 def embed(
@@ -978,6 +1048,7 @@ def init(
     config.additional_config = additional_config
     config.parallel_dims = parallel_dims
     config.sharding_rules = sharding_rules
+    config.mesh = mesh
     weights["model.norm.weight"] = init_param("model.norm.weight", (hidden_size,))
 
     return Model(
@@ -993,6 +1064,7 @@ def init(
             if getattr(config, "tie_word_embeddings", True)
             else "lm_head.weight"
         ),
+        mesh=mesh,
     )
 
 
@@ -1016,7 +1088,11 @@ def load(
         sequence_parallelism=additional_config["sequence_parallelism"],
     )
 
-    model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
+    local_path = Path(local_dir).expanduser() if local_dir is not None else None
+    if local_path is not None and (local_path / "config.json").exists():
+        model_ckpt_dir = local_path
+    else:
+        model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
     config = AutoConfig.from_pretrained(model_ckpt_dir)
     if not isinstance(config, PreTrainedConfig):
@@ -1048,6 +1124,7 @@ def load(
     config.additional_config = additional_config
     config.parallel_dims = parallel_dims
     config.sharding_rules = sharding_rules
+    config.mesh = mesh
 
     return Model(
         name=__name__,
@@ -1062,4 +1139,5 @@ def load(
             if getattr(config, "tie_word_embeddings", True)
             else "lm_head.weight"
         ),
+        mesh=mesh,
     )

@@ -1,5 +1,4 @@
 import typing as tp
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -113,6 +112,27 @@ def make_bool_interface(
             return (mask_output & padding_mask[:, None, :, None]).astype(jnp.bool)
     else:
         return mask_output.astype(jnp.bool)[:, None, :, :]
+
+
+def make_decode_mask(
+    *,
+    batch_size: int,
+    q_length: int,
+    kv_length: int,
+    pos: int | Array,
+    window_size: int | None = None,
+) -> Bool[Array, "..."]:
+    q_positions = jnp.asarray(pos, dtype=jnp.int32) + jnp.arange(
+        q_length, dtype=jnp.int32
+    )
+    kv_positions = jnp.arange(kv_length, dtype=jnp.int32)
+
+    mask = kv_positions[None, :] <= q_positions[:, None]
+    if window_size is not None and window_size > 0:
+        mask = mask & (kv_positions[None, :] > q_positions[:, None] - window_size)
+
+    mask = mask[None, None, :, :]
+    return jnp.broadcast_to(mask, (batch_size, 1, q_length, kv_length))
 
 
 class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):

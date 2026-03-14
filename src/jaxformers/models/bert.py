@@ -14,7 +14,6 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     PreTrainedConfig,
-    PreTrainedTokenizerBase,
 )
 
 from jaxformers.modeling_utils import (
@@ -447,8 +446,15 @@ def load(
                     weights[key] = arr
 
     return Model(
+        name=__name__,
         config=cfg,
         weights=weights,
         forward=partial(forward, cfg),
         tokenizer=tokenizer,
+        embed=partial(embed_input, cfg),
+        unembed=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            NotImplementedError("BERT model does not define an LM head.")
+        ),
+        lm_head_key="",
+        mesh=mesh,
     )

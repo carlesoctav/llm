@@ -1,5 +1,6 @@
+import copy
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
@@ -8,10 +9,12 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 from jax import P
+from jax.sharding import AxisType
 from jaxtyping import Bool, Float, PyTree
 from safetensors import safe_open
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
+from jaxformers.distributed.parallel import mutate_sharding_rule_parallel_dims
 from jaxformers.print_utils import tree_pformat
 
 
@@ -45,6 +48,15 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "forward_impl": "loop",
 }
 
+DEFAULT_SHARDING_RULES = {
+    "none": None,
+    "batch": ("dp_replicate", "dp_shard"),
+    "fsdp": ("dp_shard", "cp"),
+    "model": ("tp",),
+    "sequence": ("tp", "cp"),
+    "context": ("cp",),
+}
+
 
 @partial(
     jtu.register_dataclass,
@@ -66,6 +78,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "unembed",
         "lm_head_key",
         "callbacks",
+        "mesh",
     ],
 )
 @dataclass
@@ -78,6 +91,7 @@ class Model:
     unembed: Callable
     tokenizer: PreTrainedTokenizerFast
     lm_head_key: str
+    mesh: Any | None = None
 
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None
@@ -91,6 +105,69 @@ class Model:
 
     def __repr__(self):
         return self.name + "\n" + tree_pformat(self.weights)
+
+
+def make_mesh(parallel_dims, devices: list | None = None):
+    axis_shapes = tuple(parallel_dims.values())
+    axis_names = tuple(parallel_dims.keys())
+    axis_types = tuple(AxisType.Explicit for _ in axis_names)
+    return jax.make_mesh(
+        axis_shapes,
+        axis_names,
+        axis_types=axis_types,
+        devices=devices,
+    )
+
+
+def clone_model_with_mesh(
+    model: Model,
+    parallel_dims,
+    *,
+    devices: list | None = None,
+) -> Model:
+    config = copy.deepcopy(model.config)
+    additional_config = {
+        **DEFAULT_ADDITIONAL_CONFIG,
+        **getattr(config, "additional_config", {}),
+    }
+    sharding_rules = mutate_sharding_rule_parallel_dims(
+        dict(DEFAULT_SHARDING_RULES),
+        parallel_dims,
+        sequence_parallelism=additional_config["sequence_parallelism"],
+    )
+    config.additional_config = additional_config
+    config.parallel_dims = parallel_dims
+    config.sharding_rules = sharding_rules
+    mesh = make_mesh(
+        parallel_dims,
+        devices=devices,
+    )
+    config.mesh = mesh
+
+    def _rebind(fn: Callable):
+        if isinstance(fn, partial):
+            args = fn.args
+            if args:
+                return partial(
+                    fn.func,
+                    config,
+                    *args[1:],
+                    **(fn.keywords or {}),
+                )
+            return partial(fn.func, config, **(fn.keywords or {}))
+        bound_fn = getattr(fn, "__func__", None)
+        if bound_fn is not None:
+            return partial(bound_fn, config)
+        return fn
+
+    return replace(
+        model,
+        config=config,
+        forward=_rebind(model.forward),
+        embed=_rebind(model.embed),
+        unembed=_rebind(model.unembed),
+        mesh=mesh,
+    )
 
 
 def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):

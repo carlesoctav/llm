@@ -66,9 +66,8 @@ def mutate_sharding_rule_parallel_dims(
 
     return rules
 
-
-def check_mesh_axis_for_inference(parallel_dims: ParallelDims):
-    # if parallel_dims["dp_shard"] > 1:
-    #     raise ValueError("not recommended to shard across dp_shard for inference")
+def check_mesh_axis_for_rollout(parallel_dims: ParallelDims):
+    if parallel_dims["dp_shard"] > 1:
+        raise ValueError("not recommended to shard across dp_shard for inference")
     if parallel_dims["cp"] > 1:
         raise ValueError("context parallelism not supported for inference")

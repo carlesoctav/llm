@@ -48,7 +48,7 @@ ModelWeights = TypeVar("ModelWeights")
 AxisName = str | tuple[str, ...] | None
 
 
-SHARDING_RULES = {
+LOGICAL_TO_PHYSICAL_SHARDING_RULES = {
     "none": None,
     "batch": BATCH,
     "fsdp": FSDP,
@@ -496,7 +496,7 @@ def init(
     }
 
     sharding_rules = mutate_sharding_rule_parallel_dims(
-        dict(SHARDING_RULES),
+        dict(LOGICAL_TO_PHYSICAL_SHARDING_RULES),
         parallel_dims,
         sequence_parallelism=additional_config["sequence_parallelism"],
     )
@@ -678,7 +678,7 @@ def load(
     }
 
     sharding_rules = mutate_sharding_rule_parallel_dims(
-        dict(SHARDING_RULES),
+        dict(LOGICAL_TO_PHYSICAL_SHARDING_RULES),
         parallel_dims,
         sequence_parallelism=additional_config["sequence_parallelism"],
     )
@@ -715,6 +715,7 @@ def load(
     config.additional_config = additional_config
     config.parallel_dims = parallel_dims
     config.sharding_rules = sharding_rules
+    config.sharding_rules_before_mutate = LOGICAL_TO_PHYSICAL_SHARDING_RULES
 
     return Model(
         name=__name__,

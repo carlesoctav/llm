@@ -1,10 +1,14 @@
 import dataclasses
 import importlib
+import time
+from functools import partial
 
 from jaxformers import tree_util
+from jaxformers.benchmark_utils import print_timing
 from jaxformers.optimizer_utils import mask_trainable_lora
 
 
+@print_timing
 def make_optimizer(optimizer_name: str, model, scheduler, optimizer_config: dict):
     optimizer_module = importlib.import_module(
         f"jaxformers.optimizers.{optimizer_name}"

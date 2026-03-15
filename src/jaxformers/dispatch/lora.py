@@ -6,6 +6,7 @@ import fnmatch
 import time
 from dataclasses import replace
 from enum import auto, StrEnum
+from functools import partial
 from typing import cast
 
 import equinox as eqx
@@ -20,6 +21,7 @@ import quax
 from jax import P
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
+from jaxformers.benchmark_utils import print_timing
 from jaxformers.modeling_utils import Model
 from jaxformers.print_utils import tree_pformat
 
@@ -167,6 +169,7 @@ def random_weight(key, shape):
     return jax.random.normal(key, shape)
 
 
+@print_timing
 def loraify(
     model: Model,
     weights_path: list[str],
@@ -213,9 +216,7 @@ def loraify(
             return weight
 
     weights = jtu.tree_map_with_path(_loraify, model.weights)
-    diff = time.monotonic() - t0
     print("Model weights converted to LoRA:", tree_pformat(loraify_weight))
-    print(f"loraify takes {diff}s")
     return replace(
         model,
         weights=weights,

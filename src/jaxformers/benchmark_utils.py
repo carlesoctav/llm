@@ -1,3 +1,8 @@
+import functools
+import time
+from contextlib import contextmanager
+
+
 def print_compiled_memory_stats(compiled_stats):
     if compiled_stats is None:
         return
@@ -30,3 +35,15 @@ def print_flops(compiled_stats):
     tflops = compiled_stats.get("flops") / 1e12
     print(f"estimated tflops per step: {tflops}")
     return {"tflops": tflops}
+
+
+def print_timing(wrapped, name: str | None = None):
+    name = name or wrapped.__name__
+    @functools.wraps(wrapped)
+    def wrapper(*args, **kwargs):
+        t0 = time.monotonic()
+        out = wrapped(*args, **kwargs)
+        print(f"{name} run in {time.monotonic() - t0:.2f} seconds")
+        return out
+
+    return wrapper

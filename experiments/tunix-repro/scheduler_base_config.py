@@ -4,6 +4,7 @@ import sws
 def get_config():
     config = sws.Config()
 
+    config.learning_rate = 1e-5
     config.lr_scheduler_name = "wsds"
     config.lr_scheduler.min_lr_ratio = 0.1
     config.lr_scheduler.warmup = 0.01

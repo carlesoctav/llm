@@ -16,12 +16,11 @@ from grain import (
 )
 from jax.sharding import Mesh, PartitionSpec
 
-from jaxformers.data.transforms import DatasetTransforms
-
-from .huggingface import (
+from jaxformers.data.source.huggingface import (
     HuggingFaceSourceIterDataset,
     HuggingFaceSourceMapDataset,
 )
+from jaxformers.data.transforms import DatasetTransforms
 
 
 Batch = tp.Any
@@ -107,7 +106,7 @@ class IterDatasetWithInputSpec(IterDataset[_T]):
         )
 
 
-def make_dataloader(
+def make(
     datasets: Sequence[IterDataset | MapDataset],
     transforms: Sequence[
         grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms
@@ -155,6 +154,11 @@ def make_dataloader(
     )
 
     for ds in datasets:
+        if isinstance(ds, IterableDataset):
+            ds = HuggingFaceSourceIterDataset(ds)
+        elif isinstance(ds, Dataset):
+            ds = HuggingFaceSourceMapDataset(ds)
+
         if not transforms:
             raise ValueError("No operations provided for dataset preparation")
 
@@ -200,9 +204,6 @@ def make_dataloader(
             )
 
         for op in transforms:
-            # NOTES: pretty much all transformation just wrapping the dataset by another dataset class with new __iter__ and __next__ (the iterator part)
-            # so by this we shouldnt differentiate between BaseDatasetTransform and grain transforms
-            # need to think more about makeing single interface for all transformation
             if isinstance(op, DatasetTransforms):
                 ds = op(ds)
             elif isinstance(op, grain_transforms.RandomMap):

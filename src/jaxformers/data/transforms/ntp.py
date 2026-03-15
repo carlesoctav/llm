@@ -1,16 +1,20 @@
 import dataclasses as dc
-import os
 import typing as tp
 from dataclasses import dataclass
+from enum import auto, StrEnum
 
 import grain
-import jax.tree_util as jtu
-import numpy as np
 from grain import transforms as grain_transforms
 from jaxtyping import Array
 from transformers import PreTrainedTokenizerBase
 
-from jaxformers.data.transforms import DatasetTransforms
+from .base import DatasetTransforms
+
+
+class DataType(StrEnum):
+    CHAT = auto()
+    TEXT = auto()
+    TOKEN = auto()
 
 
 @dataclass
@@ -41,17 +45,16 @@ class TokenizeText(grain_transforms.Map):
     column: str
     tokenizer: PreTrainedTokenizerBase
     packing: bool
-    is_chat: bool
+    data_type: str
     chat_template: str | None = None
-    assistant_loss: bool = (False,)
+    assistant_loss: bool = False
     max_length: int | None = None
 
     def map(self, features: dict[str, tp.Any]) -> dict[str, Array]:
         if self.column not in features:
             raise KeyError(f"Column {self.column!r} not found in element")
         text = features[self.column]
-        output = {}
-        if self.is_chat:
+        if self.data_type == DataType.CHAT:
             encoded = self.tokenizer.apply_chat_template(
                 text,
                 truncation=self.max_length is not None,
@@ -92,16 +95,14 @@ class NestInputs(grain_transforms.Map):
             inputs["segment_ids"] = features["input_ids_segment_ids"]
         if "assistant_masks" in features:
             inputs["assistant_masks"] = features["assistant_masks"]
-
         return {"inputs": inputs, "labels": features["labels"]}
 
 
-def transforms(
+def make(
     column: str,
     max_length: int,
-    tokenizer: PreTrainedTokenizerBase,
-    is_tokenized: bool,
-    is_chat: bool = False,
+    data_type: str | None = None,
+    tokenizer: PreTrainedTokenizerBase | None = None,
     chat_template_path: str | None = None,
     assistant_loss: bool = False,
     packing: bool = False,
@@ -109,26 +110,35 @@ def transforms(
 ) -> list[grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms]:
     """Build the list of transforms required for next-token prediction."""
 
+    if data_type is None:
+        raise ValueError("data_type is required")
+    if data_type not in tuple(DataType):
+        raise ValueError(
+            f"Unsupported data_type {data_type!r}. Expected one of {tuple(DataType)!r}."
+        )
+    if data_type != DataType.TOKEN and tokenizer is None:
+        raise ValueError(f"tokenizer is required unless data_type={DataType.TOKEN!r}")
+
     transforms = []
     chat_template = None
-    if chat_template_path:
+    if data_type == DataType.CHAT and chat_template_path:
         with open(chat_template_path) as f:
             chat_template = f.read()
 
-    if chat_template:
+    if data_type == DataType.CHAT and chat_template:
         preview = chat_template.replace("\n", "\\n")
         preview_short = (preview[:120] + "...") if len(preview) > 120 else preview
         print(f"Using custom chat_template (preview): '{preview_short}'")
-    else:
+    elif data_type == DataType.CHAT:
         print("No custom chat_template provided; using default chat formatting.")
 
-    if not is_tokenized:
+    if data_type != DataType.TOKEN:
         transforms.append(
             TokenizeText(
                 column=column,
                 tokenizer=tokenizer,
                 max_length=max_length,
-                is_chat=is_chat,
+                data_type=data_type,
                 chat_template=chat_template,
                 assistant_loss=assistant_loss,
                 packing=packing,
@@ -145,8 +155,6 @@ def transforms(
             ApplyFirstFitPacking(
                 length_struct=length_struct,
                 num_packing_bins=packing_bins,
-                # These are redundant with `input_ids_segment_ids` /
-                # `input_ids_positions` and just bloat each batch.
                 meta_features=("attention_mask", "labels")
                 + (("assistant_masks",) if assistant_loss else ()),
             )

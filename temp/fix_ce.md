@@ -28,7 +28,7 @@ You are forcing only the broken implementation:
 So there is no fallback. To unblock training immediately, run with the reference CE:
 
 ```bash
-python src/jaxformers/train/ntp.py --config ./config/gemma_3_1b_tunix.py \
+python src/jaxformers/train/ntp.py --config ./experiments/tunix-repro/lora_gemma3_config.py \
   c.loss_implementation=reference
 ```
 

@@ -56,9 +56,6 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         )
 
     def set_slice(self, sl: slice, sequential_slice: bool = True) -> None:
-
-        # sl.step is num of worker
-        # (1, 2, 4)
         if sl.step is None or sl.step <= 0:
             raise ValueError("slice.step (num_workers) must be a positive integer.")
         worker_index = 0 if sl.start is None else sl.start
@@ -80,9 +77,8 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         seed: int | None = None,
         buffer_size: int | None = 1000,
     ) -> "HuggingFaceSourceIterDataset":
-        return HuggingFaceSourceIterDataset(
-            self._source.shuffle(seed=seed)
-        )
+        del buffer_size
+        return HuggingFaceSourceIterDataset(self._source.shuffle(seed=seed))
 
 
 class HuggingFaceSourceMapDataset(grain.MapDataset):
@@ -101,23 +97,20 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
 
     def slice(self, sl: slice) -> "HuggingFaceSourceMapDataset":
         start, stop, step = sl.indices(len(self._source))
-        if step == 1:  # [ start: end]
+        if step == 1:
             return HuggingFaceSourceMapDataset(self._source.select(range(start, stop)))
         if stop == len(self._source) and start < step:
             return HuggingFaceSourceMapDataset(
                 self._source.shard(num_shards=step, index=start, contiguous=False)
             )
 
-        return HuggingFaceSourceMapDataset(
-            self._source.select(range(start, stop, step))
-        )
+        return HuggingFaceSourceMapDataset(self._source.select(range(start, stop, step)))
+
     def shuffle(
         self,
         seed: int | None = None,
-    ) -> "HuggingFaceSourceIterDataset":
-        return HuggingFaceSourceMapDataset(
-            self._source.shuffle(seed=seed)
-        )
+    ) -> "HuggingFaceSourceMapDataset":
+        return HuggingFaceSourceMapDataset(self._source.shuffle(seed=seed))
 
     def __getitem__(self, index):
         if isinstance(index, slice):

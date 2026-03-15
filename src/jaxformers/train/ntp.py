@@ -1,4 +1,3 @@
-from jaxformers.print_utils import tree_pprint
 import dataclasses
 import sys
 import time
@@ -16,7 +15,7 @@ from optax import microbatch
 from tqdm.auto import tqdm
 
 from jaxformers import tree_util
-from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops
+from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops, print_timing
 from jaxformers.callbacks import make_callbacks
 from jaxformers.data import make_dataset
 from jaxformers.dispatch.lora import make_lora
@@ -25,6 +24,7 @@ from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model, prepare_weights as prepare_model_weights
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
+from jaxformers.print_utils import tree_pprint
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 
@@ -228,7 +228,6 @@ def train(
 
     to_log_later = {}
     program_wall_t0 = None
-    first_compile_time = None
     warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
@@ -268,24 +267,23 @@ def train(
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with jax.named_scope("compile train step"):
-                    start_time = time.monotonic()
-                    train_step_jit = jax.jit(
-                        partial(train_step, config),
-                        donate_argnums=(0,),
-                    )
-                    lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
-                    train_step_fn = lower.compile()
-                    first_compile_time = time.monotonic() - start_time
-
-                    if jax.process_index() == 0:
-                        print("compile time: ", first_compile_time)
-                        memory_stats = print_compiled_memory_stats(
-                            train_step_fn.memory_analysis()
+                    @print_timing
+                    def compile_train_step():
+                        train_step_jit = jax.jit(
+                            partial(train_step, config),
+                            donate_argnums=(0,),
                         )
-                        cost = print_flops(train_step_fn.cost_analysis())
+                        lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
+                        train_step_fn = lower.compile()
+                        return train_step_fn
+                    train_step_fn = compile_train_step()
+                    memory_stats = print_compiled_memory_stats(
+                        train_step_fn.memory_analysis()
+                    )
+                    cost = print_flops(train_step_fn.cost_analysis())
 
-                        to_log_later.update(memory_stats)
-                        to_log_later.update(cost)
+                    to_log_later.update(memory_stats)
+                    to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
                     model, aux = train_step_fn(model, batch, rngs=loop_rngs)
@@ -333,7 +331,6 @@ def train(
 
     finally:
         to_log_later["program_time"] = time.monotonic() - program_wall_t0
-        to_log_later["compile_time"] = first_compile_time
         to_log_later.update(process_aux(global_aux, "cum"))
         token_count = to_log_later.get("cum/token")
         program_time = to_log_later.get("program_time")
@@ -357,6 +354,8 @@ def train(
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
+    do_callback = hasattr(config, "callback_name")
+    do_lora = hasattr(config, "lora")
 
     logger = None
     if jax.process_index() == 0:
@@ -382,21 +381,20 @@ def main(config: sws.FinalConfig):
             config.max_train_step,
             scheduler_config=scheduler_config,
         )
-        model = make_lora(
-            model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
-        )
+        if do_lora:
+            model = make_lora(
+                model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+            )
         model = prepare_model_weights(config.model_name, model)
-        t0 = time.monotonic()
         model = make_optimizer(
             config.optimizer_name,
             model,
             scheduler,
             config.optimizer.to_dict(),
         )
-        diff = time.monotonic() - t0
-        print(f"Created optimizer and its state in {diff:.2f} seconds.")
-        callbacks = make_callbacks(config.callback)
-        if callbacks is not None:
+
+        if do_callback:
+            callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
             model = dataclasses.replace(
                 model,
                 callback_state=callbacks.init(model.weights, model.opt_state),

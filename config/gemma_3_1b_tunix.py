@@ -110,10 +110,8 @@ def get_config():
     # config.logger.tags =
     #
     #
-    config.callback = [
-        "log_grad_norm",
-        "log_learning_rate",
-        # ("log_performance", {"denom_keys": ["token", "batch"], "real_step_threshold": 0}),
-    ]
+    config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
+    config.callback.log_performance.real_step_threshold = 10
+    config.callback.log_performance.denom_keys = ["token"]
 
     return config

@@ -98,8 +98,8 @@ def get_sharding(key, sharding_rules):
     return P()
 
 
-def get_forward_impl(config: Config | PreTrainedConfig) -> ForwardImpl:
-    return ForwardImpl(config.additional_config.get("forward_impl", ForwardImpl.LOOP))
+def get_forward_impl(config: Config | PreTrainedConfig) -> str:
+    return config.additional_config.get("forward_impl", ForwardImpl.LOOP)
 
 
 def get_layer_types(config: Config) -> list[str]:
@@ -203,10 +203,10 @@ def stack_layer_values(values, leading_shape: tuple[int, ...]):
 def prepare_weights(
     config: Config,
     weights: dict[str, Array],
-    forward_impl: ForwardImpl | str | None = None,
+    forward_impl: str | None = None,
 ) -> dict[str, Array]:
-    forward_impl = ForwardImpl(forward_impl or get_forward_impl(config))
-    if forward_impl is ForwardImpl.LOOP:
+    forward_impl = forward_impl or get_forward_impl(config)
+    if forward_impl == ForwardImpl.LOOP:
         return weights
 
     if not any(LAYER_PATTERN.fullmatch(key) for key in weights):
@@ -216,12 +216,15 @@ def prepare_weights(
     other_weights, layer_weights = split_layer_weights(weights, num_hidden_layers)
     prepared_weights = dict(other_weights)
 
-    if forward_impl is ForwardImpl.SCAN_LAYER:
+    if forward_impl == ForwardImpl.SCAN_LAYER:
         for inner_key, values in layer_weights.items():
             prepared_weights[inner_key] = stack_layer_values(
                 values, (num_hidden_layers,)
             )
         return prepared_weights
+
+    if forward_impl != ForwardImpl.SCAN_BLOCK:
+        raise ValueError(f"Unsupported Gemma-3 forward implementation: {forward_impl!r}")
 
     layer_types = get_layer_types(config)
     block_size = get_layer_block_size(layer_types)
@@ -734,14 +737,14 @@ def forward(
     )
 
     forward_impl = get_forward_impl(config)
-    if forward_impl is not ForwardImpl.LOOP:
+    if forward_impl != ForwardImpl.LOOP:
         weights = prepare_weights(config, weights, forward_impl)
 
-    if forward_impl is ForwardImpl.LOOP:
+    if forward_impl == ForwardImpl.LOOP:
         x = forward_loop(config, x, weights, mask_mapping, pos)
-    elif forward_impl is ForwardImpl.SCAN_LAYER:
+    elif forward_impl == ForwardImpl.SCAN_LAYER:
         x = forward_scan_layer(config, x, weights, mask_mapping, pos)
-    elif forward_impl is ForwardImpl.SCAN_BLOCK:
+    elif forward_impl == ForwardImpl.SCAN_BLOCK:
         x = forward_scan_block(config, x, weights, mask_mapping, pos)
     else:  # pragma: no cover
         raise ValueError(

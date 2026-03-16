@@ -2,7 +2,7 @@
 
 Usage:
   python src/jaxformers/make_sweep.py \
-    base_config=src/jaxformers/config/config_qwen_0_6b_loss_bench.py \
+    base_config=experiments/tunix-repro/lora_gemma3_config.py \
     dir=/mnt/carles/llm/.agents/sweeps \
     name=loss_impl \
     'loss_implementation:=[\"xla_chunked\",\"reference\"]' \

@@ -38,20 +38,18 @@ class InitLora(StrEnum):
 
 def make_lora(
     model: Model,
-    init_lora: InitLora | str | None,
+    init_lora: str | None,
     lora_config: dict,
     *,
     rngs: PRNGKeyArray | None = None,
 ) -> Model:
-    if init_lora is None:
-        return model
 
-    if init_lora in (InitLora.RANDOM, "random"):
+    if init_lora in (InitLora.RANDOM, None):
         if rngs is None:
             raise ValueError("random LoRA init requires an rng key")
         return loraify(model, **lora_config, rngs=rngs)
 
-    if init_lora in (InitLora.PYTREE, "pytree"):
+    if init_lora == InitLora.PYTREE:
         raise NotImplementedError("LoRA pytree initialization is not implemented yet.")
 
     raise ValueError(f"Unsupported LoRA init method: {init_lora!r}")

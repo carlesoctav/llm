@@ -402,9 +402,11 @@ def main(config: sws.FinalConfig):
             )
 
         train_ds = make_dataset(
-            config.data_name,
-            config.data.load_kwargs,
+            config.data.source_name,
+            config.data.source.to_dict(),
+            config.data.transforms_name,
             config.data.transforms.to_dict(),
+            config.train_loader_name,
             config.train_loader.to_dict(),
         )
         eval_ds = None

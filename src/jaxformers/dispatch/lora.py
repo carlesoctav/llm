@@ -405,3 +405,12 @@ def _(
     if out_sharding is not None:
         out = jax.sharding.reshard(out, out_sharding)
     return out
+
+
+def lora_get_w(weights):
+    def _f(leaf):
+        if isinstance(leaf, LoraArray):
+            return leaf.w
+        else:
+            return leaf
+    return jtu.tree_map(_f, weights, is_leaf = lambda x: isinstance(x, LoraArray))

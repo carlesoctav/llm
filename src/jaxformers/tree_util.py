@@ -1,3 +1,4 @@
+import jax
 import jax.tree_util as jtu
 from jax.tree_util import (
     DictKey,
@@ -55,3 +56,12 @@ def _optimizer_entrystr(key: KeyEntry) -> str:
             return ""
         case _:
             return str(key)
+
+
+def copy(tree, stop_gradient = True):
+    def _f(leaf):
+        if stop_gradient:
+            return jax.lax.stop_gradient(leaf.copy())
+        else:
+            leaf.copy()
+    return jax.tree.map(_f, tree)

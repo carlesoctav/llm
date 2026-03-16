@@ -1,11 +1,13 @@
-from jaxformers.utils import GeneralInterface
+from functools import partial
+from typing import Protocol
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, PRNGKeyArray
 import tokamax
+from jaxtyping import Array, Bool, Float, PRNGKeyArray
+
 from jaxformers.ops.attention import chunked_manual_dot_product_attention
-from typing import Protocol
-from functools import partial
+from jaxformers.utils import GeneralInterface
 
 
 class AttentionImpl(Protocol):
@@ -17,8 +19,8 @@ class AttentionImpl(Protocol):
         mask: Bool[Array, " B #N T S"] | None = None,
         q_sharding: jax.NamedSharding | None = None,
         **kwargs,
-    ):
-        ...
+    ): ...
+
 
 def eager_dot_product_attention(
     query: Float[Array, "B T N H"],
@@ -51,8 +53,8 @@ def eager_dot_product_attention(
                 "Number of query heads must be a positive multiple of key/value heads"
             )
         repeat_factor = N // K
-        key = jnp.repeat(key, repeat_factor, axis=-2, out_sharding = q_sharding)
-        value = jnp.repeat(value, repeat_factor, axis=-2, out_sharding = q_sharding)
+        key = jnp.repeat(key, repeat_factor, axis=-2, out_sharding=q_sharding)
+        value = jnp.repeat(value, repeat_factor, axis=-2, out_sharding=q_sharding)
         K = N
 
     scores = jnp.einsum(
@@ -84,18 +86,24 @@ def eager_dot_product_attention(
         multiplier = keep.astype(weights.dtype) / keep_prob
         weights = weights * multiplier
 
-    attn = jnp.einsum("bnts, bsnh -> btnh", weights, value, preferred_element_type=query.dtype)
+    attn = jnp.einsum(
+        "bnts, bsnh -> btnh", weights, value, preferred_element_type=query.dtype
+    )
     return attn
+
 
 class AttentionInterface(GeneralInterface[str, AttentionImpl]):
     _global_mapping = {
         "eager": eager_dot_product_attention,
-        "sdpa": partial(tokamax.dot_product_attention, precision = jax.lax.Precision.HIGHEST),
+        "sdpa": partial(
+            tokamax.dot_product_attention, precision=jax.lax.Precision.HIGHEST
+        ),
         # Historically, "xla_chunked" referred to Tokamax's chunked XLA attention.
         # In this codebase we instead map it to the manual chunked implementation,
         # because Tokamax's xla_chunked backward can have very large temp memory.
         "xla_chunked": chunked_manual_dot_product_attention,
         "chunked_manual": chunked_manual_dot_product_attention,
     }
+
 
 ATTENTION_INTERFACE = AttentionInterface()

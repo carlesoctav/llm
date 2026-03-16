@@ -737,8 +737,6 @@ def forward(
     )
 
     forward_impl = get_forward_impl(config)
-    if forward_impl != ForwardImpl.LOOP:
-        weights = prepare_weights(config, weights, forward_impl)
 
     if forward_impl == ForwardImpl.LOOP:
         x = forward_loop(config, x, weights, mask_mapping, pos)

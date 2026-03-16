@@ -1,5 +1,10 @@
+import numpy as np
+import jaxformers.tree_util
+import jax.tree_util as jtu
+import jax
 import functools
 import time
+import jax.numpy as jnp
 from contextlib import contextmanager
 
 
@@ -19,7 +24,8 @@ def print_compiled_memory_stats(compiled_stats):
 
     print(
         f"Total memory size: {total_gb:.1f} GB, Output size: {output_gb:.1f} GB, Temp size: {temp_gb:.1f} GB, "
-        f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB."
+        f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB.",
+        f"Alias size: {alias_gb:.1f} GB"
     )
 
     return {
@@ -28,6 +34,7 @@ def print_compiled_memory_stats(compiled_stats):
         "temp_gb": round(temp_gb, 1),
         "argument_gb": round(argument_gb, 1),
         "host_temp_gb": round(host_temp_gb, 1),
+        "alias_gb" : round(alias_gb, 1)
     }
 
 
@@ -47,3 +54,33 @@ def print_timing(wrapped, name: str | None = None):
         return out
 
     return wrapper
+
+def print_train_state_size(model):
+    def dtype_multiplier(dtype):
+        if dtype in (jnp.float32, jnp.int32):
+            return 4
+        elif dtype in (jnp.bfloat16, jnp.float16):
+            return 2
+        else:
+            raise ValueError
+
+    def sum(name, tree):
+        p = 0
+        def _sum(path,leaf):
+            nonlocal p
+            if isinstance(leaf, jax.Array):
+                p += np.prod(leaf.shape) * dtype_multiplier(leaf.dtype)
+
+        jtu.tree_map_with_path(_sum, tree)
+        print(f" tree {name} use {p / 1e9} GB")
+        return p
+
+    if model.train_mask:
+        train_weights, _ = jaxformers.tree_util.partition(model.weights, model.train_mask)
+    else:
+        train_weights = model.weights
+
+    p = 0
+    p +=sum("train_weights", train_weights)
+    p += sum("opt_state", model.opt_state)
+    print(f"Total Model use {p / 1e9} GB")

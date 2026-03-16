@@ -15,7 +15,11 @@ from optax import microbatch
 from tqdm.auto import tqdm
 
 from jaxformers import tree_util
-from jaxformers.benchmark_utils import print_compiled_memory_stats, print_flops, print_timing
+from jaxformers.benchmark_utils import (
+    print_compiled_memory_stats,
+    print_flops,
+    print_timing, print_train_state_size,
+)
 from jaxformers.callbacks import make_callbacks
 from jaxformers.data import make_dataset
 from jaxformers.dispatch.lora import make_lora
@@ -354,8 +358,8 @@ def train(
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    do_callback = hasattr(config, "callback_name")
-    do_lora = hasattr(config, "lora")
+    do_callback = getattr(config, "callback_name", None)
+    do_lora = getattr(config, "lora", None)
 
     logger = None
     if jax.process_index() == 0:
@@ -392,6 +396,7 @@ def main(config: sws.FinalConfig):
             scheduler,
             config.optimizer.to_dict(),
         )
+        print_train_state_size(model)
 
         if do_callback:
             callbacks = make_callbacks(config.callback_name, config.callback.to_dict())

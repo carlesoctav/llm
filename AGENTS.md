@@ -49,3 +49,51 @@ Rules:
   them as `Float32[jax.Array, " x"]`.
 - Jaxtyping treats `"x"` and `" x"` the same way, so prefer the leading-space
   form for single-axis shapes in this repo.
+
+
+
+## Don't
+- Prefer inlining trivial helper functions (one to three lines) rather than creating a separate function. For example, instead of:
+   def get_forward_impl(config: Config | PreTrainedConfig) -> str:
+       return config.additional_config.get("forward_impl", ForwardImpl.LOOP)
+  access the value directly:
+   config.additional_config["forward_impl"]
+
+- For enum-based control flow, validate first with `if value not in tuple(Enum): raise`, then use explicit `if` / `elif` / `elif` branches. Do not add a redundant trailing `else: raise` after that upfront validation.
+
+- Do not rely on implicit fallthrough for enum cases or other closed sets. Even if only one case remains, spell it out as an explicit branch.
+
+- Avoid using getattr(...) or dict.get(...) when you are certain the attribute or key exists. Use direct attribute access (obj.attr) or indexing (dict[key]) instead. Ensure those attributes or keys are initialized up front (for example in __init__ or when constructing the dict) so callers do not need to defensively probe for presence.
+
+- Example: if additional_config is constructed from DEFAULT_ADDITIONAL_CONFIG and will always contain "forward_impl", prefer:
+   additional_config["forward_impl"]
+  over calling .get(...) with a fallback. Minimize use of None for required fields on Config or other classes — reserve None only for truly optional values.
+
+- Remove dead compatibility code once the upstream contract or validation already guarantees the invariant.
+
+- Prefer minimal code paths over defensive abstractions when the caller, config, or upstream library is trusted.
+
+- Avoid redundant type casts like int(...), float(...), or bool(...) when the value type is already guaranteed by config, validation, or the caller. Only cast when converting genuinely untyped external data or when an API explicitly requires a different type.
+
+- If you're not really sure about a runtime behavior, inferred type, or library contract, check it in a REPL instead of guessing.
+
+
+## After finishing the code
+
+Check the diff against main and remove any AI-generated slop introduced in this branch.
+
+The diff against main should be one of the following, in this order:
+- git diff --cached
+- git diff
+- git diff main..HEAD or git diff master..HEAD
+
+AI-generated slop includes:
+- Extra comments that a human wouldn't add or that are inconsistent with the rest of the file.
+- Extra defensive checks or try/catch blocks that are abnormal for that area of the codebase (especially if called by trusted/validated code paths).
+- Variables or functions that are used only once immediately after declaration — prefer inlining the right-hand side or the function.
+- Redundant checks or casts inside a function that the caller already performs.
+- Any other style that is inconsistent with the file, including adding type annotations where the file does not use them.
+- Changes that are inconsistent with AGENTS.md requirements.
+- Code that should have been removed but was retained for "legacy compatibility" or similar reasons.
+
+At the end, include only a 1-3 sentence summary of what you changed

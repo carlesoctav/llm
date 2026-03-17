@@ -12,6 +12,8 @@ from jaxtyping import Bool, Float, PyTree
 from safetensors import safe_open
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
+from jaxformers import tree_util
+from jaxformers.dispatch.lora import lora_get_w
 from jaxformers.print_utils import tree_pformat
 
 
@@ -58,6 +60,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "name",
         "tokenizer",
         "forward",
+        "prepare_weights",
         "config",
         "tx",
         "is_lora",
@@ -76,6 +79,7 @@ class Model:
     forward: Callable
     embed: Callable
     unembed: Callable
+    prepare_weights: Callable
     tokenizer: PreTrainedTokenizerFast
     lm_head_key: str
 
@@ -87,10 +91,28 @@ class Model:
     callbacks: Any | None = None
 
     train_mask: PyTree[Bool] | None = None
+    # make this str_enum
     is_lora: bool = False
 
     def __repr__(self):
         return self.name + "\n" + tree_pformat(self.weights)
+
+    @property
+    def params(
+        self,
+    ):
+        return self.weights
+
+    @property
+    def trainable_params(self) -> tuple[PyTree, PyTree]:
+        return tree_util.partition(self.weights, self.train_mask)
+
+    @property
+    def base_params(self):
+        if self.is_lora:
+            return lora_get_w(self.weights)
+        else:
+            return self.weights
 
 
 def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):

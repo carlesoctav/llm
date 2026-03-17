@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 import sys
 import time
@@ -18,14 +20,15 @@ from jaxformers import tree_util
 from jaxformers.benchmark_utils import (
     print_compiled_memory_stats,
     print_flops,
-    print_timing, print_train_state_size,
+    print_timing,
+    print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
 from jaxformers.data import make_dataset
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
-from jaxformers.models import make_model, prepare_weights as prepare_model_weights
+from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.print_utils import tree_pprint
@@ -389,7 +392,7 @@ def main(config: sws.FinalConfig):
             model = make_lora(
                 model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
             )
-        model = prepare_model_weights(config.model_name, model)
+        dataclasses.replace(model, weights = model.prepare_weights(model.weights))
         model = make_optimizer(
             config.optimizer_name,
             model,

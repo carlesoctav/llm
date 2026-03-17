@@ -90,6 +90,7 @@ def train_step(
             weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
         )
         logits = model.unembed(weights, hidden_states)
+
         if model.is_lora:
             orig_weights = lora_get_w(weights)
             kl_hidden_states = model.forward(

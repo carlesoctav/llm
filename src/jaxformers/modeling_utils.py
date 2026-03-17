@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from enum import auto, StrEnum
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
@@ -20,6 +21,14 @@ from jaxformers.print_utils import tree_pformat
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 
+
+class StoreWeights(StrEnum):
+    STACK = auto()
+    FREE = auto()
+
+class ForwardImpl(StrEnum):
+    LOOP = auto()
+    SCAN_LAYER = auto()
 
 def logical_to_physical(logical, rules):
     spec = [rules[lo] for lo in logical]

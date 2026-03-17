@@ -8,6 +8,7 @@ def get_config():
 
     config.init_model = "pretrained"
     config.init_lora = None
+    config.store_weights = "stack"
 
     config.model_name = "huggingface.gemma3"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}

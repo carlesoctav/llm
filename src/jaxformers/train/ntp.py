@@ -392,7 +392,7 @@ def main(config: sws.FinalConfig):
             model = make_lora(
                 model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
             )
-        dataclasses.replace(model, weights = model.prepare_weights(model.weights))
+        model = dataclasses.replace(model, weights = model.prepare_weights(model.weights, config.store_weights))
         model = make_optimizer(
             config.optimizer_name,
             model,

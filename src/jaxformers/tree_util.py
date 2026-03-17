@@ -71,27 +71,40 @@ def copy(tree, stop_gradient=True):
 
     return jax.tree.map(_f, tree)
 
+
 def stack(*trees):
     return jax.tree.map(lambda *leaf: jnp.stack(leaf), *trees)
+
 
 def unstack(trees):
     trees = jax.tree.map(lambda leaf: jnp.unstack(leaf), trees)
     N = len(jax.tree.leaves(trees)[0])
     return [jax.tree.map(lambda leaf: leaf[i], trees) for i in range(N)]
 
+
 def maybe_stack(trees: list | dict):
     if not isinstance(trees, list):
         return trees
     return jax.tree.map(lambda *leaf: jnp.stack(leaf), *trees)
 
+
 def maybe_unstack(trees: list | dict):
     if not isinstance(trees, dict):
         return trees
     trees = jax.tree.map(lambda leaf: jnp.unstack(leaf), trees)
-    N = len(jax.tree.leaves(trees)[0])
-    return [jax.tree.map(lambda leaf: leaf[i], trees) for i in range(N)]
+    N = len(jax.tree.leaves(trees, is_leaf=lambda x: isinstance(x, tuple))[0])
+    print("DEBUGPRINT {N}:", N)
+    return [
+        jax.tree.map(
+            lambda leaf: leaf[i], trees, is_leaf=lambda x: isinstance(x, tuple)
+        )
+        for i in range(N)
+    ]
 
-def split_layer_weights(weights, num_hidden_layers: int, layer_pattern, stack: bool = False):
+
+def split_layer_weights(
+    weights, num_hidden_layers: int, layer_pattern, stack: bool = False
+):
     other_weights = {}
     layers = [{} for _ in range(num_hidden_layers)]
     inner_keys = set()
@@ -110,9 +123,7 @@ def split_layer_weights(weights, num_hidden_layers: int, layer_pattern, stack: b
     for layer_idx, layer_weight in enumerate(layers):
         missing = sorted(inner_keys - layer_weight.keys())
         if missing:
-            raise KeyError(
-                f"Missing layer weights at index {layer_idx}: {missing!r}."
-            )
+            raise KeyError(f"Missing layer weights at index {layer_idx}: {missing!r}.")
 
     if stack:
         return other_weights, jax.tree.map(lambda *leaf: jnp.stack(leaf), *layers)
@@ -153,6 +164,7 @@ def unflatten(arg):
     {'foo': [{'bar': 'val'}, {'baz': 'x'}]}
 
     """
+
     class Holder(dict):
         def __init__(self, flat_key):
             self.flat_key = flat_key

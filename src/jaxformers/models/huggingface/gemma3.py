@@ -1,10 +1,8 @@
 import fnmatch
-import math
 import re
-from enum import auto, StrEnum
 from functools import partial
 from pathlib import Path
-from typing import Callable, Sequence, TypeAlias, TypeVar
+from typing import Callable, TypeAlias, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +10,6 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from jinja2.nodes import For
 from torch.ao.quantization.fx.prepare import prepare
 from transformers import (
     AutoConfig,
@@ -31,11 +28,12 @@ from jaxformers.masking_utils import (
 from jaxformers.modeling_utils import (
     AdditionalConfig,
     DEFAULT_ADDITIONAL_CONFIG,
+    ForwardImpl,
     load_weights,
     logical_to_physical,
     Model,
+    StoreWeights,
 )
-from jaxformers.print_utils import tree_pprint
 from jaxformers.scan_utils import make_scan_fwd
 
 from ...attention_utils import ATTENTION_INTERFACE
@@ -54,6 +52,7 @@ LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
 Config: TypeAlias = PreTrainedConfig
 Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], jax.Array]
+
 LAYER_PREFIX = "model.layers"
 LAYER_PATTERN = re.compile(rf"{re.escape(LAYER_PREFIX)}\.(\d+)\.(.*)")
 NON_LAYER_WEIGHT_KEYS = {
@@ -61,12 +60,6 @@ NON_LAYER_WEIGHT_KEYS = {
     "model.norm.weight",
     "lm_head.weight",
 }
-
-
-class ForwardImpl(StrEnum):
-    LOOP = auto()
-    SCAN_LAYER = auto()
-
 
 SHARDING_RULES = {
     "none": None,
@@ -100,30 +93,25 @@ def get_sharding(key, sharding_rules):
     return P()
 
 
-def get_layer_block_size(layer_types: Sequence[str]) -> int:
-    for block_size in range(1, len(layer_types) + 1):
-        if all(
-            layer_types[idx] == layer_types[idx % block_size]
-            for idx in range(len(layer_types))
-        ):
-            return block_size
-    return len(layer_types)
-
-
 @print_timing
 def prepare_weights(
     config: Config,
     weights: dict[str, Array],
-    forward_impl: str | None = None,
+    store_weights: str = False,
 ) -> dict[str, Array]:
-    forward_impl = forward_impl or config.additional_config["forward_impl"]
+
+    if store_weights not in tuple(StoreWeights):
+        raise ValueError(
+            f"Unsupported Gemma-3 store_weights implementation: {store_weights!r}"
+        )
 
     other_weights, layers = tree_util.split_layer_weights(
         weights,
         config.num_hidden_layers,
         LAYER_PATTERN,
-        stack=False if forward_impl == ForwardImpl.LOOP else True,
+        stack=store_weights == StoreWeights.STACK,
     )
+
     prepared_weights = dict(other_weights)
     prepared_weights[LAYER_PREFIX] = layers
 
@@ -134,7 +122,10 @@ def get_layer_metadata(config: Config) -> tuple[jax.Array, jax.Array, jax.Array]
     layer_types = config.layer_types
     layer_idx = jnp.arange(len(layer_types), dtype=jnp.int32)
     rope_theta = jnp.asarray(
-        [get_rope_theta(config, attention_type) for attention_type in layer_types],
+        [
+            config.rope_parameters[attention_type]["rope_theta"]
+            for attention_type in layer_types
+        ],
         dtype=jnp.float32,
     )
     is_sliding = jnp.asarray(
@@ -142,28 +133,6 @@ def get_layer_metadata(config: Config) -> tuple[jax.Array, jax.Array, jax.Array]
         dtype=jnp.bool_,
     )
     return layer_idx, rope_theta, is_sliding
-
-
-def get_block_metadata(
-    config: Config,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    layer_idx, rope_theta, is_sliding = get_layer_metadata(config)
-    block_size = get_layer_block_size(config.layer_types)
-    num_hidden_layers = config.num_hidden_layers
-    num_blocks = math.ceil(num_hidden_layers / block_size)
-    padded_layers = num_blocks * block_size
-    pad_size = padded_layers - num_hidden_layers
-
-    if pad_size:
-        layer_idx = jnp.pad(layer_idx, (0, pad_size))
-        rope_theta = jnp.pad(rope_theta, (0, pad_size))
-        is_sliding = jnp.pad(is_sliding, (0, pad_size))
-
-    return (
-        layer_idx.reshape(num_blocks, block_size),
-        rope_theta.reshape(num_blocks, block_size),
-        is_sliding.reshape(num_blocks, block_size),
-    )
 
 
 def _match_first_initializer(
@@ -236,10 +205,6 @@ def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array
     raise ValueError(f"Unsupported hidden activation {hidden_activation!r}")
 
 
-def get_rope_theta(config: Config, attention_type: str) -> float:
-    return config.rope_parameters[attention_type]["rope_theta"]
-
-
 def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
     attn_impl = config.additional_config["attn_implementation"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
@@ -247,9 +212,6 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
             "full_attention": None,
             "sliding_attention": None,
         }
-
-    if attention_mask is not None:
-        attention_mask = attention_mask.astype(jnp.bool_)
 
     full_mask = make_causal_mask(attn_impl, input_embeds, attention_mask, segment_ids)
     window_size = config.sliding_window
@@ -283,20 +245,6 @@ def linear_3d(x, w, b=None, *, out_sharding=None):
     return y
 
 
-def select_attention_mask(attention_mask, is_sliding):
-    if not isinstance(attention_mask, dict):
-        return attention_mask
-
-    full_mask = attention_mask["full_attention"]
-    sliding_mask = attention_mask["sliding_attention"]
-    if full_mask is None or sliding_mask is None:
-        return None
-
-    return jax.lax.select(
-        jnp.asarray(is_sliding, dtype=jnp.bool_), sliding_mask, full_mask
-    )
-
-
 def forward_layer(
     config: Config,
     x: Float[Array, "B T D"],
@@ -309,9 +257,11 @@ def forward_layer(
     rules = config.sharding_rules
     act_fn = get_activation_fn(config.hidden_activation)
     head_dim = config.head_dim
-    attention_mask = select_attention_mask(
-        inputs["attention_mask"],
+    attention_mask = inputs["attention_mask"]
+    attention_mask = jax.lax.select(
         inputs["is_sliding"],
+        attention_mask["sliding_attention"],
+        attention_mask["full_attention"],
     )
 
     residual = x
@@ -421,53 +371,23 @@ def forward_layer(
     return x
 
 
-def forward_block(
-    layer_fwd,
-    x: Float[Array, "B T D"],
-    w: PyTree[Array, "LayerWeights"],
-    layer_idx: Int[Array, " L"],
-    rope_theta: Float[Array, " L"],
-    is_sliding: Int[Array, " L"],
-    pos=0,
-    **inputs,
-):
-    block_size = layer_idx.shape[0]
-    for block_idx in range(block_size):
-        layer_weights = jax.tree.map(lambda leaf: leaf[block_idx], w)
-        x = layer_fwd(
-            x,
-            layer_weights,
-            layer_idx[block_idx],
-            rope_theta[block_idx],
-            pos=pos,
-            attention_mask=inputs["attention_mask"],
-            is_sliding=is_sliding[block_idx],
-        )
-    return x
-
-
 def forward_loop(
     config: Config,
     x: Float[Array, "B T D"],
-    weights: dict[str, Array],
-    mask_mapping,
+    layer_weights: list[Array] | dict[str, Array],
+    mask_mapping: dict[str, Array],
     pos: int,
 ):
     fwd = partial(forward_layer, config)
     if config.additional_config["remat_layer"]:
         fwd = jax.remat(fwd)
 
-    _, layer_weights = tree_util.split_layer_weights(
-        weights,
-        config.num_hidden_layers,
-        LAYER_PATTERN,
-    )
     for layer_idx, attention_type in enumerate(config.layer_types):
         x = fwd(
             x,
             layer_weights[layer_idx],
             layer_idx,
-            get_rope_theta(config, attention_type),
+            config.rope_parameters[attention_type]["rope_theta"],
             pos=pos,
             attention_mask=mask_mapping,
             is_sliding=attention_type == "sliding_attention",
@@ -519,7 +439,6 @@ def forward(
     model_prefix = "model"
     embed_key = f"{model_prefix}.embed_tokens.weight"
     final_norm_key = f"{model_prefix}.norm.weight"
-    tree_pprint(weights)
 
     input_ids = reshard(input_ids, logical_to_physical(("batch", "context"), rules))
     x = (
@@ -607,10 +526,6 @@ def unembed(
         preferred_element_type=jnp.float32,
     )
     return logits
-
-
-def save_safetensors(weights: PyTree[ModelWeights], path: str | Path):
-    pass
 
 
 def init(

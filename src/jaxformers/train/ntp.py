@@ -69,8 +69,8 @@ def _preparse_absl_flags() -> None:
 
 
 def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
-    def loss_fn(train_weights, frozen_weights, batch, rngs):
-        weights = tree_util.combine(train_weights, frozen_weights)
+    def loss_fn(train_weights, freeze_weights, batch, rngs):
+        weights = tree_util.combine(train_weights, freeze_weights)
         forward_dtype = config.forward_dtype
 
         hidden_states = model.forward(
@@ -114,8 +114,6 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
 
         return loss, aux
 
-    train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
-
     if config.grad_accum > 1:
         microbatch_size = config.train_loader.global_batch_size // config.grad_accum
         grad_fn = microbatch(
@@ -126,15 +124,16 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     else:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
+    (loss, aux), grad = grad_fn(*model.trainable_params, batch, rngs)
 
     token_count = aux["token"]
     inv_token_count = (1 / token_count).astype(config.forward_dtype)
     grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
 
     updates, nst = model.tx.update(
-        grad, model.opt_state, model.weights, count=token_count
+        grad, model.opt_state, model.weights
     )
+
     nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
     callback_state = model.callback_state
     if model.callback_state is not None:

@@ -30,7 +30,7 @@ def partition(pytree, filter=None, replace=None, is_leaf=None):
     return left, right
 
 
-def combine(left, right, is_leaf=None):
+def combine(*val, is_leaf=None):
     def _combine(*args):
         for arg in args:
             if arg is not None:
@@ -38,7 +38,7 @@ def combine(left, right, is_leaf=None):
 
     is_none = lambda x: x is None
     _is_leaf = is_none if is_leaf is None else lambda x: is_none(x) or is_leaf(x)
-    return jtu.tree_map(_combine, left, right, is_leaf=_is_leaf)
+    return jtu.tree_map(_combine, *val, is_leaf=_is_leaf)
 
 
 def apply_updates(weights, updates, dtype):

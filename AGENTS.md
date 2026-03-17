@@ -50,6 +50,17 @@ Rules:
 - Jaxtyping treats `"x"` and `" x"` the same way, so prefer the leading-space
   form for single-axis shapes in this repo.
 
+## Model Weight Layout
+
+Prefer explicit, model-owned weight preparation with shared tree utilities.
+
+Rules:
+- Structural weight transforms such as stacking, splitting, or nesting layer weights should be an explicit lifecycle step, not hidden inside checkpoint loading by default.
+- Prefer calling a model hook like `model.prepare_weights(...)` from top-level assembly or training code instead of branching on `model_name` or using external model-specific preparation helpers.
+- Run structural weight preparation before creating optimizer state or checkpoint state so downstream state uses the final weight tree layout.
+- Put reusable tree reshaping logic in shared utilities such as `tree_util.py`, not duplicated inside each model file.
+- Prefer one canonical prepared container for repeated structures like layers, for example `weights["model.layers"]`, and use lightweight adapters such as stack or unstack only at the consumption boundary.
+
 
 
 ## Don't

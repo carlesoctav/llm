@@ -530,6 +530,7 @@ def unembed(
 
 def init(
     config: Config | None = None,
+    model_id: str | None = None,
     parallel_dims: ParallelDims | None = None,
     devices: list | None = None,
     multihost: bool = False,
@@ -539,7 +540,6 @@ def init(
     rngs: PRNGKeyArray,
     initializers: dict[str, Initializer] | None = None,
     tokenizer=None,
-    model_id: str | None = None,
 ) -> Model:
     if (config is None) == (model_id is None):
         raise ValueError(

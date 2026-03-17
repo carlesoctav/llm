@@ -24,27 +24,23 @@ For a new experiment, prefer:
 experiments/<task-name>/
   README.md
   logbook.md
+  base_config.py
   config/
-    base.py
-    model.py
-    data.py
-    optimizer.py
-    scheduler.py
-    train.py
-  <task-name>_config.py
+    lora_rank256.py
+    adamw.py
+    short_run.py
   sweeps/
 ```
 
 Rules:
 - `README.md` is the short human-facing summary: goal, current status, best command, current best result.
 - `logbook.md` is append-only: date, command, config, result, interpretation, next step.
-- `config/base.py` holds shared runtime and experiment metadata such as `exp_name`, `project_name`, `dir`, `ckpt_path`, `seed`, `max_train_step`, `logger_name`, `checkpoint_options`, and other run-level defaults.
-- `config/model.py` holds only `model_name`, `init_model`, `init_lora`, and `model.*` or `lora.*`.
-- `config/data.py` holds `data.source_name`, `data.source.*`, `data.transforms_name`, `data.transforms.*`, `train_loader_name`, and `train_loader.*`.
-- `config/optimizer.py` holds `optimizer_name` and `optimizer.*`.
-- `config/scheduler.py` holds `learning_rate`, `lr_scheduler_name`, and `lr_scheduler.*`.
-- `config/train.py` is optional. Use it only for train-script-specific knobs such as `loss_ratio.*` for KL runs.
-- `<task-name>_config.py` is the config entrypoint passed to `--config`. It should combine the files from `./config`.
+- `base_config.py` holds the readable task default in one file: run metadata, model, data, optimizer, scheduler, and train defaults together.
+- Additional root base configs are acceptable when a task has a few genuinely different baselines and separate root files are easier to navigate than stacking many overrides.
+- `config/` is optional and holds small override fragments for variants or extensions.
+- Name override files by intent, for example `adamw.py`, `lora_rank256.py`, or `short_run.py`.
+- Do not split the default task config into one file per factory by default. Keep the common config easy to scan in `base_config.py`.
+- Pass the root `base_config.py` first to `--config`, then add `config/*.py` overrides after it when needed.
 - `sweeps/` is optional. If you generate sweep configs, keep them inside the same task folder.
 
 ## Reuse First
@@ -89,7 +85,7 @@ Factory rules in this repo:
 - Do not add backward-compat wrappers or loose `**kwargs` just to make configs more permissive.
 
 Rules of thumb:
-- If the only difference is dataset path, tokenizer, max length, LoRA rank, batch size, or scheduler settings, stay in `experiments/<task-name>/config/`.
+- If the only difference is dataset path, tokenizer, max length, LoRA rank, batch size, or scheduler settings, keep it in `base_config.py` or a small override under `experiments/<task-name>/config/`.
 - If multiple experiments would reuse the same dataset preparation logic, add a transform or loader in `src/jaxformers/data/...`.
 - If multiple experiments would reuse the same optimization or LR logic, add an optimizer or scheduler module in `src/jaxformers/...`.
 - If the loss/training step changes in a real way, add or extend a train entrypoint in `src/jaxformers/train/`.
@@ -98,32 +94,25 @@ Rules of thumb:
 
 Use Python config builders that return `sws.Config`, matching the rest of the repo.
 
-Prefer a task entrypoint like:
+Prefer a base config plus optional override files:
 
 ```python
-from pathlib import Path
-
-from jaxformers.sws_utils import merge_config_builders
-
-
-CONFIG_PATHS = [
-    str(Path(__file__).parent / "config" / "base.py"),
-    str(Path(__file__).parent / "config" / "model.py"),
-    str(Path(__file__).parent / "config" / "data.py"),
-    str(Path(__file__).parent / "config" / "optimizer.py"),
-    str(Path(__file__).parent / "config" / "scheduler.py"),
-]
+import sws
 
 
 def get_config():
-    return merge_config_builders(CONFIG_PATHS)
+    config = sws.Config()
+    ...
+    return config
 ```
 
 Rules:
-- Keep the main `--config` entrypoint in `experiments/<task-name>/`.
-- Put reusable per-task config pieces under `experiments/<task-name>/config/`.
-- Add `config/train.py` to `CONFIG_PATHS` only when the chosen train script needs extra config fields.
-- Use `merge_config_builders(...)` to combine config builders.
+- Keep the main config path in `experiments/<task-name>/base_config.py`.
+- If a task needs more than one real baseline, multiple root base config files are acceptable.
+- Put optional override fragments under `experiments/<task-name>/config/`.
+- Prefer composing configs at the CLI with multiple `--config` paths instead of creating a merged Python entrypoint by default.
+- The first config path should usually be the root `base_config.py`, followed by any `config/*.py` overrides.
+- If you want a named root shortcut config file for a common variant, add it only when it improves usability.
 - If you need a generated frozen config file, use `jaxformers.sws_utils.combine_and_write(...)`, but keep the output inside the same task folder.
 
 ## Run Workflow
@@ -133,19 +122,19 @@ For each new task:
 2. Create `experiments/<task-name>/`.
 3. Write `README.md` with the goal and the baseline command.
 4. Decide whether the task fits an existing train script and factory pieces.
-5. Build `config/*.py`.
-6. Create `<task-name>_config.py`.
-7. Run the chosen train script with that config.
+5. Write `base_config.py`.
+6. Add `config/*.py` only for overrides or variants.
+7. Run the chosen train script with `--config experiments/<task-name>/base_config.py ...`.
 8. Append results to `logbook.md`.
 
 Typical commands:
 
 ```bash
-uv python src/jaxformers/train/ntp.py --config experiments/<task-name>/<task-name>_config.py
+uv python src/jaxformers/train/ntp.py --config experiments/<task-name>/base_config.py
 ```
 
 ```bash
-uv python src/jaxformers/train/ntp_with_kl_regularzier.py --config experiments/<task-name>/<task-name>_config.py
+uv python src/jaxformers/train/ntp_with_kl_regularzier.py --config experiments/<task-name>/base_config.py experiments/<task-name>/config/<variant>.py
 ```
 
 If you use `src/jaxformers/train/make_sweep.py`, write the generated configs into `experiments/<task-name>/sweeps/`.
@@ -168,8 +157,11 @@ Keep the workflow lightweight and local to the task folder. Do not create extra 
 Minimum required artifacts per task:
 - `experiments/<task-name>/README.md`
 - `experiments/<task-name>/logbook.md`
+- `experiments/<task-name>/base_config.py`
+
+Optional:
 - `experiments/<task-name>/config/*.py`
-- `experiments/<task-name>/<task-name>_config.py`
+- `experiments/<task-name>/*_config.py`
 
 What to record in `logbook.md`:
 - date/time
@@ -192,3 +184,5 @@ Keep everything reproducible:
 - Do not add one-off code to `src/` before checking whether the current factories already cover the use case.
 - Do not create a new factory module when the change belongs in config.
 - Do not create compatibility layers for old config names when a new experiment can just use the correct current names.
+- Do not default to `config/base.py`, `config/model.py`, `config/data.py`, and similar one-file-per-factory splits for every task.
+- Do not hide the main runnable config inside `experiments/<task-name>/config/`; keep the base config in the task root.

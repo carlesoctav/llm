@@ -31,7 +31,6 @@ from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
-from jaxformers.print_utils import tree_pprint
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 

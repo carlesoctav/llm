@@ -24,18 +24,38 @@ from jaxformers.benchmark_utils import (
 )
 from jaxformers.callbacks import make_callbacks
 from jaxformers.data import make_dataset
-from jaxformers.dispatch.lora import lora_get_w, make_lora
+from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
-from jaxformers.models import make_model, prepare_weights as prepare_model_weights
+from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 
 
-DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
-DEFAULT_AUX = {"loss": (0.0, 0), "token": 0, "batch": 0}
+DEFAULT_REDUCED = {
+    "loss": "mean",
+    "token": "sum",
+    "batch": "sum",
+    "sft.loss": "mean",
+    "sft.token": "sum",
+    "sft.batch": "sum",
+    "kl.loss": "mean",
+    "kl.token": "sum",
+    "kl.batch": "sum",
+}
+DEFAULT_AUX = {
+    "loss": (0.0, 0),
+    "token": 0,
+    "batch": 0,
+    "sft.loss": (0.0, 0),
+    "sft.token": 0,
+    "sft.batch": 0,
+    "kl.loss": (0.0, 0),
+    "kl.token": 0,
+    "kl.batch": 0,
+}
 
 
 def _preparse_absl_flags() -> None:
@@ -77,34 +97,44 @@ def train_step(
                 batch["kl_inputs"]["attention_mask"]
                 * batch["kl_inputs"]["assistant_masks"]
             )
-            mask = (
-                batch["kl_inputs"]["attention_mask"]
-                * batch["kl_inputs"]["assistant_masks"]
-            ).reshape(-1)
+            mask = batch["kl_inputs"]["attention_mask"] * batch["kl_inputs"]["assistant_masks"]
         else:
-            count = jnp.sum(batch["inputs"]["attention_mask"])
-            mask = (batch["inputs"]["attention_mask"]).reshape(-1)
+            count = jnp.sum(batch["kl_inputs"]["attention_mask"])
+            mask = batch["kl_inputs"]["attention_mask"]
 
         hidden_states = model.forward(
             weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
         )
-        logits = model.unembed(weights, hidden_states)
+        log_probs = jax.nn.log_softmax(model.unembed(weights, hidden_states), axis=-1)
 
         if model.is_lora:
-            orig_weights = lora_get_w(weights)
+            base_weights = model.base_params
             kl_hidden_states = model.forward(
-                orig_weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
+                base_weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
             )
-            kl_logits = model.unembed(weights, kl_hidden_states)
+            kl_log_probs = jax.nn.log_softmax(
+                model.unembed(base_weights, kl_hidden_states),
+                axis=-1,
+            )
         else:
             kl_hidden_states = base_model.forward(
                 base_model.weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
             )
-            kl_logits = base_model.unembed(base_model.weights, kl_hidden_states)
+            kl_log_probs = jax.nn.log_softmax(
+                base_model.unembed(base_model.weights, kl_hidden_states),
+                axis=-1,
+            )
 
-        optax.kl_divergence
+        kl_loss = (
+            optax.losses.kl_divergence_with_log_targets(log_probs, kl_log_probs) * mask
+        ).sum()
 
-        pass
+        return kl_loss, {
+            "loss": (kl_loss, count),
+            "token": count,
+            "batch": batch["kl_inputs"]["input_ids"].shape[0],
+        }
+
 
     def sft_loss_fn(train_weights, frozen_weights, batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
@@ -180,7 +210,7 @@ def train_step(
     sft_inv_token_count = (1 / sft_token_count).astype(config.forward_dtype)
     kl_inv_token_count = (1 / kl_token_count).astype(config.forward_dtype)
     sft_grad = jtu.tree_map(lambda g: g * sft_inv_token_count, sft_grad)
-    kl_grad = jtu.tree_map(lambda g: g * sft_inv_token_count, kl_grad)
+    kl_grad = jtu.tree_map(lambda g: g * kl_inv_token_count, kl_grad)
 
     grad = jtu.tree_map(
         lambda g1, g2: config.loss_ratio.sft_loss * g1 + config.loss_ratio.kl_loss * g2,
@@ -190,7 +220,8 @@ def train_step(
 
     updates, nst = model.tx.update(grad, model.opt_state, model.weights)
     nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
-    aux = {**sft_aux, **kl_aux}
+    total_aux = add_aux(sft_aux, kl_aux)
+    aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
 
     callback_state = model.callback_state
     if model.callback_state is not None:
@@ -225,6 +256,7 @@ def process_aux(accum_aux: dict[str, Any], namespace=""):
 
 def _to_host(tree):
     tree = jax.device_get(tree)
+    flat_tree = tree_util.flatten(tree, is_leaf=lambda x: isinstance(x, tuple))
 
     def _item(value):
         if isinstance(value, np.ndarray) and value.shape == ():
@@ -233,7 +265,7 @@ def _to_host(tree):
             return value.item()
         return value
 
-    return jtu.tree_map(_item, tree)
+    return jtu.tree_map(_item, flat_tree)
 
 
 def add_aux(accum_aux, aux):
@@ -338,7 +370,12 @@ def train(
                             partial(train_step, config),
                             donate_argnums=(0,),
                         )
-                        lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
+                        lower = train_step_jit.lower(
+                            model,
+                            base_model,
+                            batch,
+                            rngs=loop_rngs,
+                        )
                         train_step_fn = lower.compile()
                         return train_step_fn
 
@@ -352,14 +389,24 @@ def train(
                     to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
+                    model, aux = train_step_fn(
+                        model,
+                        base_model,
+                        batch,
+                        rngs=loop_rngs,
+                    )
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                 ):
-                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
+                    model, aux = train_step_fn(
+                        model,
+                        base_model,
+                        batch,
+                        rngs=loop_rngs,
+                    )
 
             callback_output = {}
             if model.callback_state is not None:
@@ -396,7 +443,8 @@ def train(
             step += 1
 
     finally:
-        to_log_later["program_time"] = time.monotonic() - program_wall_t0
+        if program_wall_t0 is not None:
+            to_log_later["program_time"] = time.monotonic() - program_wall_t0
         to_log_later.update(process_aux(global_aux, "cum"))
         token_count = to_log_later.get("cum/token")
         program_time = to_log_later.get("program_time")
@@ -452,7 +500,10 @@ def main(config: sws.FinalConfig):
             model = make_lora(
                 model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
             )
-        model = prepare_model_weights(config.model_name, model)
+        model = dataclasses.replace(
+            model,
+            weights=model.prepare_weights(model.weights, config.store_weights),
+        )
         model = make_optimizer(
             config.optimizer_name,
             model,
@@ -464,6 +515,13 @@ def main(config: sws.FinalConfig):
         if do_lora:
             base_model = None
         else:
+            base_model = dataclasses.replace(
+                base_model,
+                weights=base_model.prepare_weights(
+                    base_model.weights,
+                    config.store_weights,
+                ),
+            )
             base_model = tree_util.copy(base_model)
 
         if do_callback:

@@ -131,6 +131,16 @@ def split_layer_weights(
     return other_weights, layers
 
 
+def flatten(tree, separator=".", is_leaf=None):
+    res = {}
+
+    def _f(path, leaf):
+        res[jtu.keystr(path, simple=True, separator=separator)] = leaf
+
+    jax.tree.map_with_path(_f, tree, is_leaf=is_leaf)
+    return res
+
+
 def unflatten(arg):
     """Unflatten nested dict/array data.
 

@@ -152,7 +152,9 @@ def make(
         preview_short = (preview[:120] + "...") if len(preview) > 120 else preview
         print(f"Using custom kl_chat_template (preview): '{preview_short}'")
     if not chat_template or not kl_chat_template_path:
-        print("No custom chat_template and kl_chat_template provided; using default chat formatting.")
+        print(
+            "No custom chat_template and kl_chat_template provided; using default chat formatting."
+        )
 
     transforms.append(
         TokenizeText(
@@ -160,7 +162,7 @@ def make(
             tokenizer=tokenizer,
             max_length=max_length,
             data_type=data_type,
-            kl_chat_template_path = kl_chat_template or chat_template,
+            kl_chat_template_path=kl_chat_template or chat_template,
             chat_template=chat_template,
             assistant_loss=assistant_loss,
             packing=packing,

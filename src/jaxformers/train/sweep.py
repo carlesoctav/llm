@@ -104,7 +104,9 @@ def run_worker(
         payload["overrides"] = module.get("OVERRIDES")
         factory = module.get("get_config")
         if not callable(factory):
-            raise ConfigLoadError(f"`get_config` function not found in {run_config_path}")
+            raise ConfigLoadError(
+                f"`get_config` function not found in {run_config_path}"
+            )
         builder = factory()
         config = builder.finalize([])
         payload["config_json"] = json.loads(config.to_json())
@@ -210,7 +212,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    progress = tqdm(run_configs, total=len(run_configs), dynamic_ncols=True, file=sys.stdout)
+    progress = tqdm(
+        run_configs, total=len(run_configs), dynamic_ncols=True, file=sys.stdout
+    )
     for idx, cfg_path in progress:
         preview = cfg_path.name
         try:

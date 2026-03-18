@@ -10,7 +10,6 @@ from einops import rearrange
 from huggingface_hub import snapshot_download
 from jax.sharding import AxisType, PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from torch.ao.quantization.fx.prepare import prepare
 from transformers import (
     AutoConfig,
     AutoTokenizer,
@@ -689,7 +688,7 @@ def init(
         config=config,
         weights=weights,
         forward=partial(forward, config),
-        prepare_weights=partial(prepare, config),
+        prepare_weights=partial(prepare_weights, config),
         tokenizer=tokenizer,
         embed=partial(embed, config),
         unembed=partial(unembed, config),

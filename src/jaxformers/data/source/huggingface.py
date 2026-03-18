@@ -104,7 +104,9 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
                 self._source.shard(num_shards=step, index=start, contiguous=False)
             )
 
-        return HuggingFaceSourceMapDataset(self._source.select(range(start, stop, step)))
+        return HuggingFaceSourceMapDataset(
+            self._source.select(range(start, stop, step))
+        )
 
     def shuffle(
         self,

@@ -58,9 +58,13 @@ def make_scan_fwd(
 
         missing_argnames = [name for name in argnames if name not in kwargs]
         if missing_argnames:
-            raise ValueError(f"Missing scanned keyword arguments: {missing_argnames!r}.")
+            raise ValueError(
+                f"Missing scanned keyword arguments: {missing_argnames!r}."
+            )
 
-        scan_values = [fwd_args[idx] for idx in argnums] + [kwargs[name] for name in argnames]
+        scan_values = [fwd_args[idx] for idx in argnums] + [
+            kwargs[name] for name in argnames
+        ]
         lengths = _get_scan_lengths(scan_values, in_axes)
         if len(set(lengths)) != 1 or lengths[0] != length:
             raise ValueError(

@@ -193,8 +193,7 @@ def _get_cycle_minima(
         if cycles <= 0:
             raise ValueError("cycles must be positive.")
         cycle_points = [
-            int(total_main_steps / cycles * (i + 1))
-            for i in range(cycles - 1)
+            int(total_main_steps / cycles * (i + 1)) for i in range(cycles - 1)
         ]
     elif isinstance(cycles, list):
         cycle_points = list(cycles)
@@ -227,8 +226,7 @@ def _inv_decay_schedule(lr: float, min_lr: float, decay_steps: int):
     def schedule(count):
         decay = jnp.minimum(
             1.0,
-            1.0
-            / ((lr / min_lr - 1) * jnp.maximum(count, 1) / decay_steps + 1),
+            1.0 / ((lr / min_lr - 1) * jnp.maximum(count, 1) / decay_steps + 1),
         )
         return jnp.maximum(lr * decay, min_lr)
 
@@ -237,9 +235,7 @@ def _inv_decay_schedule(lr: float, min_lr: float, decay_steps: int):
 
 def _convert_frac_or_steps(frac_or_steps: float | int, num_train_steps: int) -> int:
     """Interpret values <= 1 as fractions and larger integers as explicit steps."""
-    if frac_or_steps < 0.0 or (
-        frac_or_steps > 1.0 and frac_or_steps % 1 != 0
-    ):
+    if frac_or_steps < 0.0 or (frac_or_steps > 1.0 and frac_or_steps % 1 != 0):
         raise ValueError(
             f"Invalid fraction {frac_or_steps}. Must be between 0 and 1. "
             "You can also use whole steps."

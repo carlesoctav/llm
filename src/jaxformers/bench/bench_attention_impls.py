@@ -65,9 +65,15 @@ def main() -> None:
     key = jax.random.PRNGKey(0)
     kq, kk, kv = jax.random.split(key, 3)
 
-    q = jax.random.normal(kq, (batch, seqlen, num_q_heads, head_dim), dtype=jnp.bfloat16)
-    k = jax.random.normal(kk, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
-    v = jax.random.normal(kv, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    q = jax.random.normal(
+        kq, (batch, seqlen, num_q_heads, head_dim), dtype=jnp.bfloat16
+    )
+    k = jax.random.normal(
+        kk, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
+    v = jax.random.normal(
+        kv, (batch, seqlen, num_kv_heads, head_dim), dtype=jnp.bfloat16
+    )
 
     is_causal = mask_mode == "causal"
     mask = _make_bool_causal_mask(batch, seqlen) if mask_mode == "bool" else None
@@ -153,7 +159,9 @@ def main() -> None:
     out.block_until_ready()
     fwd_compile_s = time.perf_counter() - t0
     print("fwd_compile_time_s", fwd_compile_s)
-    print_compiled_memory_stats(fwd_jit.lower(q, k, v, mask).compile().memory_analysis())
+    print_compiled_memory_stats(
+        fwd_jit.lower(q, k, v, mask).compile().memory_analysis()
+    )
 
     # Forward steady.
     t0 = time.perf_counter()
@@ -171,7 +179,9 @@ def main() -> None:
     dv.block_until_ready()
     bwd_compile_s = time.perf_counter() - t0
     print("bwd_compile_time_s", bwd_compile_s)
-    print_compiled_memory_stats(bwd_jit.lower(q, k, v, mask).compile().memory_analysis())
+    print_compiled_memory_stats(
+        bwd_jit.lower(q, k, v, mask).compile().memory_analysis()
+    )
 
     # Backward steady.
     t0 = time.perf_counter()
@@ -191,4 +201,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

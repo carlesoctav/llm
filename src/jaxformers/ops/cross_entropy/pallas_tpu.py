@@ -327,7 +327,7 @@ def linear_softmax_cross_entropy_loss_fwd_pallas_mosaic_tpu(
             ),  # x
             pl.BlockSpec(
                 (block_sizes.b,),
-                lambda c, i, j, k: (c * num_b_blocks_per_core + i),
+                lambda c, i, j, k: c * num_b_blocks_per_core + i,
                 memory_space=pltpu.VMEM,
             ),  # labels
             pl.BlockSpec(
@@ -612,7 +612,7 @@ def _linear_softmax_cross_entropy_loss_bwd_pallas_mosaic_tpu_combined(
             ),
             pl.BlockSpec(  # labels
                 (block_sizes.b,),
-                lambda c, i, j, s, k: (c * num_b_blocks_per_core + i),
+                lambda c, i, j, s, k: c * num_b_blocks_per_core + i,
                 memory_space=pltpu.VMEM,
             ),
             pl.BlockSpec(  # w

@@ -197,13 +197,16 @@ def print_shared_lora_summary(train_model: Model, base_model: Model) -> None:
 
     print(f"LoRA/base shared leaves: {shared_count}/{total_lora}")
 
+
 def get_raw(weights):
     def _f(leaf):
         if isinstance(leaf, LoraArray):
             return leaf.w
         else:
             return leaf
-    return jtu.tree_map(_f, weights, is_leaf = lambda x: isinstance(x, LoraArray))
+
+    return jtu.tree_map(_f, weights, is_leaf=lambda x: isinstance(x, LoraArray))
+
 
 def train_step(
     config: sws.FinalConfig,

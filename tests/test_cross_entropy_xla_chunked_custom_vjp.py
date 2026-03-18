@@ -59,5 +59,9 @@ def test_xla_chunked_custom_vjp_forward_backward_matches_reference():
     dx_ref, dw_ref = jax.grad(obj_ref, argnums=(0, 1))(x, w)
     dx_xla, dw_xla = jax.grad(obj_xla, argnums=(0, 1))(x, w)
 
-    assert jnp.max(jnp.abs(dx_ref.astype(jnp.float32) - dx_xla.astype(jnp.float32))) < 2e-2
-    assert jnp.max(jnp.abs(dw_ref.astype(jnp.float32) - dw_xla.astype(jnp.float32))) < 2e-2
+    assert (
+        jnp.max(jnp.abs(dx_ref.astype(jnp.float32) - dx_xla.astype(jnp.float32))) < 2e-2
+    )
+    assert (
+        jnp.max(jnp.abs(dw_ref.astype(jnp.float32) - dw_xla.astype(jnp.float32))) < 2e-2
+    )

@@ -26,9 +26,11 @@ class StoreWeights(StrEnum):
     STACK = auto()
     FREE = auto()
 
+
 class ForwardImpl(StrEnum):
     LOOP = auto()
     SCAN_LAYER = auto()
+
 
 def logical_to_physical(logical, rules):
     spec = [rules[lo] for lo in logical]

@@ -81,7 +81,9 @@ def _query_chunk_attention(
         if mask_qhk is not None:
             mask_qhk = cast(Bool[Array, "Q #H K"], _pad_axis_last(mask_qhk, pad_kv))
 
-    query = query / jnp.sqrt(jnp.array(k_features, dtype=jnp.float32)).astype(query.dtype)
+    query = query / jnp.sqrt(jnp.array(k_features, dtype=jnp.float32)).astype(
+        query.dtype
+    )
 
     @functools.partial(jax.checkpoint, prevent_cse=False)
     def summarize_chunk(
@@ -241,6 +243,7 @@ def chunked_manual_dot_product_attention(
         avoid `vmap` sharding restrictions (masks are often replicated).
       - `bias` is supported for completeness, but most model paths pass `None`.
     """
+
     def axis_spec_is_nontrivial(mesh, axis_spec) -> bool:
         if axis_spec is None:
             return False
@@ -298,9 +301,11 @@ def chunked_manual_dot_product_attention(
 
         if batch_axis is not None and axis_spec_is_nontrivial(mesh, batch_axis):
             # Only support batch sharding for now.
-            if axis_spec_is_nontrivial(mesh, seq_axis) or axis_spec_is_nontrivial(
-                mesh, heads_axis
-            ) or axis_spec_is_nontrivial(mesh, dim_axis):
+            if (
+                axis_spec_is_nontrivial(mesh, seq_axis)
+                or axis_spec_is_nontrivial(mesh, heads_axis)
+                or axis_spec_is_nontrivial(mesh, dim_axis)
+            ):
                 raise NotImplementedError(
                     "chunked_manual attention only supports sharding on the batch axis."
                 )

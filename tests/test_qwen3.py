@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from jaxformers.models import qwen3
 
 
@@ -20,14 +21,16 @@ def test_correctness_qwen3_0_6_b_cpu():
     jax_model = qwen3.load(
         model_id="Qwen/Qwen3-0.6B",
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
-        local_dir = "~/hallo",
+        local_dir="~/hallo",
         devices=devices,
         param_dtype=jnp.float32,
     )
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
     test_str = "hallo saya makan nasi goreng"
     hf_token = tokenizer(test_str, return_tensors="pt")
-    jax_token = {k: jnp.asarray(v) for k, v in tokenizer(test_str, return_tensors="np").items()}
+    jax_token = {
+        k: jnp.asarray(v) for k, v in tokenizer(test_str, return_tensors="np").items()
+    }
 
     with torch.no_grad():
         hf_logits = hf_model(**hf_token).logits.to(torch.float32).cpu().numpy()
@@ -39,7 +42,6 @@ def test_correctness_qwen3_0_6_b_cpu():
 
 @pytest.mark.tpu_ci
 def test_pass_qwen3_0_6b_tpu_tp():
-
     try:
         tpu_devices = jax.devices("tpu")
     except RuntimeError:
@@ -50,10 +52,10 @@ def test_pass_qwen3_0_6b_tpu_tp():
     jax_model = qwen3.load(
         model_id="Qwen/Qwen3-0.6B",
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 4},
-        devices = tpu_devices[:4],
+        devices=tpu_devices[:4],
         param_dtype=jnp.float32,
     )
-    jax_token  = jnp.ones((1, 12), dtype = jnp.int32)
+    jax_token = jnp.ones((1, 12), dtype=jnp.int32)
     jax_logits = jax_model.forward(jax_token, weights=jax_model.weights)
 
     assert jax_logits.ndim == 3

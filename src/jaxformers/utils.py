@@ -1,8 +1,4 @@
 import typing as tp
-from typing import Any, Callable
-
-import wadler_lindig as wl
-from attr import dataclass
 
 
 K = tp.TypeVar("K")

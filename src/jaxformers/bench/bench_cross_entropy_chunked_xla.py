@@ -11,7 +11,6 @@ from jaxformers.ops.cross_entropy import cross_entropy_loss
 from jaxformers.ops.cross_entropy.config import infer_block_sizes
 
 
-
 def main() -> None:
     print("devices:", jax.devices())
 
@@ -32,7 +31,9 @@ def main() -> None:
     if block_sizes is None:
         print(
             "inferred_block_sizes:",
-            infer_block_sizes(implementation, batch * pos, embed, vocab, dtype=jnp.float32),
+            infer_block_sizes(
+                implementation, batch * pos, embed, vocab, dtype=jnp.float32
+            ),
         )
 
     def loss_fn(x_in, w_in, y_in):
@@ -59,7 +60,9 @@ def main() -> None:
     out.block_until_ready()
     compile_time = time.perf_counter() - start
 
-    print_compiled_memory_stats(loss_jit.lower(x_raw, w_raw, y_raw).compile().memory_analysis())
+    print_compiled_memory_stats(
+        loss_jit.lower(x_raw, w_raw, y_raw).compile().memory_analysis()
+    )
 
     steps = 5
     start = time.perf_counter()
@@ -97,4 +100,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

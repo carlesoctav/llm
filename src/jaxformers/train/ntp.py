@@ -31,7 +31,6 @@ from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
-from jaxformers.print_utils import tree_pprint
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
 
@@ -130,9 +129,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     inv_token_count = (1 / token_count).astype(config.forward_dtype)
     grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
 
-    updates, nst = model.tx.update(
-        grad, model.opt_state, model.weights
-    )
+    updates, nst = model.tx.update(grad, model.opt_state, model.weights)
 
     nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
     callback_state = model.callback_state
@@ -273,6 +270,7 @@ def train(
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with jax.named_scope("compile train step"):
+
                     @print_timing
                     def compile_train_step():
                         train_step_jit = jax.jit(
@@ -282,6 +280,7 @@ def train(
                         lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
                         train_step_fn = lower.compile()
                         return train_step_fn
+
                     train_step_fn = compile_train_step()
                     memory_stats = print_compiled_memory_stats(
                         train_step_fn.memory_analysis()
@@ -391,7 +390,9 @@ def main(config: sws.FinalConfig):
             model = make_lora(
                 model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
             )
-        model = dataclasses.replace(model, weights = model.prepare_weights(model.weights, config.store_weights))
+        model = dataclasses.replace(
+            model, weights=model.prepare_weights(model.weights, config.store_weights)
+        )
         model = make_optimizer(
             config.optimizer_name,
             model,

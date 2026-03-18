@@ -1,20 +1,19 @@
 from dataclasses import dataclass
-from typing import Tuple
 
-import numpy as np
 import jax
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 @dataclass(frozen=True)
 class ShardCheck:
     name: str
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     axis_dim: int
     axis_size: int
 
 
-def is_shardable(shape: Tuple[int, ...], axis_dim: int, axis_size: int) -> bool:
+def is_shardable(shape: tuple[int, ...], axis_dim: int, axis_size: int) -> bool:
     if axis_dim < 0 or axis_dim >= len(shape):
         raise ValueError(f"axis_dim {axis_dim} out of range for shape {shape}")
     return shape[axis_dim] % axis_size == 0

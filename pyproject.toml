@@ -48,6 +48,7 @@ optax = { git = "https://github.com/google-deepmind/optax" }
 [dependency-groups]
 dev = [
     "flax>=0.12.2",
+    "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "torch>=2.10.0",
     "torchax>=0.0.11",

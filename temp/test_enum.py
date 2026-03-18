@@ -1,8 +1,10 @@
-from enum import StrEnum, auto
+from enum import auto, StrEnum
+
 
 class Warna(StrEnum):
-    MERAH = auto()   # Nilainya otomatis menjadi "merah" (lowercase dari nama variabel)
-    BIRU = "biru"    # Nilai ditentukan secara manual
+    MERAH = auto()  # Nilainya otomatis menjadi "merah" (lowercase dari nama variabel)
+    BIRU = "biru"  # Nilai ditentukan secara manual
+
 
 # Perbandingan langsung (Ini akan menghasilkan True)
 print("merah" == Warna.MERAH)

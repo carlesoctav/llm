@@ -3,7 +3,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from transformers import AutoTokenizer
 from transformers.models.gemma3 import Gemma3ForCausalLM
 
 from jaxformers.models import gemma3
@@ -67,14 +66,16 @@ def test_gemma3_1b_it_cpu():
         hf_logits = (
             hf_model(
                 input_ids=torch.from_numpy(input_ids),
-                attention_mask = torch.from_numpy(attention_mask)
+                attention_mask=torch.from_numpy(attention_mask),
             )
             .logits.to(torch.float32)
             .cpu()
             .numpy()
         )
 
-    jax_logits = jax_model.forward(jax_model.weights, input_ids=input_ids , attention_mask = attention_mask)
+    jax_logits = jax_model.forward(
+        jax_model.weights, input_ids=input_ids, attention_mask=attention_mask
+    )
     np.testing.assert_allclose(jax_logits, hf_logits, atol=1e-2, rtol=1e-2)
 
 

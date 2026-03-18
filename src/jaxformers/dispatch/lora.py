@@ -8,7 +8,6 @@ import fnmatch
 import time
 from dataclasses import replace
 from enum import auto, StrEnum
-from functools import partial
 from typing import cast, TYPE_CHECKING
 
 import equinox as eqx
@@ -18,7 +17,6 @@ import jax.extend.core as jexc
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-import numpy as np
 import quax
 from jax import P
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
@@ -47,7 +45,6 @@ def make_lora(
     *,
     rngs: PRNGKeyArray | None = None,
 ) -> Model:
-
     if init_lora in (InitLora.RANDOM, None):
         if rngs is None:
             raise ValueError("random LoRA init requires an rng key")

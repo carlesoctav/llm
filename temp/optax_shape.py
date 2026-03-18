@@ -1,6 +1,8 @@
-from jaxformers.optimizers import adam
 import jax
 from jaxformers.callback.log_learning_rate import log_learning_rate
+
+from jaxformers.optimizers import adam
+
 
 w = jax.random.normal(jax.random.key(10), (12, 1000))
 tx = adam.make(1e-5, 1, 1.0)

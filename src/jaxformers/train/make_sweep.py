@@ -22,8 +22,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from etils import epath
 import sws
+from etils import epath
 
 from jaxformers.sweep_utils import build_sweep_space
 from jaxformers.sws_utils import run as sws_run
@@ -56,7 +56,9 @@ def render_config_file(base_config_path: str, overrides: dict[str, Any]) -> str:
     lines.append("")
     lines.append("from jaxformers.sws_utils import load_config_builder")
     lines.append("")
-    lines.append(f"BASE_CONFIG_PATH = str(Path(__file__).with_name({base_config_name!r}))")
+    lines.append(
+        f"BASE_CONFIG_PATH = str(Path(__file__).with_name({base_config_name!r}))"
+    )
     lines.append("OVERRIDES = " + repr(list(overrides.items())))
     lines.append("")
     lines.append("def get_config() -> sws.Config:")
@@ -144,7 +146,9 @@ def main(config: sws.FinalConfig) -> None:
     manifest: list[dict[str, Any]] = []
     for run_idx, (group_idx, run_overrides) in enumerate(run_items):
         cfg_path = out_dir / f"{run_idx}.py"
-        cfg_path.write_text(render_config_file(str(copied_base_config_path), run_overrides))
+        cfg_path.write_text(
+            render_config_file(str(copied_base_config_path), run_overrides)
+        )
         manifest.append(
             {
                 "run_idx": run_idx,

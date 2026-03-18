@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import textwrap
 
-from jaxformers.sws_utils import combine_and_write, load_config_builder, merge_config_builders, run
+from jaxformers.sws_utils import (
+    combine_and_write,
+    load_config_builder,
+    merge_config_builders,
+    run,
+)
 
 
 def write_config(path, body: str) -> None:

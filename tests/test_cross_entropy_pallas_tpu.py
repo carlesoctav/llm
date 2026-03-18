@@ -3,7 +3,9 @@ import jax.numpy as jnp
 import pytest
 
 from jaxformers.ops.cross_entropy.config import infer_block_sizes
-from jaxformers.ops.cross_entropy.pallas_tpu import linear_softmax_cross_entropy_loss_pallas
+from jaxformers.ops.cross_entropy.pallas_tpu import (
+    linear_softmax_cross_entropy_loss_pallas,
+)
 from jaxformers.ops.cross_entropy.reference import cross_entropy_reference
 
 
@@ -64,5 +66,9 @@ def test_pallas_cross_entropy_forward_backward_matches_reference():
     dx_ref, dw_ref = jax.grad(obj_ref, argnums=(0, 1))(x, w)
     dx_pal, dw_pal = jax.grad(obj_pal, argnums=(0, 1))(x, w)
 
-    assert jnp.max(jnp.abs(dx_ref.astype(jnp.float32) - dx_pal.astype(jnp.float32))) < 1e-2
-    assert jnp.max(jnp.abs(dw_ref.astype(jnp.float32) - dw_pal.astype(jnp.float32))) < 1e-2
+    assert (
+        jnp.max(jnp.abs(dx_ref.astype(jnp.float32) - dx_pal.astype(jnp.float32))) < 1e-2
+    )
+    assert (
+        jnp.max(jnp.abs(dw_ref.astype(jnp.float32) - dw_pal.astype(jnp.float32))) < 1e-2
+    )

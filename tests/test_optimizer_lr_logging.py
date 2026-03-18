@@ -2,9 +2,9 @@ import jax.numpy as jnp
 import optax
 
 from jaxformers.optimizers.lr import (
+    custom_scale_by_learning_rate,
     get_logged_learning_rate,
     get_logged_step_size,
-    custom_scale_by_learning_rate,
 )
 
 

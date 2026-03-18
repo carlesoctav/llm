@@ -1,14 +1,8 @@
 from dataclasses import replace
 
-import equinox
-import jax
-import jax.numpy as jnp
 import jax.tree_util as jtu
-import optax
 
-from jaxformers import tree_util
 from jaxformers.dispatch.lora import LoraArray
-from jaxformers.optimizers.lr import ScaleByLearningRateState
 
 
 def mask_trainable_lora(params):

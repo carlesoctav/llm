@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 import dataclasses
 import sys
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import optax
 import orbax.checkpoint as ocp
 import sws
 from jax.experimental.rnn import PRNGKeyArray
@@ -23,51 +25,71 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_ntp_data
-from jaxformers.dispatch.lora import make_lora
+from jaxformers.data import make_dataset
+from jaxformers.dispatch.lora import LoraArray, make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
-from jaxformers.models import make_model
+from jaxformers.models import make_model, prepare_weights as prepare_model_weights
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
+from jaxformers.print_utils import tree_pprint
 from jaxformers.scheduler import make_scheduler
-from jaxformers.sws_utils import run as sws_run
+from jaxformers.sws_utils import merge_config_builders, run as sws_run
 
 
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_PATHS = [
+    str(ROOT / "experiments/tunix-repro/name_base_config.py"),
+    str(ROOT / "experiments/tunix-repro/model_base_config.py"),
+    str(ROOT / "experiments/tunix-repro/data_base_config.py"),
+    str(ROOT / "experiments/tunix-repro/optimizer_base_config.py"),
+    str(ROOT / "experiments/tunix-repro/scheduler_base_config.py"),
+]
 DEFAULT_REDUCED = {
     "loss": "mean",
     "token": "sum",
     "batch": "sum",
-    "sft.loss": "mean",
-    "sft.token": "sum",
-    "sft.batch": "sum",
-    "kl.loss": "mean",
-    "kl.token": "sum",
-    "kl.batch": "sum",
+    "teacher_probe": "mean",
 }
 DEFAULT_AUX = {
     "loss": (0.0, 0),
     "token": 0,
     "batch": 0,
-    "sft.loss": (0.0, 0),
-    "sft.token": 0,
-    "sft.batch": 0,
-    "kl.loss": (0.0, 0),
-    "kl.token": 0,
-    "kl.batch": 0,
+    "teacher_probe": (0.0, 0),
 }
+DEFAULT_LORA_PATHS = [
+    "*.q_proj.weight",
+    "*.k_proj.weight",
+    "*.v_proj.weight",
+    "*.o_proj.weight",
+    "*.gate_proj.weight",
+    "*.up_proj.weight",
+    "*.down_proj.weight",
+]
+
+
+def get_config() -> sws.Config:
+    config = merge_config_builders(CONFIG_PATHS)
+
+    config.init_lora = "random"
+    config.lora.rank = 256
+    config.lora.alpha = 512
+    config.lora.weights_path = list(DEFAULT_LORA_PATHS)
+
+    config.model.additional_config.forward_impl = "scan_layer"
+    config.model.additional_config.remat_layer = True
+
+    config.max_train_step = 1000
+    config.logger_name = "noop"
+    config.callback_name = []
+    config.checkpoint_options.save_interval_steps = 0
+    config.data.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+
+    return config
 
 
 def _preparse_absl_flags() -> None:
-    """Avoid absl.flags crashing on this script's CLI args.
-
-    Some dependencies (e.g. `tokamax`) lazily call `absl.flags.FLAGS(sys.argv)`,
-    which raises `UnrecognizedFlagError` when our program is launched with
-    non-absl flags like `--config` (used by `sws`).
-
-    We pre-parse once with `known_only=True` so absl marks flags as parsed while
-    ignoring unknown args.
-    """
+    """Avoid absl.flags crashing on this script's CLI args."""
 
     try:
         from absl import flags
@@ -77,7 +99,6 @@ def _preparse_absl_flags() -> None:
     if flags.FLAGS.is_parsed():
         return
 
-    # Ensure tokamax' absl flags are registered before parsing, if available.
     try:
         import tokamax._src.config as _tokamax_config  # noqa: F401
     except Exception:
@@ -86,161 +107,17 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def train_step(
-    config: sws.FinalConfig, model: Model, base_model: Model | None, batch, *, rngs
-):
-    def kl_loss_fn(train_weights, frozen_weights, batch, rngs):
-        weights = tree_util.combine(train_weights, frozen_weights)
-        forward_dtype = config.forward_dtype
-        if "assistant_masks" in batch["kl_inputs"]:
-            count = jnp.sum(
-                batch["kl_inputs"]["attention_mask"]
-                * batch["kl_inputs"]["assistant_masks"]
-            )
-            mask = batch["kl_inputs"]["attention_mask"] * batch["kl_inputs"]["assistant_masks"]
-        else:
-            count = jnp.sum(batch["kl_inputs"]["attention_mask"])
-            mask = batch["kl_inputs"]["attention_mask"]
+def _to_host(tree):
+    tree = jax.device_get(tree)
 
-        hidden_states = model.forward(
-            weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
-        )
-        log_probs = jax.nn.log_softmax(model.unembed(weights, hidden_states), axis=-1)
+    def _item(value):
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return value.item()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
 
-        if model.is_lora:
-            base_weights = model.base_params
-            kl_hidden_states = model.forward(
-                base_weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
-            )
-            kl_log_probs = jax.nn.log_softmax(
-                model.unembed(base_weights, kl_hidden_states),
-                axis=-1,
-            )
-        else:
-            kl_hidden_states = base_model.forward(
-                base_model.weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
-            )
-            kl_log_probs = jax.nn.log_softmax(
-                base_model.unembed(base_model.weights, kl_hidden_states),
-                axis=-1,
-            )
-
-        kl_loss = (
-            optax.losses.kl_divergence_with_log_targets(log_probs, kl_log_probs) * mask
-        ).sum()
-
-        return kl_loss, {
-            "loss": (kl_loss, count),
-            "token": count,
-            "batch": batch["kl_inputs"]["input_ids"].shape[0],
-        }
-
-
-    def sft_loss_fn(train_weights, frozen_weights, batch, rngs):
-        weights = tree_util.combine(train_weights, frozen_weights)
-        forward_dtype = config.forward_dtype
-
-        hidden_states = model.forward(
-            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
-        )
-
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        labels = batch["labels"].reshape(-1)
-
-        if "assistant_masks" in batch["inputs"]:
-            count = jnp.sum(
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
-            )
-            mask = (
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
-            ).reshape(-1)
-        else:
-            count = jnp.sum(batch["inputs"]["attention_mask"])
-            mask = (batch["inputs"]["attention_mask"]).reshape(-1)
-        loss = cross_entropy_loss(
-            hidden_states,
-            labels,
-            (
-                # The fused XLA chunked CE kernel currently assumes replicated
-                # vocab weights; avoid forcing replication for the reference
-                # implementation to match Tunix's fsdp-sharded embed/lm_head.
-                jax.reshard(
-                    weights[model.lm_head_key],
-                    logical_to_physical(("none", "none"), model.config.sharding_rules),
-                )
-                if (config.loss_implementation or None) != "reference"
-                else weights[model.lm_head_key]
-            ),
-            reduction="sum",
-            weight=mask,
-            implementation=config.loss_implementation or None,
-        )
-
-        batch_size = batch["labels"].shape[0]
-        aux = {"loss": (loss, count), "token": count, "batch": batch_size}
-        return loss, aux
-
-    train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
-
-    if config.grad_accum > 1:
-        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
-        sft_grad_fn = microbatch(
-            jax.value_and_grad(sft_loss_fn, has_aux=True),
-            argnums=2,
-            microbatch_size=microbatch_size,
-        )
-
-        kl_grad_fn = microbatch(
-            jax.value_and_grad(kl_loss_fn, has_aux=True),
-            argnums=2,
-            microbatch_size=microbatch_size,
-        )
-    else:
-        sft_grad_fn = jax.value_and_grad(sft_loss_fn, has_aux=True)
-        kl_grad_fn = jax.value_and_grad(kl_loss_fn, has_aux=True)
-
-    (sft_loss, sft_aux), sft_grad = sft_grad_fn(
-        train_weights, frozen_weights, batch, rngs
-    )
-    (kl_loss, kl_aux), kl_grad = kl_grad_fn(train_weights, frozen_weights, batch, rngs)
-
-    sft_token_count = sft_aux["token"]
-    kl_token_count = kl_aux["token"]
-
-    sft_inv_token_count = (1 / sft_token_count).astype(config.forward_dtype)
-    kl_inv_token_count = (1 / kl_token_count).astype(config.forward_dtype)
-    sft_grad = jtu.tree_map(lambda g: g * sft_inv_token_count, sft_grad)
-    kl_grad = jtu.tree_map(lambda g: g * kl_inv_token_count, kl_grad)
-
-    grad = jtu.tree_map(
-        lambda g1, g2: config.loss_ratio.sft_loss * g1 + config.loss_ratio.kl_loss * g2,
-        sft_grad,
-        kl_grad,
-    )
-
-    updates, nst = model.tx.update(grad, model.opt_state, model.weights)
-    nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
-    total_aux = add_aux(sft_aux, kl_aux)
-    aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
-
-    callback_state = model.callback_state
-    if model.callback_state is not None:
-        callback_state = model.callbacks.update(
-            model.callback_state,
-            grad,
-            updates,
-            nst,
-            nweights,
-            aux,
-        )
-
-    return dataclasses.replace(
-        model, weights=nweights, opt_state=nst, callback_state=callback_state
-    ), aux
-
-
-def eval(model, eval_ds):
-    raise NotImplementedError
+    return jtu.tree_map(_item, tree)
 
 
 def process_aux(accum_aux: dict[str, Any], namespace=""):
@@ -252,20 +129,6 @@ def process_aux(accum_aux: dict[str, Any], namespace=""):
 
     prefix = f"{namespace}/" if namespace else ""
     return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
-
-
-def _to_host(tree):
-    tree = jax.device_get(tree)
-    flat_tree = tree_util.flatten(tree, is_leaf=lambda x: isinstance(x, tuple))
-
-    def _item(value):
-        if isinstance(value, np.ndarray) and value.shape == ():
-            return value.item()
-        if isinstance(value, np.generic):
-            return value.item()
-        return value
-
-    return jtu.tree_map(_item, flat_tree)
 
 
 def add_aux(accum_aux, aux):
@@ -298,10 +161,170 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
     return {k: to_py(v) for k, v in metrics.items()}
 
 
+def _strip_lora_weights(weights):
+    is_lora_array = lambda x: isinstance(x, LoraArray)
+    return jtu.tree_map(
+        lambda leaf: leaf._w if isinstance(leaf, LoraArray) else leaf,
+        weights,
+        is_leaf=is_lora_array,
+    )
+
+
+def make_base_model_from_train_model(train_model: Model) -> Model:
+    base_weights = _strip_lora_weights(train_model.weights)
+    return dataclasses.replace(
+        train_model,
+        weights=base_weights,
+        is_lora=False,
+        train_mask=None,
+        tx=None,
+        opt_state=None,
+        callback_state=None,
+        callbacks=None,
+    )
+
+
+def print_shared_lora_summary(train_model: Model, base_model: Model) -> None:
+    shared_count = 0
+    total_lora = 0
+
+    for key, train_leaf in train_model.weights.items():
+        if not isinstance(train_leaf, LoraArray):
+            continue
+        total_lora += 1
+        if train_leaf._w is base_model.weights[key]:
+            shared_count += 1
+
+    print(f"LoRA/base shared leaves: {shared_count}/{total_lora}")
+
+
+def train_step(
+    config: sws.FinalConfig,
+    train_model: Model,
+    base_model: Model,
+    batch,
+    *,
+    rngs,
+):
+    def loss_fn(train_weights, frozen_weights, batch, rngs):
+        weights = tree_util.combine(train_weights, frozen_weights)
+        forward_dtype = config.forward_dtype
+
+        hidden_states = train_model.forward(
+            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
+        )
+
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        labels = batch["labels"].reshape(-1)
+
+        if "assistant_masks" in batch["inputs"]:
+            count = jnp.sum(
+                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+            )
+            mask = (
+                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+            ).reshape(-1)
+        else:
+            count = jnp.sum(batch["inputs"]["attention_mask"])
+            mask = batch["inputs"]["attention_mask"].reshape(-1)
+
+        loss = cross_entropy_loss(
+            hidden_states,
+            labels,
+            (
+                jax.reshard(
+                    weights[train_model.lm_head_key],
+                    logical_to_physical(
+                        ("none", "none"),
+                        train_model.config.sharding_rules,
+                    ),
+                )
+                if (config.loss_implementation or None) != "reference"
+                else weights[train_model.lm_head_key]
+            ),
+            reduction="sum",
+            weight=mask,
+            implementation=config.loss_implementation or None,
+        )
+
+        batch_size = batch["labels"].shape[0]
+        aux = {"loss": (loss, count), "token": count, "batch": batch_size}
+        return loss, aux
+
+    train_weights, frozen_weights = tree_util.partition(
+        train_model.weights,
+        train_model.train_mask,
+    )
+
+    if config.grad_accum > 1:
+        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
+        grad_fn = microbatch(
+            jax.value_and_grad(loss_fn, has_aux=True),
+            argnums=2,
+            microbatch_size=microbatch_size,
+        )
+    else:
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+
+    (loss, aux), grad = grad_fn(train_weights, frozen_weights, batch, rngs)
+
+    token_count = aux["token"]
+    inv_token_count = (1 / token_count).astype(config.forward_dtype)
+    grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
+
+    updates, nst = train_model.tx.update(
+        grad,
+        train_model.opt_state,
+        train_model.weights,
+        count=token_count,
+    )
+    nweights = tree_util.apply_updates(
+        train_model.weights,
+        updates,
+        config.forward_dtype,
+    )
+    teacher_hidden = base_model.forward(
+        base_model.weights,
+        **batch["inputs"],
+        rngs=rngs,
+        dtype=config.forward_dtype,
+    )
+    teacher_probe = teacher_hidden[..., 0].mean().astype(jnp.float32)
+    aux = {
+        **aux,
+        "teacher_probe": (
+            teacher_probe,
+            jnp.asarray(1, dtype=jnp.int32),
+        ),
+    }
+
+    callback_state = train_model.callback_state
+    if train_model.callback_state is not None:
+        callback_state = train_model.callbacks.update(
+            train_model.callback_state,
+            grad,
+            updates,
+            nst,
+            nweights,
+            aux,
+        )
+
+    return dataclasses.replace(
+        train_model,
+        weights=nweights,
+        opt_state=nst,
+        callback_state=callback_state,
+    ), aux
+
+
+def eval(model, eval_ds):
+    raise NotImplementedError
+
+
 def train(
     config,
-    model: Model,
-    base_model: Model | None,
+    train_model: Model,
+    base_model: Model,
     train_ds,
     eval_ds,
     logger,
@@ -309,7 +332,7 @@ def train(
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
-    step = model.step or 0
+    step = train_model.step or 0
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
@@ -340,8 +363,8 @@ def train(
     try:
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
-                eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(jax.device_get(eval_aux))
+                eval_aux = eval(train_model, eval_ds)
+                _ = process_aux(jax.device_get(eval_aux))
 
             try:
                 batch = next(train_iterator)
@@ -368,16 +391,15 @@ def train(
                     def compile_train_step():
                         train_step_jit = jax.jit(
                             partial(train_step, config),
-                            donate_argnums=(0,),
+                            # donate_argnums=(0, 1),
                         )
                         lower = train_step_jit.lower(
-                            model,
+                            train_model,
                             base_model,
                             batch,
                             rngs=loop_rngs,
                         )
-                        train_step_fn = lower.compile()
-                        return train_step_fn
+                        return lower.compile()
 
                     train_step_fn = compile_train_step()
                     memory_stats = print_compiled_memory_stats(
@@ -385,12 +407,14 @@ def train(
                     )
                     cost = print_flops(train_step_fn.cost_analysis())
 
-                    to_log_later.update(memory_stats)
-                    to_log_later.update(cost)
+                    if memory_stats is not None:
+                        to_log_later.update(memory_stats)
+                    if cost is not None:
+                        to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(
-                        model,
+                    train_model, aux = train_step_fn(
+                        train_model,
                         base_model,
                         batch,
                         rngs=loop_rngs,
@@ -401,21 +425,24 @@ def train(
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                 ):
-                    model, aux = train_step_fn(
-                        model,
+                    train_model, aux = train_step_fn(
+                        train_model,
                         base_model,
                         batch,
                         rngs=loop_rngs,
                     )
 
             callback_output = {}
-            if model.callback_state is not None:
-                callback_output, callback_state = model.callbacks.process(
+            if train_model.callback_state is not None:
+                callback_output, callback_state = train_model.callbacks.process(
                     {},
-                    model.callback_state,
+                    train_model.callback_state,
                     aux,
                 )
-                model = dataclasses.replace(model, callback_state=callback_state)
+                train_model = dataclasses.replace(
+                    train_model,
+                    callback_state=callback_state,
+                )
             host_aux = _to_host(aux)
             global_aux = add_aux(global_aux, host_aux)
             processed_aux = process_aux(host_aux, "step")
@@ -435,8 +462,8 @@ def train(
                 ckpt_manager.save(
                     step,
                     args=ocp.args.Composite(
-                        weights=ocp.args.StandardSave(model.weights),
-                        opt_state=ocp.args.StandardSave(model.opt_state),
+                        weights=ocp.args.StandardSave(train_model.weights),
+                        opt_state=ocp.args.StandardSave(train_model.opt_state),
                         step=ocp.args.JsonSave(int(step)),
                     ),
                 )
@@ -463,13 +490,13 @@ def train(
         if ckpt_manager is not None:
             ckpt_manager.close()
 
-    return model, to_log_later
+    return train_model, to_log_later
 
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    do_callback = getattr(config, "callback_name", None)
-    do_lora = getattr(config, "lora", None)
+    do_callback = hasattr(config, "callback_name") and bool(config.callback_name)
+    do_lora = hasattr(config, "lora")
 
     logger = None
     if jax.process_index() == 0:
@@ -480,13 +507,22 @@ def main(config: sws.FinalConfig):
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
-        model = make_model(
+        train_model = make_model(
             config.model_name,
             config.init_model,
             config.model.to_dict(),
             rngs=model_rngs,
         )
-        base_model = dataclasses.replace(model)
+
+        def copy_tree(tree):
+            def _f(leaf):
+                return leaf.copy()
+
+            return jtu.tree_map(_f, tree)
+
+        # base_model = dataclasses.replace(
+        #     train_model, weights=copy_tree(train_model.weights)
+        # )
         scheduler_config = (
             config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
         )
@@ -497,42 +533,38 @@ def main(config: sws.FinalConfig):
             scheduler_config=scheduler_config,
         )
         if do_lora:
-            model = make_lora(
-                model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+            train_model = make_lora(
+                train_model,
+                config.init_lora,
+                config.lora.to_dict(),
+                rngs=lora_rngs,
             )
-        model = dataclasses.replace(
-            model,
-            weights=model.prepare_weights(model.weights, config.store_weights),
-        )
-        model = make_optimizer(
+        train_model = prepare_model_weights(config.model_name, train_model)
+        base_model = make_base_model_from_train_model(train_model)
+        # base_model = prepare_model_weights(config.model_name, base_model)
+        tree_pprint(base_model.weights)
+        print_shared_lora_summary(train_model, base_model)
+
+        train_model = make_optimizer(
             config.optimizer_name,
-            model,
+            train_model,
             scheduler,
             config.optimizer.to_dict(),
         )
-        print_train_state_size(model)
-
-        if do_lora:
-            base_model = None
-        else:
-            base_model = dataclasses.replace(
-                base_model,
-                weights=base_model.prepare_weights(
-                    base_model.weights,
-                    config.store_weights,
-                ),
-            )
-            base_model = tree_util.copy(base_model)
+        print_train_state_size(train_model)
 
         if do_callback:
             callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
-            model = dataclasses.replace(
-                model,
-                callback_state=callbacks.init(model.weights, model.opt_state),
+            train_model = dataclasses.replace(
+                train_model,
+                callback_state=callbacks.init(
+                    train_model.weights,
+                    train_model.opt_state,
+                ),
                 callbacks=callbacks,
             )
 
-        train_ds = make_ntp_data(
+        train_ds = make_dataset(
             config.data.source_name,
             config.data.source.to_dict(),
             config.data.transforms_name,
@@ -542,7 +574,13 @@ def main(config: sws.FinalConfig):
         )
         eval_ds = None
         _, metrics = train(
-            config, model, base_model, train_ds, eval_ds, logger, rngs=train_rngs
+            config,
+            train_model,
+            base_model,
+            train_ds,
+            eval_ds,
+            logger,
+            rngs=train_rngs,
         )
         return metrics
     finally:

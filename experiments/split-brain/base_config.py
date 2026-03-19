@@ -1,7 +1,21 @@
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import sws
 from transformers import AutoTokenizer
+
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_LORA_PATHS = [
+    "*.q_proj.weight",
+    "*.k_proj.weight",
+    "*.v_proj.weight",
+    "*.o_proj.weight",
+    "*.gate_proj.weight",
+    "*.up_proj.weight",
+    "*.down_proj.weight",
+]
 
 
 def get_config():
@@ -9,65 +23,75 @@ def get_config():
 
     config.skip_eval = True
 
-    config.exp_name = ""
-    config.project_name = ""
+    config.exp_name = "gemma3-1b-it-lora-kl"
+    config.project_name = "split-brain"
     config.dir = "gs://carles-git-good"
     config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.seed = 42
     config.eval_every = None
-    config.max_train_step = 10_000
+    config.max_train_step = 1000
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_implementation = "reference"
     config.grad_accum = 4
 
-    config.logger_name = "wandb"
+    config.loss_ratio.sft_loss = 1.0
+    config.loss_ratio.kl_loss = 1.0
 
-    config.use_checkpoint = False
-    config.checkpoint_options.save_interval_steps = 2500
-    config.checkpoint_options.max_to_keep = 1
-
+    config.logger_name = "noop"
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
 
-    config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
-    config.callback.log_performance.real_step_threshold = 0
-    config.callback.log_performance.denom_keys = ["token"]
+    config.callback_name = []
+
+    config.checkpoint_options.save_interval_steps = 0
+    config.checkpoint_options.max_to_keep = 1
 
     config.init_model = "pretrained"
-    config.init_lora = None
+    config.init_lora = "random"
     config.store_weights = "stack"
-
     config.model_name = "huggingface.gemma3"
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.model.model_id = "google/gemma-3-1b-it"
-    config.model.additional_config.remat_layer = False
+    config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_implementation = "sdpa"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.forward_impl = "scan_layer"
-
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
+    config.lora.rank = 256
+    config.lora.alpha = 512
+    config.lora.weights_path = list(DEFAULT_LORA_PATHS)
+
     config.data.source_name = "huggingface"
-    config.data.source.streaming=True
     config.data.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
             "split": "train",
+            "streaming": False,
         }
     ]
 
-    config.data.transforms.column = "messages"
+    config.data.transforms_name = "ntp_kl"
+    config.data.transforms.column = "messages_sft"
+    config.data.transforms.kl_column = "messages_kl"
     config.data.transforms.max_length = 2048
+    config.data.transforms.kl_max_length = 2048
     config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
         config.model.model_id
     )
     config.data.transforms.data_type = "chat"
     config.data.transforms.assistant_loss = True
-    config.data.transforms.chat_template_path = "./temp/think.jinja"
-    config.data.transforms.packing = True
+    config.data.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.transforms.kl_chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.transforms.packing = False
+    config.data.transforms.packing_bins = 64
 
-    config.data.loader.batch_size = 32
+    config.train_loader_name = "simple"
+    config.train_loader.global_batch_size = 32
+    config.train_loader.seed = 42
+    config.train_loader.shuffle = False
+    config.train_loader.drop_remainder = True
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

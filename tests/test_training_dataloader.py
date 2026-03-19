@@ -6,7 +6,7 @@ from datasets import Dataset, IterableDataset
 from grain import transforms as grain_transforms
 from jax.sharding import Mesh, PartitionSpec
 
-from jaxformers.data.loader.simple import make
+from jaxformers.data.loader.simple import make_simple_loader
 
 
 @dc.dataclass
@@ -58,10 +58,10 @@ def _flatten_batches(dataset, key: str) -> list[int]:
 
 def test_training_cpu_only():
     ds = text_iterable_dataset(8)
-    dl = make(
+    dl = make_simple_loader(
         datasets=ds,
         transforms=[SimpleTokenize(max_length=4)],
-        global_batch_size=4,
+        batch_size=4,
         dataloading_host_index=0,
         dataloading_host_count=1,
         shuffle=False,
@@ -89,10 +89,10 @@ def test_training_single_host_tpu():
     mesh = Mesh(np.array([jax.devices()[0]]), ("data",))
     pspec = PartitionSpec("data")
 
-    dl = make(
+    dl = make_simple_loader(
         datasets=ds,
         transforms=[SimpleTokenize(max_length=4)],
-        global_batch_size=4,
+        batch_size=4,
         dataloading_host_index=0,
         dataloading_host_count=1,
         shuffle=False,
@@ -145,10 +145,10 @@ def test_training_mix_two_datasets_cpu_only():
     ds_a = text_iterable_dataset(4, source=0)
     ds_b = text_iterable_dataset(4, source=1)
 
-    dl = make(
+    dl = make_simple_loader(
         datasets=[ds_a, ds_b],
         transforms=[SimpleTokenize(max_length=4)],
-        global_batch_size=2,
+        batch_size=2,
         dataloading_host_index=0,
         dataloading_host_count=1,
         shuffle=False,

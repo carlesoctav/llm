@@ -576,7 +576,6 @@ def init(
         axis_types=axis_types,
         devices=devices,
     )
-    jax.set_mesh(mesh)
 
     counter = 0
 
@@ -608,80 +607,81 @@ def init(
 
     weights: dict[str, Array] = {}
 
-    weights["model.embed_tokens.weight"] = init_param(
-        "model.embed_tokens.weight", (vocab_size, hidden_size)
-    )
-    if not config.tie_word_embeddings:
-        weights["lm_head.weight"] = init_param(
-            "lm_head.weight", (vocab_size, hidden_size)
+    with jax.set_mesh(mesh):
+        weights["model.embed_tokens.weight"] = init_param(
+            "model.embed_tokens.weight", (vocab_size, hidden_size)
         )
-
-    for layer_idx in range(num_hidden_layers):
-        prefix = f"model.layers.{layer_idx}."
-        weights[f"{prefix}input_layernorm.weight"] = init_param(
-            f"{prefix}input_layernorm.weight", (hidden_size,)
-        )
-        weights[f"{prefix}post_attention_layernorm.weight"] = init_param(
-            f"{prefix}post_attention_layernorm.weight", (hidden_size,)
-        )
-        weights[f"{prefix}pre_feedforward_layernorm.weight"] = init_param(
-            f"{prefix}pre_feedforward_layernorm.weight", (hidden_size,)
-        )
-        weights[f"{prefix}post_feedforward_layernorm.weight"] = init_param(
-            f"{prefix}post_feedforward_layernorm.weight", (hidden_size,)
-        )
-
-        q_out = num_attention_heads * head_dim
-        kv_out = num_key_value_heads * head_dim
-
-        weights[f"{prefix}self_attn.q_proj.weight"] = init_param(
-            f"{prefix}self_attn.q_proj.weight", (q_out, hidden_size)
-        )
-        weights[f"{prefix}self_attn.k_proj.weight"] = init_param(
-            f"{prefix}self_attn.k_proj.weight", (kv_out, hidden_size)
-        )
-        weights[f"{prefix}self_attn.v_proj.weight"] = init_param(
-            f"{prefix}self_attn.v_proj.weight", (kv_out, hidden_size)
-        )
-        weights[f"{prefix}self_attn.o_proj.weight"] = init_param(
-            f"{prefix}self_attn.o_proj.weight", (hidden_size, q_out)
-        )
-
-        if config.attention_bias:
-            weights[f"{prefix}self_attn.q_proj.bias"] = init_param(
-                f"{prefix}self_attn.q_proj.bias", (q_out,)
-            )
-            weights[f"{prefix}self_attn.k_proj.bias"] = init_param(
-                f"{prefix}self_attn.k_proj.bias", (kv_out,)
-            )
-            weights[f"{prefix}self_attn.v_proj.bias"] = init_param(
-                f"{prefix}self_attn.v_proj.bias", (kv_out,)
-            )
-            weights[f"{prefix}self_attn.o_proj.bias"] = init_param(
-                f"{prefix}self_attn.o_proj.bias", (hidden_size,)
+        if not config.tie_word_embeddings:
+            weights["lm_head.weight"] = init_param(
+                "lm_head.weight", (vocab_size, hidden_size)
             )
 
-        weights[f"{prefix}self_attn.q_norm.weight"] = init_param(
-            f"{prefix}self_attn.q_norm.weight", (head_dim,)
-        )
-        weights[f"{prefix}self_attn.k_norm.weight"] = init_param(
-            f"{prefix}self_attn.k_norm.weight", (head_dim,)
-        )
+        for layer_idx in range(num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}."
+            weights[f"{prefix}input_layernorm.weight"] = init_param(
+                f"{prefix}input_layernorm.weight", (hidden_size,)
+            )
+            weights[f"{prefix}post_attention_layernorm.weight"] = init_param(
+                f"{prefix}post_attention_layernorm.weight", (hidden_size,)
+            )
+            weights[f"{prefix}pre_feedforward_layernorm.weight"] = init_param(
+                f"{prefix}pre_feedforward_layernorm.weight", (hidden_size,)
+            )
+            weights[f"{prefix}post_feedforward_layernorm.weight"] = init_param(
+                f"{prefix}post_feedforward_layernorm.weight", (hidden_size,)
+            )
 
-        weights[f"{prefix}mlp.gate_proj.weight"] = init_param(
-            f"{prefix}mlp.gate_proj.weight", (intermediate_size, hidden_size)
-        )
-        weights[f"{prefix}mlp.up_proj.weight"] = init_param(
-            f"{prefix}mlp.up_proj.weight", (intermediate_size, hidden_size)
-        )
-        weights[f"{prefix}mlp.down_proj.weight"] = init_param(
-            f"{prefix}mlp.down_proj.weight", (hidden_size, intermediate_size)
-        )
+            q_out = num_attention_heads * head_dim
+            kv_out = num_key_value_heads * head_dim
+
+            weights[f"{prefix}self_attn.q_proj.weight"] = init_param(
+                f"{prefix}self_attn.q_proj.weight", (q_out, hidden_size)
+            )
+            weights[f"{prefix}self_attn.k_proj.weight"] = init_param(
+                f"{prefix}self_attn.k_proj.weight", (kv_out, hidden_size)
+            )
+            weights[f"{prefix}self_attn.v_proj.weight"] = init_param(
+                f"{prefix}self_attn.v_proj.weight", (kv_out, hidden_size)
+            )
+            weights[f"{prefix}self_attn.o_proj.weight"] = init_param(
+                f"{prefix}self_attn.o_proj.weight", (hidden_size, q_out)
+            )
+
+            if config.attention_bias:
+                weights[f"{prefix}self_attn.q_proj.bias"] = init_param(
+                    f"{prefix}self_attn.q_proj.bias", (q_out,)
+                )
+                weights[f"{prefix}self_attn.k_proj.bias"] = init_param(
+                    f"{prefix}self_attn.k_proj.bias", (kv_out,)
+                )
+                weights[f"{prefix}self_attn.v_proj.bias"] = init_param(
+                    f"{prefix}self_attn.v_proj.bias", (kv_out,)
+                )
+                weights[f"{prefix}self_attn.o_proj.bias"] = init_param(
+                    f"{prefix}self_attn.o_proj.bias", (hidden_size,)
+                )
+
+            weights[f"{prefix}self_attn.q_norm.weight"] = init_param(
+                f"{prefix}self_attn.q_norm.weight", (head_dim,)
+            )
+            weights[f"{prefix}self_attn.k_norm.weight"] = init_param(
+                f"{prefix}self_attn.k_norm.weight", (head_dim,)
+            )
+
+            weights[f"{prefix}mlp.gate_proj.weight"] = init_param(
+                f"{prefix}mlp.gate_proj.weight", (intermediate_size, hidden_size)
+            )
+            weights[f"{prefix}mlp.up_proj.weight"] = init_param(
+                f"{prefix}mlp.up_proj.weight", (intermediate_size, hidden_size)
+            )
+            weights[f"{prefix}mlp.down_proj.weight"] = init_param(
+                f"{prefix}mlp.down_proj.weight", (hidden_size, intermediate_size)
+            )
+        weights["model.norm.weight"] = init_param("model.norm.weight", (hidden_size,))
 
     config.additional_config = additional_config
     config.parallel_dims = parallel_dims
     config.sharding_rules = sharding_rules
-    weights["model.norm.weight"] = init_param("model.norm.weight", (hidden_size,))
 
     return Model(
         name=__name__,
@@ -697,6 +697,7 @@ def init(
             if config.tie_word_embeddings
             else "lm_head.weight"
         ),
+        mesh = mesh,
     )
 
 
@@ -738,9 +739,9 @@ def load(
         axis_types=axis_types,
         devices=devices,
     )
-    jax.set_mesh(mesh)
 
-    weights = load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
+    with jax.set_mesh(mesh):
+        weights = load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
     # weights = prepare_weights(config, weights)
 
     if "model.embed_tokens.weight" not in weights:
@@ -768,4 +769,5 @@ def load(
             if config.tie_word_embeddings
             else "lm_head.weight"
         ),
+        mesh = mesh
     )

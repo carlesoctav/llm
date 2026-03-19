@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 from jax import P
+from jax.sharding import Mesh
 from jaxtyping import Bool, Float, PyTree
 from safetensors import safe_open
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
@@ -80,6 +81,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "unembed",
         "lm_head_key",
         "callbacks",
+        "mesh",
     ],
 )
 @dataclass
@@ -93,6 +95,7 @@ class Model:
     prepare_weights: Callable
     tokenizer: PreTrainedTokenizerFast
     lm_head_key: str
+    mesh: Mesh
 
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None

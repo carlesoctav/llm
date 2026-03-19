@@ -24,7 +24,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_dataset
+from jaxformers.data import make_ntp_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
@@ -114,7 +114,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
         return loss, aux
 
     if config.grad_accum > 1:
-        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
+        microbatch_size = config.data.loader.batch_size // config.grad_accum
         grad_fn = microbatch(
             jax.value_and_grad(loss_fn, has_aux=True),
             argnums=2,
@@ -269,7 +269,7 @@ def train(
 
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
-                with jax.named_scope("compile train step"):
+                with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
 
                     @print_timing
                     def compile_train_step():
@@ -297,6 +297,7 @@ def train(
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
+                    jax.set_mesh(model.mesh)
                 ):
                     model, aux = train_step_fn(model, batch, rngs=loop_rngs)
 
@@ -377,48 +378,47 @@ def main(config: sws.FinalConfig):
             config.model.to_dict(),
             rngs=model_rngs,
         )
-        scheduler_config = (
-            config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
-        )
-        scheduler = make_scheduler(
-            config.lr_scheduler_name,
-            config.learning_rate,
-            config.max_train_step,
-            scheduler_config=scheduler_config,
-        )
-        if do_lora:
-            model = make_lora(
-                model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
-            )
-        print(model)
-        model = dataclasses.replace(
-            model, weights=model.prepare_weights(model.weights, config.store_weights)
-        )
-        print(model)
-        model = make_optimizer(
-            config.optimizer_name,
-            model,
-            scheduler,
-            config.optimizer.to_dict(),
-        )
-        print_train_state_size(model)
 
-        if do_callback:
-            callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
+        with jax.set_mesh(model.mesh):
+            scheduler_config = (
+                config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
+            )
+            scheduler = make_scheduler(
+                config.lr_scheduler_name,
+                config.learning_rate,
+                config.max_train_step,
+                scheduler_config=scheduler_config,
+            )
+            if do_lora:
+                model = make_lora(
+                    model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+                )
             model = dataclasses.replace(
-                model,
-                callback_state=callbacks.init(model.weights, model.opt_state),
-                callbacks=callbacks,
+                model, weights=model.prepare_weights(model.weights, config.store_weights)
             )
+            model = make_optimizer(
+                config.optimizer_name,
+                model,
+                scheduler,
+                config.optimizer.to_dict(),
+            )
+            print_train_state_size(model)
 
-        train_ds = make_dataset(
-            config.data.source_name,
+            if do_callback:
+                callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
+                model = dataclasses.replace(
+                    model,
+                    callback_state=callbacks.init(model.weights, model.opt_state),
+                    callbacks=callbacks,
+                )
+
+        train_ds = make_ntp_data(
             config.data.source.to_dict(),
-            config.data.transforms_name,
             config.data.transforms.to_dict(),
-            config.train_loader_name,
-            config.train_loader.to_dict(),
+            config.data.loader.to_dict(),
+            mesh = model.mesh,
         )
+
         eval_ds = None
         _, metrics = train(config, model, train_ds, eval_ds, logger, rngs=train_rngs)
         return metrics

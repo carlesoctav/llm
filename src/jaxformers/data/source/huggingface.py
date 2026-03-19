@@ -42,7 +42,11 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
     def __str__(self) -> str:
         return "HuggingFaceIterableDataset"
 
-    def repeat(self, num_epochs):
+    @property
+    def num_shards(self) -> int:
+        return self._source.num_shards
+
+    def repeat(self, num_epochs: int | None= None):
         return HuggingFaceSourceIterDataset(self._source.repeat(num_epochs))
 
     def shard(
@@ -77,7 +81,6 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         seed: int | None = None,
         buffer_size: int | None = 1000,
     ) -> "HuggingFaceSourceIterDataset":
-        del buffer_size
         return HuggingFaceSourceIterDataset(self._source.shuffle(seed=seed))
 
 
@@ -92,8 +95,9 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
     def __str__(self) -> str:
         return "HuggingFaceMapDataset"
 
-    def repeat(self, num_epochs):
-        return HuggingFaceSourceMapDataset(self._source.repeat(num_epochs))
+    # doesnt support indefinete repeat wtf, let's use MapDataset repeat implementation
+    # def repeat(self, num_epochs: int | None = None):
+    #     return HuggingFaceSourceMapDataset(self._source.repeat(num_epochs))
 
     def slice(self, sl: slice) -> "HuggingFaceSourceMapDataset":
         start, stop, step = sl.indices(len(self._source))
@@ -146,10 +150,10 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         )
 
 
-def make(load_kwargs: list[dict[str, Any]]):
+def make_huggingface_datasets(load_kwargs: dict[str, Any], streaming = False):
     datasets = []
     for load_kwarg in load_kwargs:
-        dataset = load_dataset(**load_kwarg)
+        dataset = load_dataset(**load_kwarg, streaming = streaming)
         if isinstance(dataset, IterableDataset):
             datasets.append(HuggingFaceSourceIterDataset(dataset))
         elif isinstance(dataset, Dataset):

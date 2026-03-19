@@ -59,7 +59,7 @@ class TokenizeText(grain_transforms.Map):
                 text,
                 truncation=self.max_length is not None,
                 padding="max_length" if not self.packing else "do_not_pad",
-                max_length=self.max_length + 1,
+                max_length=self.max_length,
                 chat_template=self.chat_template,
                 return_tensors="np",
                 return_assistant_tokens_mask=self.assistant_loss,
@@ -69,13 +69,12 @@ class TokenizeText(grain_transforms.Map):
                 text,
                 truncation=self.max_length is not None,
                 padding="max_length" if not self.packing else "do_not_pad",
-                max_length=self.max_length + 1,
+                max_length=self.max_length,
                 return_tensors="np",
                 return_attention_mask=True,
                 return_token_type_ids=False,
             )
         output = {k: v.squeeze(0)[:-1] for k, v in encoded.items()}
-        output["labels"] = encoded["input_ids"].squeeze(0)[1:]
         return output
 
 
@@ -98,7 +97,7 @@ class NestInputs(grain_transforms.Map):
         return {"inputs": inputs, "labels": features["labels"]}
 
 
-def make_ntp_transforms(
+def make(
     column: str,
     max_length: int,
     data_type: str | None = None,
@@ -106,7 +105,7 @@ def make_ntp_transforms(
     chat_template_path: str | None = None,
     assistant_loss: bool = False,
     packing: bool = False,
-    packing_bins: int | None = 64,
+    packing_bins: int | None = None,
 ) -> list[grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms]:
     """Build the list of transforms required for next-token prediction."""
 

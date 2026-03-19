@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import time
 import typing as tp
@@ -6,21 +8,13 @@ from collections.abc import Sequence
 
 import grain
 import jax
-import jax.tree_util as jtu
-from datasets import Dataset, IterableDataset
-from grain import (
-    DatasetIterator,
-    IterDataset,
-    MapDataset,
-    transforms as grain_transforms,
-)
+from grain import DatasetIterator, IterDataset, MapDataset, ReadOptions
+from grain.experimental import RepeatIterDataset, WindowShuffleIterDataset
+from jax import P
 from jax.sharding import Mesh, PartitionSpec
 
-from jaxformers.data.source.huggingface import (
-    HuggingFaceSourceIterDataset,
-    HuggingFaceSourceMapDataset,
-)
-from jaxformers.data.transforms import DatasetTransforms
+from jaxformers.data.transforms.base import transform_ds, TransformFn
+from jaxformers.distributed.parallel import BATCH
 
 
 Batch = tp.Any
@@ -71,7 +65,7 @@ class _DatasetIteratorWithInputSpec(DatasetIterator[_T]):
             raise last_error
         with self._stats.record_self_time():
             return self._stats.record_output_spec(
-                jtu.tree_map(self.array_from_local_process, local_values)
+                self.array_from_local_process(local_values)
             )
 
     def array_from_local_process(self, local_values: _T) -> _T:
@@ -87,7 +81,7 @@ class _DatasetIteratorWithInputSpec(DatasetIterator[_T]):
         self._parent.set_state(state)
 
 
-class IterDatasetWithInputSpec(IterDataset[_T]):
+class ShardedIterDataset(IterDataset[_T]):
     def __init__(
         self,
         parent: IterDataset[_S],
@@ -99,134 +93,102 @@ class IterDatasetWithInputSpec(IterDataset[_T]):
         self._pspec = pspec or PartitionSpec()
         self._mesh = mesh
 
-    def __iter__(self) -> "IterDatasetWithInputSpec":
+    def __iter__(self) -> ShardedIterDataset:
         parent_iter = self._parent.__iter__()
         return _DatasetIteratorWithInputSpec(
             parent_iter, pspec=self._pspec, mesh=self._mesh
         )
 
 
-def make(
-    datasets: Sequence[IterDataset | MapDataset],
-    transforms: Sequence[
-        grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms
-    ]
-    | None,
-    global_batch_size: int,
-    pspec: PartitionSpec | None = None,
-    mesh: Mesh | None = None,
-    num_epochs: int | None = None,
+def make_simple_loader(
+    datasets: Sequence[MapDataset] | Sequence[IterDataset],
+    transforms: Sequence[TransformFn] | None,
+    mesh: Mesh | None,
+    batch_size: int,
+    shard: bool = False,
+    shuffle: bool = False,
     dataset_weights: Sequence[float] | None = None,
-    dataloading_host_index: int | None = None,
-    dataloading_host_count: int | None = None,
-    is_not_sharded: bool = True,
-    read_num_threads: int = 0,
-    read_prefetch_buffer_size: int = 0,
-    shuffle: bool = True,
-    shuffle_buffer_size: int = 1000,
+    *,
+    num_workers: int = 0,
+    num_threads: int = 1,
+    prefetch_buffer_size: int | None = 500,
+    per_worker_buffer_size: int | None = 1,
+    window_size: int = 1000,
     seed: int = 0,
-    worker_count: int = 0,
-    worker_buffer_size: int = 0,
-    drop_remainder: bool = True,
-) -> IterDatasetWithInputSpec:
-    if dataloading_host_index is None:
-        dataloading_host_index = jax.process_index()
-    if dataloading_host_count is None:
-        dataloading_host_count = jax.process_count()
-
-    if dataloading_host_count <= 0:
-        raise ValueError("dataloading_host_count must be positive")
-    if global_batch_size % dataloading_host_count != 0:
-        raise ValueError(
-            "global_batch_size must be divisible by dataloading_host_count"
-        )
+) -> ShardedIterDataset:
 
     prepared: list[grain.IterDataset] = []
-    if isinstance(datasets, (IterableDataset, Dataset)) or not isinstance(
+    if shard and not mesh:
+        raise ValueError("need mesh if we shard the datasets")
+
+    if isinstance(datasets, (MapDataset, IterDataset)) or not isinstance(
         datasets, Sequence
     ):
         datasets = (datasets,)
     else:
         datasets = tuple(datasets)
 
-    read_options = grain.ReadOptions(
-        num_threads=read_num_threads, prefetch_buffer_size=read_prefetch_buffer_size
-    )
+    ds_type = type(datasets[0])
+    is_map = isinstance(datasets[0], MapDataset)
+    if not all(isinstance(x, ds_type) for x in datasets):
+        raise ValueError(
+            "All datasets must have the same type, either MapDataset or IterDataset"
+        )
 
+    process_count = jax.process_count()
+    process_index = jax.process_index()
+    seed = seed + process_index if shard else seed
+    min_num_shards = None
     for ds in datasets:
-        if isinstance(ds, IterableDataset):
-            ds = HuggingFaceSourceIterDataset(ds)
-        elif isinstance(ds, Dataset):
-            ds = HuggingFaceSourceMapDataset(ds)
-
-        if not transforms:
-            raise ValueError("No operations provided for dataset preparation")
-
-        if dataloading_host_count > 1 and is_not_sharded:
-            ds = ds.shard(
-                num_shards=dataloading_host_count,
-                index=dataloading_host_index,
-                contiguous=True,
-            )
+        if shard:
+            if not hasattr(ds, "shard"):
+                raise NotImplementedError(
+                    "shard is active but ds doenst have shard method"
+                )
+            ds = ds.shard(process_count, process_index)
+        if not is_map and num_workers > 0 and hasattr(ds, "num_shards"):
+            ds_num_shards = ds.num_shards
+            if min_num_shards is None or ds_num_shards < min_num_shards:
+                min_num_shards = ds_num_shards
 
         if shuffle:
-            if isinstance(ds, HuggingFaceSourceMapDataset):
-                warnings.warn(
-                    "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
-                    "If shuffling is important for your workflow, please pre-shuffle the dataset."
-                )
-                ds = ds.shuffle(seed=seed + dataloading_host_index)
-            elif isinstance(ds, HuggingFaceSourceIterDataset):
-                ds = ds.shuffle(
-                    seed=seed + dataloading_host_index,
-                    buffer_size=shuffle_buffer_size,
-                )
-            else:
-                raise TypeError(
-                    f"Shuffle requested but unsupported for dataset type {type(ds)}"
-                )
-
-        if num_epochs is not None:
-            if isinstance(ds, HuggingFaceSourceMapDataset):
-                ds = ds.repeat(num_epochs)
-            elif isinstance(ds, HuggingFaceSourceIterDataset):
-                ds = ds.repeat(num_epochs)
-            else:
-                raise TypeError(
-                    f"Repeat requested but unsupported for dataset type {type(ds)}"
-                )
-
-        if isinstance(ds, grain.MapDataset):
-            ds = ds.to_iter_dataset(read_options)
-        elif not isinstance(ds, grain.IterDataset):
-            raise TypeError(
-                "Dataset transform pipeline must return a Grain MapDataset or IterDataset"
+            warnings.warn(
+                "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
+                "If shuffling is important for your workflow, please pre-shuffle the dataset."
             )
-
-        for op in transforms:
-            if isinstance(op, DatasetTransforms):
-                ds = op(ds)
-            elif isinstance(op, grain_transforms.RandomMap):
-                ds = ds.random_map(op)
-            elif isinstance(op, grain_transforms.Map):
-                ds = ds.map(op)
+            if hasattr(ds, "shuffle"):
+                ds = ds.shuffle(seed)
             else:
-                raise TypeError(f"Unsupported operation type: {type(op)}")
+                ds = WindowShuffleIterDataset(ds, window_size=window_size, seed=seed)
 
+        ds = ds.repeat() if hasattr(ds, "repeat") else RepeatIterDataset(ds)
         prepared.append(ds)
 
-    mixed = grain.IterDataset.mix(prepared, weights=dataset_weights)
-    local_process_batch_size = global_batch_size // dataloading_host_count
+    if min_num_shards is not None and num_workers > min_num_shards:
+        warnings.warn(
+            "Reducing num_workers because the streaming dataset has fewer shards "
+            f"than workers: num_workers={num_workers}, num_shards={min_num_shards}."
+        )
+        num_workers = min_num_shards
 
-    mixed = mixed.batch(
-        batch_size=local_process_batch_size, drop_remainder=drop_remainder
+    mixed = (
+        grain.MapDataset.mix(prepared, dataset_weights)
+        if is_map
+        else grain.IterDataset.mix(prepared, dataset_weights)
     )
-
-    mp_options = grain.MultiprocessingOptions(
-        num_workers=worker_count,
-        per_worker_buffer_size=worker_buffer_size,
+    mixed = (
+        mixed.to_iter_dataset(
+            read_options=ReadOptions(num_threads, prefetch_buffer_size)
+        )
+        if is_map
+        else mixed
     )
+    mixed = transform_ds(mixed, *transforms)
+    batch_size = batch_size // process_count if shard else batch_size
+    mixed = mixed.batch(batch_size=batch_size)
+    mp_options = grain.MultiprocessingOptions(num_workers, per_worker_buffer_size)
     mixed = mixed.mp_prefetch(mp_options)
-    if mesh:
-        return IterDatasetWithInputSpec(mixed, pspec=pspec, mesh=mesh)
+    # think more about local data -> global data
+    if shard:
+        return ShardedIterDataset(mixed, P(BATCH), mesh)
     return mixed

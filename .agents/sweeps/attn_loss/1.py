@@ -1,9 +1,15 @@
 import sws
-
 from jaxformers.bench.sweep_utils import load_config_builder
 
-BASE_CONFIG_PATH = '/mnt/carles/llm/src/jaxformers/config/config_qwen_0_6b_loss_bench.py'
-OVERRIDES = [('model.additional_config.attn_implementation', 'xla_chunked'), ('loss_implementation', 'reference')]
+
+BASE_CONFIG_PATH = (
+    "/mnt/carles/llm/src/jaxformers/config/config_qwen_0_6b_loss_bench.py"
+)
+OVERRIDES = [
+    ("model.additional_config.attn_implementation", "xla_chunked"),
+    ("loss_implementation", "reference"),
+]
+
 
 def get_config() -> sws.Config:
     c = load_config_builder(BASE_CONFIG_PATH)

@@ -2,12 +2,13 @@
 copied from quax.examples.lora
 """
 
+from __future__ import annotations
+
 import fnmatch
 import time
 from dataclasses import replace
 from enum import auto, StrEnum
-from functools import partial
-from typing import cast
+from typing import cast, TYPE_CHECKING
 
 import equinox as eqx
 import jax
@@ -16,15 +17,16 @@ import jax.extend.core as jexc
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-import numpy as np
 import quax
 from jax import P
 from jaxtyping import Array, ArrayLike, PRNGKeyArray, PyTree, Shaped
 
 from jaxformers.benchmark_utils import print_timing
-from jaxformers.modeling_utils import Model
 from jaxformers.print_utils import tree_pformat
 
+
+if TYPE_CHECKING:
+    from jaxformers.modeling_utils import Model
 
 default_init = jax.nn.initializers.variance_scaling(
     1 / 3.0, "fan_in", "uniform", in_axis=-1, out_axis=-2, batch_axis=()
@@ -43,7 +45,6 @@ def make_lora(
     *,
     rngs: PRNGKeyArray | None = None,
 ) -> Model:
-
     if init_lora in (InitLora.RANDOM, None):
         if rngs is None:
             raise ValueError("random LoRA init requires an rng key")
@@ -405,3 +406,13 @@ def _(
     if out_sharding is not None:
         out = jax.sharding.reshard(out, out_sharding)
     return out
+
+
+def lora_get_w(weights):
+    def _f(leaf):
+        if isinstance(leaf, LoraArray):
+            return leaf.w
+        else:
+            return leaf
+
+    return jtu.tree_map(_f, weights, is_leaf=lambda x: isinstance(x, LoraArray))

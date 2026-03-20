@@ -10,6 +10,7 @@ from jaxformers.models import bert
 
 MODEL_ID = "google-bert/bert-base-uncased"
 
+
 def test_bert_base_cpu_parity():
     hf_model = AutoModel.from_pretrained(MODEL_ID, attn_implementation="eager")
     hf_model.eval()
@@ -29,7 +30,9 @@ def test_bert_base_cpu_parity():
 
     text = "jax bert parity check"
     hf_token = tokenizer(text, return_tensors="pt")
-    jax_token = {k: jnp.asarray(v) for k, v in tokenizer(text, return_tensors="np").items()}
+    jax_token = {
+        k: jnp.asarray(v) for k, v in tokenizer(text, return_tensors="np").items()
+    }
 
     with torch.no_grad():
         hf_output = hf_model(**hf_token)

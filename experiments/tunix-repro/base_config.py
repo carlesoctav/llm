@@ -1,0 +1,88 @@
+import jax
+import jax.numpy as jnp
+import sws
+from transformers import AutoTokenizer
+
+
+def get_config():
+    config = sws.Config()
+
+    config.skip_eval = True
+
+    config.exp_name = ""
+    config.project_name = ""
+    config.dir = "gs://carles-git-good"
+    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.seed = 42
+    config.eval_every = None
+    config.max_train_step = 10_000
+    config.forward_dtype = lambda: jnp.bfloat16
+    config.loss_implementation = "reference"
+    config.grad_accum = 4
+
+    config.logger_name = "wandb"
+
+    config.use_checkpoint = False
+    config.checkpoint_options.save_interval_steps = 2500
+    config.checkpoint_options.max_to_keep = 1
+
+    config.logger.project = lambda: config.project_name
+    config.logger.name = lambda: config.exp_name
+
+    config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
+    config.callback.log_performance.real_step_threshold = 0
+    config.callback.log_performance.denom_keys = ["token"]
+
+    config.init_model = "pretrained"
+    config.init_lora = None
+    config.store_weights = "stack"
+
+    config.model_name = "huggingface.gemma3"
+    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.model.model_id = "google/gemma-3-1b-it"
+    config.model.additional_config.remat_layer = False
+    config.model.additional_config.attn_implementation = "sdpa"
+    config.model.additional_config.sequence_parallelism = True
+    config.model.additional_config.forward_impl = "scan_layer"
+
+    config.model.devices = lambda: jax.devices()
+    config.model.param_dtype = lambda: jnp.bfloat16
+
+    config.data.source_name = "huggingface"
+    config.data.streaming = True
+    config.data.source.load_kwargs = [
+        {
+            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
+            "split": "train",
+        }
+    ]
+
+    config.data.transforms.column = "messages"
+    config.data.transforms.max_length = 2048
+    config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
+        config.model.model_id
+    )
+    config.data.transforms.data_type = "chat"
+    config.data.transforms.assistant_loss = True
+    config.data.transforms.chat_template_path = "./temp/think.jinja"
+    config.data.transforms.packing = True
+
+    config.data.loader.batch_size = 32
+
+    config.optimizer_name = "adam"
+    config.optimizer.max_grad_norm = 1.0
+    config.optimizer.b1 = 0.9
+    config.optimizer.b2 = 0.95
+    config.optimizer.eps = 1e-8
+
+    config.learning_rate = 1e-5
+    config.lr_scheduler_name = "wsds"
+    config.lr_scheduler.min_lr_ratio = 0.1
+    config.lr_scheduler.warmup = 0.01
+    config.lr_scheduler.decay = None
+    config.lr_scheduler.rewarmup = 0.0
+    config.lr_scheduler.cycle_length = 0.2
+    config.lr_scheduler.cycles = None
+    config.lr_scheduler.decay_schedule = "cosine"
+
+    return config

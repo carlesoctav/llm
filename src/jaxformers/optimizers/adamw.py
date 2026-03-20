@@ -1,5 +1,3 @@
-from jaxformers import tree_util
-from jaxformers.print_utils import tree_pformat
 import fnmatch
 from typing import Callable
 
@@ -7,6 +5,9 @@ import jax
 import jax.tree_util as jtu
 import optax
 from jaxtyping import PyTree
+
+from jaxformers import tree_util
+from jaxformers.print_utils import tree_pformat
 
 from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
 
@@ -39,8 +40,6 @@ DEFAULT_WEIGHT_DECAY_PATH_LORA = [
 ]
 
 
-
-
 def make(
     learning_rate: float | Callable[[int], float],
     model: PyTree | None = None,
@@ -53,20 +52,21 @@ def make(
 ):
     if not weights_decay_path and not model.is_lora:
         weights_decay_path = DEFAULT_WEIGHT_DECAY_PATH
-    elif not weights_decay_path and  model.is_lora:
+    elif not weights_decay_path and model.is_lora:
         weights_decay_path = DEFAULT_WEIGHT_DECAY_PATH_LORA
 
     decayed_weights = []
+
     def make_weight_decay_mask(weights, weights_decay_path):
         def _f(path, leaf):
-            keystr = jtu.keystr(path, simple = True, separator = ".")
+            keystr = jtu.keystr(path, simple=True, separator=".")
             for pattern_to_match in weights_decay_path:
                 if fnmatch.fnmatch(keystr, pattern_to_match):
                     decayed_weights.append(keystr)
                     return True
             return False
 
-        return jax.tree.map_with_path(_f, weights, is_leaf = lambda x: x is None)
+        return jax.tree.map_with_path(_f, weights, is_leaf=lambda x: x is None)
 
     train_weights, _ = tree_util.partition(model.weights, model.train_mask)
     weight_decay_mask = make_weight_decay_mask(train_weights, weights_decay_path)

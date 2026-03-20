@@ -53,9 +53,7 @@ def log_performance(
     def process(output, callback_state, aux):
         dispatch_delta = time.monotonic() - host_state["last_time"]
         for k, v in callback_state.denom_count.items():
-            output[f"performance/dispatch_{k}_per_s"] = float(
-                v / dispatch_delta
-            )
+            output[f"performance/dispatch_{k}_per_s"] = float(v / dispatch_delta)
 
         output["performance/dispatch_time_per_step"] = float(dispatch_delta)
 
@@ -66,7 +64,6 @@ def log_performance(
                 output[f"performance/real_{k}_per_s"] = float(v / real_delta)
 
             output["performance/real_time_per_step"] = real_delta
-
 
         host_state["last_time"] = time.monotonic()
         host_state["step"] += 1

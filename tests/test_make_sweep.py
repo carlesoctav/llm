@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sws
-
 from jaxformers.sws_utils import load_config_builder
 from jaxformers.train.make_sweep import get_config, main
 

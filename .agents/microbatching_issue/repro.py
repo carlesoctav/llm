@@ -13,6 +13,7 @@ import numpy as np
 import optax
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
+
 # from jaxformers.dispatch.einsum import einsum
 # from equinox import tree_pprint
 
@@ -309,7 +310,9 @@ def microbatch(
     fun: Function,
     argnums: int | Sequence[int],
     microbatch_size: int | None,
-    accumulator: Accumulator | AccumulationType | AccumulatorTree = AccumulationType.SUM,
+    accumulator: Accumulator
+    | AccumulationType
+    | AccumulatorTree = AccumulationType.SUM,
     *,
     argnames: str | Sequence[str] = (),
     in_axes: int | Sequence[int] = 0,
@@ -508,7 +511,9 @@ def make_shardings(mode: str, mesh: Mesh):
     raise ValueError(f"Unknown mode: {mode}")
 
 
-def make_linear_params(base, shardings, *, base_key: str, a_key: str, b_key: str, rank: int):
+def make_linear_params(
+    base, shardings, *, base_key: str, a_key: str, b_key: str, rank: int
+):
     if rank < 1:
         raise ValueError("`lora_rank` must be >= 1.")
     scale = 1e-2
@@ -530,21 +535,30 @@ def make_params(config: ReproConfig, shardings):
     scale = 1e-2
     for _ in range(config.num_layers):
         key, gate_key, up_key, down_key = jax.random.split(key, 4)
-        gate = jax.random.normal(
-            gate_key,
-            (config.intermediate_size, config.hidden_size),
-            dtype=jnp.bfloat16,
-        ) * scale
-        up = jax.random.normal(
-            up_key,
-            (config.intermediate_size, config.hidden_size),
-            dtype=jnp.bfloat16,
-        ) * scale
-        down = jax.random.normal(
-            down_key,
-            (config.hidden_size, config.intermediate_size),
-            dtype=jnp.bfloat16,
-        ) * scale
+        gate = (
+            jax.random.normal(
+                gate_key,
+                (config.intermediate_size, config.hidden_size),
+                dtype=jnp.bfloat16,
+            )
+            * scale
+        )
+        up = (
+            jax.random.normal(
+                up_key,
+                (config.intermediate_size, config.hidden_size),
+                dtype=jnp.bfloat16,
+            )
+            * scale
+        )
+        down = (
+            jax.random.normal(
+                down_key,
+                (config.hidden_size, config.intermediate_size),
+                dtype=jnp.bfloat16,
+            )
+            * scale
+        )
         if config.use_lora:
             layers.append(
                 {
@@ -583,11 +597,14 @@ def make_params(config: ReproConfig, shardings):
                 )
             )
     key, lm_head_key = jax.random.split(key)
-    lm_head = jax.random.normal(
-        lm_head_key,
-        (config.vocab_size, config.hidden_size),
-        dtype=jnp.bfloat16,
-    ) * scale
+    lm_head = (
+        jax.random.normal(
+            lm_head_key,
+            (config.vocab_size, config.hidden_size),
+            dtype=jnp.bfloat16,
+        )
+        * scale
+    )
     if config.use_lora:
         lm_head = make_linear_params(
             lm_head,
@@ -607,6 +624,7 @@ def make_params(config: ReproConfig, shardings):
 
 def make_train_mask(params, config: ReproConfig):
     if config.use_lora:
+
         def build_mask(node):
             if isinstance(node, dict):
                 mask = {}
@@ -671,7 +689,9 @@ def make_batch(batch_size: int, config: ReproConfig, batch_sharding):
     )
     labels_sharding = batch_sharding
     if isinstance(batch_sharding, NamedSharding) and len(batch_sharding.spec) != 0:
-        labels_sharding = NamedSharding(batch_sharding.mesh, P(batch_sharding.spec[0], None))
+        labels_sharding = NamedSharding(
+            batch_sharding.mesh, P(batch_sharding.spec[0], None)
+        )
     return {
         "inputs": jax.device_put(inputs, batch_sharding),
         "labels": jax.device_put(labels, labels_sharding),
@@ -684,7 +704,9 @@ def mlp_forward(params, x):
     for layer in layers:
         out_sharding = jax.typeof(h).sharding
         if isinstance(layer, dict):
-            gate = einsum("bth,fh->btf", h, layer["gate"]["base"], out_sharding=out_sharding)
+            gate = einsum(
+                "bth,fh->btf", h, layer["gate"]["base"], out_sharding=out_sharding
+            )
             gate_lora = einsum(
                 "bth,rh->btr",
                 h,
@@ -697,7 +719,9 @@ def mlp_forward(params, x):
                 layer["gate"]["lora_b"],
                 out_sharding=out_sharding,
             )
-            up = einsum("bth,fh->btf", h, layer["up"]["base"], out_sharding=out_sharding)
+            up = einsum(
+                "bth,fh->btf", h, layer["up"]["base"], out_sharding=out_sharding
+            )
             up_lora = einsum(
                 "bth,rh->btr",
                 h,
@@ -854,6 +878,7 @@ def index_microbatch(batch, index):
         lambda x: jnp.take(x, index, axis=0),
         batch,
     )
+
 
 def make_optax_microbatch_train_step(config: ReproConfig, train_mask):
     tx = make_optimizer(config)
@@ -1078,6 +1103,7 @@ def run_new_microbatch(mode: str, config: ReproConfig):
         )
         print(f"{mode}/microbatch loss={loss:.6f}")
 
+
 def run_optax_microbatch(mode: str, config: ReproConfig):
     validate_mode_config(mode, config)
     mesh = make_mesh(mode, config.mesh_devices)
@@ -1154,10 +1180,11 @@ def run_init_outside_microbatch(mode: str, config: ReproConfig):
         batch = make_batch(config.logical_batch_size, config, shardings["batch"])
         counts = count_trainable(train_mask)
         if counts is not None:
-            print(f"{mode}/init_outside_microbatch trainable_leaves={counts[0]}/{counts[1]}")
+            print(
+                f"{mode}/init_outside_microbatch trainable_leaves={counts[0]}/{counts[1]}"
+            )
         hlo_path = (
-            Path("issues/microbatch/hlo")
-            / f"{mode}_init_outside_microbatch.stablehlo"
+            Path("issues/microbatch/hlo") / f"{mode}_init_outside_microbatch.stablehlo"
             if config.dump_hlo
             else None
         )
@@ -1181,7 +1208,9 @@ def run_multistep(mode: str, config: ReproConfig):
         train_weights, _ = partition(params, train_mask)
         train_step, tx = make_multistep_train_step(config, train_mask)
         opt_state = tx.init(train_weights)
-        state = jax.device_put((params, opt_state), make_state_shardings(params, opt_state, mesh))
+        state = jax.device_put(
+            (params, opt_state), make_state_shardings(params, opt_state, mesh)
+        )
         batch = make_batch(config.microbatch_size, config, shardings["batch"])
         counts = count_trainable(train_mask)
         if counts is not None:

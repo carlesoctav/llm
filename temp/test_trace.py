@@ -1,5 +1,6 @@
 import jax
 
+
 @jax.jit
 def f(w, x):
     return w @ x

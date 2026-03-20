@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from enum import auto, StrEnum
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
@@ -8,15 +9,28 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
 from jax import P
+from jax.sharding import Mesh
 from jaxtyping import Bool, Float, PyTree
 from safetensors import safe_open
 from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
+from jaxformers import tree_util
+from jaxformers.dispatch.lora import lora_get_w
 from jaxformers.print_utils import tree_pformat
 
 
 LayerWeights = TypeVar("LayerWeights")
 ModelWeights = TypeVar("ModelWeights")
+
+
+class StoreWeights(StrEnum):
+    STACK = auto()
+    FREE = auto()
+
+
+class ForwardImpl(StrEnum):
+    LOOP = auto()
+    SCAN_LAYER = auto()
 
 
 def logical_to_physical(logical, rules):
@@ -58,6 +72,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "name",
         "tokenizer",
         "forward",
+        "prepare_weights",
         "config",
         "tx",
         "is_lora",
@@ -66,6 +81,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
         "unembed",
         "lm_head_key",
         "callbacks",
+        "mesh",
     ],
 )
 @dataclass
@@ -76,8 +92,10 @@ class Model:
     forward: Callable
     embed: Callable
     unembed: Callable
+    prepare_weights: Callable
     tokenizer: PreTrainedTokenizerFast
     lm_head_key: str
+    mesh: Mesh
 
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None
@@ -87,10 +105,28 @@ class Model:
     callbacks: Any | None = None
 
     train_mask: PyTree[Bool] | None = None
+    # make this str_enum
     is_lora: bool = False
 
     def __repr__(self):
         return self.name + "\n" + tree_pformat(self.weights)
+
+    @property
+    def params(
+        self,
+    ):
+        return self.weights
+
+    @property
+    def trainable_params(self) -> tuple[PyTree, PyTree]:
+        return tree_util.partition(self.weights, self.train_mask)
+
+    @property
+    def base_params(self):
+        if self.is_lora:
+            return lora_get_w(self.weights)
+        else:
+            return self.weights
 
 
 def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):

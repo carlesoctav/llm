@@ -37,7 +37,7 @@ def test_gemma3_forward_impls_match_on_small_config():
         tokenizer=None,
     )
 
-    input_ids = (jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % config.vocab_size)
+    input_ids = jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % config.vocab_size
     attention_mask = jnp.ones_like(input_ids)
 
     loop_hidden = model.forward(
@@ -106,7 +106,7 @@ def test_scan_block_forward_handles_unstacked_lora_weights():
     )
     lora_model = prepare_model_weights("huggingface.gemma3", lora_model)
 
-    input_ids = (jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % config.vocab_size)
+    input_ids = jnp.arange(16, dtype=jnp.int32).reshape(2, 8) % config.vocab_size
     attention_mask = jnp.ones_like(input_ids)
     hidden = lora_model.forward(
         lora_model.weights,

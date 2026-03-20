@@ -64,6 +64,7 @@ def test_build_sweep_space_accepts_c_prefix():
     assert run["c.learning_rate"] == 1e-5
     assert run["c.optimizer.b1"] == 0.8
 
+
 def test_build_sweep_space_list_values_are_dimensions():
     space = build_sweep_space(
         overrides={"lora.weights_path": ["*.q_proj.weight", "*.k_proj.weight"]},

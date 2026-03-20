@@ -119,16 +119,14 @@ def cross_entropy_loss(
         try:
             # Only compute logsumexp when actually used, to avoid forcing
             # materialization of [B, V] logits in the reference implementation.
-            loss, lse = (
-                fn(
-                    x,
-                    labels,
-                    w,
-                    logit_soft_cap=logit_soft_cap,
-                    block_sizes=block_sizes_for_impl,
-                    dtype=dtype,
-                    precision=precision,
-                )
+            loss, lse = fn(
+                x,
+                labels,
+                w,
+                logit_soft_cap=logit_soft_cap,
+                block_sizes=block_sizes_for_impl,
+                dtype=dtype,
+                precision=precision,
             )
         except Exception as e:
             errors.append(e)

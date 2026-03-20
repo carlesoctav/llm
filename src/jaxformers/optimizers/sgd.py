@@ -1,12 +1,14 @@
 from typing import Callable
 
 import optax
+from jaxtyping import PyTree
 
 from .lr import custom_scale_by_learning_rate as custom_scale_by_learning_rate
 
 
 def make(
     learning_rate: float | Callable[[int], float],
+    model: PyTree | None = None,
     max_grad_norm: float | None = 1.0,
     momentum: float = 0.0,
     nesterov: bool = False,

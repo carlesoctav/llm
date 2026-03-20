@@ -2,8 +2,6 @@ from collections.abc import Iterable, Mapping
 from itertools import product
 from typing import Any
 
-from jaxformers.sws_utils import ConfigLoadError, load_config_builder
-
 
 class SweepConfigError(ValueError):
     pass

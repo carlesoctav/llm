@@ -1,11 +1,15 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from functools import partial
 from jaxtyping import Array, Float, Int
 
 from .config import BlockSizes
 
-def _apply_logit_soft_cap(logits: Float[Array, "B V"], logit_soft_cap: float | None = None) -> Float[Array, "B V"]:
+
+def _apply_logit_soft_cap(
+    logits: Float[Array, "B V"], logit_soft_cap: float | None = None
+) -> Float[Array, "B V"]:
     if logit_soft_cap is None:
         return logits
     return jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
@@ -17,12 +21,12 @@ def _infer_named_sharding(x):
     if sharding is None:
         aval = getattr(x, "aval", None)
         sharding = getattr(aval, "sharding", None) if aval is not None else None
-    return (
-        sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
-    )
+    return sharding if isinstance(sharding, jax.sharding.NamedSharding) else None
 
 
-def _named_sharding_is_nontrivial(named_sharding: jax.sharding.NamedSharding, shape) -> bool:
+def _named_sharding_is_nontrivial(
+    named_sharding: jax.sharding.NamedSharding, shape
+) -> bool:
     # Consider it non-trivial if any non-broadcasted dim is partitioned across an axis
     # with size > 1.
     mesh = named_sharding.mesh
@@ -81,15 +85,20 @@ def _fused_cross_entropy_chunked_xla_body(
             lse_b, label_logits_b = val
             v0 = vi * v_block
 
-
             def h_body(hi, acc):
                 h0 = h_block * hi
                 x_bh = jax.lax.dynamic_slice(x, (b0, h0), (b_block, h_block))
                 w_hv = jax.lax.dynamic_slice(w_pad, (v0, h0), (v_block, h_block))
-                return acc + jax.lax.dot_general(x_bh, w_hv, (((1,), (1,)), ((), ())), precision, preferred_element_type = dtype)
+                return acc + jax.lax.dot_general(
+                    x_bh,
+                    w_hv,
+                    (((1,), (1,)), ((), ())),
+                    precision,
+                    preferred_element_type=dtype,
+                )
 
             logits = jax.lax.fori_loop(
-                0, num_h, h_body, jnp.zeros((b_block, v_block), dtype = dtype)
+                0, num_h, h_body, jnp.zeros((b_block, v_block), dtype=dtype)
             )  # [B_block, V_block]
             logits = _apply_logit_soft_cap(logits, logit_soft_cap)
             valid = v0 + jnp.arange(v_block) < V
@@ -141,6 +150,7 @@ def fused_cross_entropy_chunked_xla(
     If inputs are sharded on the batch axis, run the kernel under `shard_map` so
     internal loop carries remain type-stable (JAX includes sharding in carry types).
     """
+
     def axis_spec_is_nontrivial(mesh, axis_spec) -> bool:
         if axis_spec is None:
             return False
@@ -161,7 +171,9 @@ def fused_cross_entropy_chunked_xla(
             labels_sharding, labels.shape
         ):
             batch_sharding = labels_sharding
-        elif x_sharding is not None and _named_sharding_is_nontrivial(x_sharding, x.shape):
+        elif x_sharding is not None and _named_sharding_is_nontrivial(
+            x_sharding, x.shape
+        ):
             batch_sharding = x_sharding
 
     if batch_sharding is None:

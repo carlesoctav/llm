@@ -98,7 +98,7 @@ class NestInputs(grain_transforms.Map):
         return {"inputs": inputs, "labels": features["labels"]}
 
 
-def make(
+def make_ntp_transforms(
     column: str,
     max_length: int,
     data_type: str | None = None,
@@ -106,7 +106,7 @@ def make(
     chat_template_path: str | None = None,
     assistant_loss: bool = False,
     packing: bool = False,
-    packing_bins: int | None = None,
+    packing_bins: int | None = 64,
 ) -> list[grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms]:
     """Build the list of transforms required for next-token prediction."""
 

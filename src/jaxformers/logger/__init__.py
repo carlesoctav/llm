@@ -1,5 +1,6 @@
-from jaxformers.benchmark_utils import print_timing
 import importlib
+
+from jaxformers.benchmark_utils import print_timing
 
 
 @print_timing

@@ -18,7 +18,9 @@ class ConfigLoadError(RuntimeError):
     pass
 
 
-def load_config_builder(config_path: str, *, default_func: str = "get_config") -> sws.Config:
+def load_config_builder(
+    config_path: str, *, default_func: str = "get_config"
+) -> sws.Config:
     path = config_path
     func_name = default_func
     if ":" in path:
@@ -69,7 +71,9 @@ def _rebind_value(value: Any, *, source: sws.Config, target: sws.Config) -> Any:
         )
 
     if isinstance(value, tuple):
-        return tuple(_rebind_value(item, source=source, target=target) for item in value)
+        return tuple(
+            _rebind_value(item, source=source, target=target) for item in value
+        )
 
     if isinstance(value, list):
         return [_rebind_value(item, source=source, target=target) for item in value]
@@ -233,7 +237,9 @@ def _split_config_args(
             start = len(config_paths)
             while i < len(argv):
                 next_token = argv[i]
-                if next_token == config_flag or next_token.startswith(config_flag + "="):
+                if next_token == config_flag or next_token.startswith(
+                    config_flag + "="
+                ):
                     break
                 if next_token == "--" or "=" in next_token:
                     break
@@ -264,7 +270,9 @@ def _load_default_builder(caller_file: str, *, default_func: str) -> sws.Config:
     if caller_file and os.path.exists(caller_file):
         factory = runpy.run_path(caller_file).get(default_func, lambda: sws.Config())
         if not callable(factory):
-            raise AttributeError(f"Function {default_func!r} not found in {caller_file}")
+            raise AttributeError(
+                f"Function {default_func!r} not found in {caller_file}"
+            )
         builder = factory()
         if not isinstance(builder, sws.Config):
             raise TypeError("Config factory must return a sws.Config")

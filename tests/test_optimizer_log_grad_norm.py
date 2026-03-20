@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 import optax
-
 from jaxformers.optimizers.divide import divide_every
 from jaxformers.optimizers.log_grad_norm import get_logged_grad_norm, log_grad_norm
 
@@ -35,4 +34,3 @@ def test_log_grad_norm_updates_only_on_emit_and_is_pre_clip():
 
     # Clipping happens after logging; ensure the emitted update is clipped.
     assert float(optax.global_norm(u2)) == 1.0
-

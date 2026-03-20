@@ -1,15 +1,19 @@
-import jax.numpy as jnp
-import jax
-from jaxtyping import PyTree
 from typing import NamedTuple
-from jaxtyping import Float, Array
-from .base import Callback
-from jaxformers.optimizers.lr import ScaleByLearningRateState
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Float, PyTree
+
 from jaxformers import tree_util
+from jaxformers.optimizers.lr import ScaleByLearningRateState
+
+from .base import Callback
+
 
 def find_learning_rate(opt_state):
     is_lr_state = lambda x: isinstance(x, ScaleByLearningRateState)
     res = {}
+
     def f(path, leaf):
         if is_lr_state(leaf):
             log_key = tree_util.optimizerstr(path)
@@ -19,6 +23,7 @@ def find_learning_rate(opt_state):
     jax.tree.map_with_path(f, opt_state, is_leaf=is_lr_state)
     return res
 
+
 class LogLearningRateState(NamedTuple):
     learning_rate: PyTree[Float[Array, ""]]
 
@@ -27,12 +32,14 @@ def log_learning_rate() -> Callback:
     def init(weights, opt_state):
         del weights
         shape = jax.eval_shape(find_learning_rate, opt_state)
-        zeros = jax.tree.map(lambda shape: jnp.zeros_like(shape, dtype = jnp.float32), shape)
+        zeros = jax.tree.map(
+            lambda shape: jnp.zeros_like(shape, dtype=jnp.float32), shape
+        )
         return LogLearningRateState(zeros)
 
     def update(callback_state, grad, updates, opt_state, weights, aux):
         del grad, updates, weights, aux
-        return LogLearningRateState(learning_rate = find_learning_rate(opt_state))
+        return LogLearningRateState(learning_rate=find_learning_rate(opt_state))
 
     def process(output, callback_state, aux):
         del aux
@@ -40,6 +47,7 @@ def log_learning_rate() -> Callback:
         return output, callback_state
 
     return Callback(init, update, process)
+
 
 def make():
     return log_learning_rate()

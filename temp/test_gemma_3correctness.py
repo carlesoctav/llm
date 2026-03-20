@@ -4,6 +4,7 @@ import os
 import sys
 from pathlib import Path
 
+
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
@@ -79,7 +80,11 @@ def main() -> int:
     if args.seq_len is None:
         hf_token = tokenizer(args.prompt, return_tensors="pt")
         import jax.numpy as jnp
-        jax_token = {k: jnp.asarray(v) for k, v in tokenizer(args.prompt, return_tensors="np").items()}
+
+        jax_token = {
+            k: jnp.asarray(v)
+            for k, v in tokenizer(args.prompt, return_tensors="np").items()
+        }
         logits_to_keep = 0
     else:
         seq_len = int(args.seq_len)
@@ -89,7 +94,9 @@ def main() -> int:
         hf_token = {"input_ids": input_ids, "attention_mask": attention_mask}
         jax_token = {
             "input_ids": jnp.asarray(input_ids.cpu().numpy(), dtype=jnp.int32),
-            "attention_mask": jnp.asarray(attention_mask.cpu().numpy(), dtype=jnp.int32),
+            "attention_mask": jnp.asarray(
+                attention_mask.cpu().numpy(), dtype=jnp.int32
+            ),
         }
         logits_to_keep = 1
 
@@ -118,7 +125,9 @@ def main() -> int:
     print("atol:", args.atol, "rtol:", args.rtol)
 
     try:
-        np.testing.assert_allclose(jax_logits, hf_logits, atol=args.atol, rtol=args.rtol)
+        np.testing.assert_allclose(
+            jax_logits, hf_logits, atol=args.atol, rtol=args.rtol
+        )
     except AssertionError as exc:
         print("FAIL: logits are not close enough.")
         print(exc)

@@ -1,5 +1,4 @@
 import typing as tp
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -92,7 +91,6 @@ def make_bool_interface(
     batch_size: int | None = None,
     nheads: int | None = None,
 ) -> Bool[Array, "B T S"] | Bool[Array, "B N T S"] | Bool[Array, "T S"]:
-
     batch_arange = jnp.arange(batch_size, dtype=jnp.int32)
     q_arange = jnp.arange(q_length, dtype=jnp.int32)
     kv_arange = jnp.arange(kv_length, dtype=jnp.int32)
@@ -121,7 +119,6 @@ class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
         "sdpa": make_bool_interface,
         "xla_chunked": make_bool_interface,
         "chunked_manual": make_bool_interface,
-
     }
 
 

@@ -1,6 +1,5 @@
 from typing import NamedTuple
 
-import jax
 import jax.tree_util as jtu
 
 
@@ -17,4 +16,4 @@ def f(path, leaf):
 
 is_tuple = lambda x: isinstance(x, Test)
 jtu.tree_map_with_path(f, mapping, is_leaf=is_tuple)
-jtu.tree_map_with_path(f, mapping, is_leaf = is_tuple)
+jtu.tree_map_with_path(f, mapping, is_leaf=is_tuple)

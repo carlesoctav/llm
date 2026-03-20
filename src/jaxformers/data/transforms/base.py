@@ -3,6 +3,7 @@ from typing import Protocol, runtime_checkable
 import grain
 from grain import (
     transforms as grain_transforms,
+    IterDataset
 )
 
 
@@ -13,7 +14,7 @@ class DatasetTransforms(Protocol):
 
 TransformFn = grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms
 
-def transform_ds(ds, *transforms: TransformFn):
+def transform_ds(ds, *transforms: TransformFn) -> IterDataset:
     for op in transforms:
         if isinstance(op, DatasetTransforms):
             ds = op(ds)

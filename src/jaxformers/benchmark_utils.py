@@ -76,17 +76,15 @@ def print_train_state_size(model):
                 p += np.prod(leaf.shape) * dtype_multiplier(leaf.dtype)
 
         jtu.tree_map_with_path(_sum, tree)
-        print(f" tree {name} use {p / 1e9} GB")
+        print(f"tree {name} use {p / 1e9} GB")
         return p
 
-    if model.train_mask:
-        train_weights, _ = jaxformers.tree_util.partition(
-            model.weights, model.train_mask
-        )
-    else:
-        train_weights = model.weights
+    train_weights, freeze_weights= jaxformers.tree_util.partition(
+        model.weights, model.train_mask
+    )
 
     p = 0
     p += sum("train_weights", train_weights)
+    p += sum("freeze_weights", freeze_weights)
     p += sum("opt_state", model.opt_state)
     print(f"Total Model use {p / 1e9} GB")

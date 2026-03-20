@@ -1,5 +1,4 @@
 import typing as tp
-import warnings
 from typing import Any
 
 import grain
@@ -42,11 +41,7 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
     def __str__(self) -> str:
         return "HuggingFaceIterableDataset"
 
-    @property
-    def num_shards(self) -> int:
-        return self._source.num_shards
-
-    def repeat(self, num_epochs: int | None= None):
+    def repeat(self, num_epochs: int | None = None):
         return HuggingFaceSourceIterDataset(self._source.repeat(num_epochs))
 
     def shard(
@@ -59,6 +54,10 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
             self._source.shard(num_shards, index, contiguous)
         )
 
+    @property
+    def num_shards(self):
+        return self._source.num_shards
+
     def set_slice(self, sl: slice, sequential_slice: bool = True) -> None:
         if sl.step is None or sl.step <= 0:
             raise ValueError("slice.step (num_workers) must be a positive integer.")
@@ -66,8 +65,9 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         contiguous = bool(sequential_slice)
 
         if self._source.num_shards < sl.step:
-            warnings.warn(
-                "The number of shards in the HuggingFace dataset is smaller than the number of workers. Some workers will not receive any data."
+            print("DEBUGPRINT {self._source.num_shards}:", self._source.num_shards)
+            raise ValueError(
+                f"The HuggingFace dataset has fewer shards ({self.num_shards}) than the number of workers ({sl.step}); some workers will receive no data."
             )
 
         self._source = self._source.shard(
@@ -112,6 +112,10 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
             self._source.select(range(start, stop, step))
         )
 
+    @property
+    def num_shards(self):
+        return self._source.num_rows
+
     def shuffle(
         self,
         seed: int | None = None,
@@ -143,6 +147,12 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         if sl.step is None or sl.step <= 0:
             raise ValueError("slice.step (num_workers) must be a positive integer.")
         worker_index = 0 if sl.start is None else sl.start
+
+        if self._source.num_shards < sl.step:
+            raise ValueError(
+                f"The HuggingFace dataset has fewer rows ({self.num_shards}) than the number of workers ({sl.step}); some workers will receive no data."
+            )
+
         self._source = self._source.shard(
             num_shards=sl.step,
             index=worker_index,
@@ -150,10 +160,10 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         )
 
 
-def make_huggingface_datasets(load_kwargs: dict[str, Any], streaming = False):
+def make_huggingface_datasets(load_kwargs: dict[str, Any], streaming=False):
     datasets = []
     for load_kwarg in load_kwargs:
-        dataset = load_dataset(**load_kwarg, streaming = streaming)
+        dataset = load_dataset(**load_kwarg, streaming=streaming)
         if isinstance(dataset, IterableDataset):
             datasets.append(HuggingFaceSourceIterDataset(dataset))
         elif isinstance(dataset, Dataset):

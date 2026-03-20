@@ -22,7 +22,7 @@ _T = tp.TypeVar("_T")
 _S = tp.TypeVar("_S")
 
 
-class _DatasetIteratorWithInputSpec(DatasetIterator[_T]):
+class _ProcessShardedDatasetIterator(DatasetIterator[_T]):
     _SLEEP_SECONDS = 2.0
     _MAX_ATTEMPTS = 5
 
@@ -81,7 +81,7 @@ class _DatasetIteratorWithInputSpec(DatasetIterator[_T]):
         self._parent.set_state(state)
 
 
-class ShardedIterDataset(IterDataset[_T]):
+class ProcessShardedIterDataset(IterDataset[_T]):
     def __init__(
         self,
         parent: IterDataset[_S],
@@ -93,9 +93,9 @@ class ShardedIterDataset(IterDataset[_T]):
         self._pspec = pspec or PartitionSpec()
         self._mesh = mesh
 
-    def __iter__(self) -> ShardedIterDataset:
+    def __iter__(self) -> ProcessShardedIterDataset:
         parent_iter = self._parent.__iter__()
-        return _DatasetIteratorWithInputSpec(
+        return _ProcessShardedDatasetIterator(
             parent_iter, pspec=self._pspec, mesh=self._mesh
         )
 
@@ -115,7 +115,7 @@ def make_simple_loader(
     per_worker_buffer_size: int | None = 1,
     window_size: int = 1000,
     seed: int = 0,
-) -> ShardedIterDataset:
+) -> ProcessShardedIterDataset:
 
     prepared: list[grain.IterDataset] = []
     if shard and not mesh:
@@ -138,18 +138,18 @@ def make_simple_loader(
     process_count = jax.process_count()
     process_index = jax.process_index()
     seed = seed + process_index if shard else seed
-    min_num_shards = None
     for ds in datasets:
         if shard:
-            if not hasattr(ds, "shard"):
+            if not hasattr(ds, "shard") and not hasattr(ds, "num_shards"):
                 raise NotImplementedError(
-                    "shard is active but ds doenst have shard method"
+                    "shard is active but ds doenst have shard method and num_shards attribute"
+                )
+            if ds.num_shards < process_count:
+                raise ValueError(
+                    f"Number of dataset shards (or MapDataset rows) ({ds.num_shards}) is less than the number of processes ({process_count}). "
+                    "Some processes will not receive any data."
                 )
             ds = ds.shard(process_count, process_index)
-        if not is_map and num_workers > 0 and hasattr(ds, "num_shards"):
-            ds_num_shards = ds.num_shards
-            if min_num_shards is None or ds_num_shards < min_num_shards:
-                min_num_shards = ds_num_shards
 
         if shuffle:
             warnings.warn(
@@ -163,13 +163,6 @@ def make_simple_loader(
 
         ds = ds.repeat() if hasattr(ds, "repeat") else RepeatIterDataset(ds)
         prepared.append(ds)
-
-    if min_num_shards is not None and num_workers > min_num_shards:
-        warnings.warn(
-            "Reducing num_workers because the streaming dataset has fewer shards "
-            f"than workers: num_workers={num_workers}, num_shards={min_num_shards}."
-        )
-        num_workers = min_num_shards
 
     mixed = (
         grain.MapDataset.mix(prepared, dataset_weights)
@@ -190,5 +183,5 @@ def make_simple_loader(
     mixed = mixed.mp_prefetch(mp_options)
     # think more about local data -> global data
     if shard:
-        return ShardedIterDataset(mixed, P(BATCH), mesh)
+        return ProcessShardedIterDataset(mixed, P(BATCH), mesh)
     return mixed

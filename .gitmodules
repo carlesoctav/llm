@@ -1,0 +1,4 @@
+[submodule ".agents"]
+	path = .agents
+	url = git@github.com:carlesoctav/llm.agents.git
+	branch = main

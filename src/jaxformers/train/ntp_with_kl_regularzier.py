@@ -23,7 +23,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_ntp_data
+from jaxformers.data import make_ntp_with_kl_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
@@ -90,27 +90,31 @@ def train_step(
     config: sws.FinalConfig, model: Model, base_model: Model | None, batch, *, rngs
 ):
     def kl_loss_fn(train_weights, frozen_weights, batch, rngs):
+        _, kl_batch = batch
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
-        if "assistant_masks" in batch["kl_inputs"]:
+        if "assistant_masks" in kl_batch["inputs"]:
             count = jnp.sum(
-                batch["kl_inputs"]["attention_mask"]
-                * batch["kl_inputs"]["assistant_masks"]
+                kl_batch["inputs"]["attention_mask"]
+                * kl_batch["inputs"]["assistant_masks"]
             )
-            mask = batch["kl_inputs"]["attention_mask"] * batch["kl_inputs"]["assistant_masks"]
+            mask = (
+                kl_batch["inputs"]["attention_mask"]
+                * kl_batch["inputs"]["assistant_masks"]
+            )
         else:
-            count = jnp.sum(batch["kl_inputs"]["attention_mask"])
-            mask = batch["kl_inputs"]["attention_mask"]
+            count = jnp.sum(kl_batch["inputs"]["attention_mask"])
+            mask = kl_batch["inputs"]["attention_mask"]
 
         hidden_states = model.forward(
-            weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
+            weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
         )
         log_probs = jax.nn.log_softmax(model.unembed(weights, hidden_states), axis=-1)
 
         if model.is_lora:
             base_weights = model.base_params
             kl_hidden_states = model.forward(
-                base_weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
+                base_weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
             )
             kl_log_probs = jax.nn.log_softmax(
                 model.unembed(base_weights, kl_hidden_states),
@@ -118,7 +122,10 @@ def train_step(
             )
         else:
             kl_hidden_states = base_model.forward(
-                base_model.weights, **batch["kl_inputs"], rngs=rngs, dtype=forward_dtype
+                base_model.weights,
+                **kl_batch["inputs"],
+                rngs=rngs,
+                dtype=forward_dtype,
             )
             kl_log_probs = jax.nn.log_softmax(
                 base_model.unembed(base_model.weights, kl_hidden_states),
@@ -132,31 +139,34 @@ def train_step(
         return kl_loss, {
             "loss": (kl_loss, count),
             "token": count,
-            "batch": batch["kl_inputs"]["input_ids"].shape[0],
+            "batch": kl_batch["inputs"]["input_ids"].shape[0],
         }
 
 
     def sft_loss_fn(train_weights, frozen_weights, batch, rngs):
+        sft_batch, _ = batch
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
 
         hidden_states = model.forward(
-            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
+            weights, **sft_batch["inputs"], rngs=rngs, dtype=forward_dtype
         )
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        labels = batch["labels"].reshape(-1)
+        labels = sft_batch["labels"].reshape(-1)
 
-        if "assistant_masks" in batch["inputs"]:
+        if "assistant_masks" in sft_batch["inputs"]:
             count = jnp.sum(
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+                sft_batch["inputs"]["attention_mask"]
+                * sft_batch["inputs"]["assistant_masks"]
             )
             mask = (
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
+                sft_batch["inputs"]["attention_mask"]
+                * sft_batch["inputs"]["assistant_masks"]
             ).reshape(-1)
         else:
-            count = jnp.sum(batch["inputs"]["attention_mask"])
-            mask = (batch["inputs"]["attention_mask"]).reshape(-1)
+            count = jnp.sum(sft_batch["inputs"]["attention_mask"])
+            mask = sft_batch["inputs"]["attention_mask"].reshape(-1)
         loss = cross_entropy_loss(
             hidden_states,
             labels,
@@ -176,14 +186,14 @@ def train_step(
             implementation=config.loss_implementation or None,
         )
 
-        batch_size = batch["labels"].shape[0]
+        batch_size = sft_batch["labels"].shape[0]
         aux = {"loss": (loss, count), "token": count, "batch": batch_size}
         return loss, aux
 
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
 
     if config.grad_accum > 1:
-        microbatch_size = config.train_loader.global_batch_size // config.grad_accum
+        microbatch_size = config.data.loader.batch_size // config.grad_accum
         sft_grad_fn = microbatch(
             jax.value_and_grad(sft_loss_fn, has_aux=True),
             argnums=2,
@@ -324,7 +334,7 @@ def train(
 
     to_log_later = {}
     program_wall_t0 = None
-    warn_assitant_loss = config.data.transforms.assistant_loss
+    warn_assitant_loss = config.data.sft.transforms.assistant_loss
 
     pbar = None
     if jax.process_index() == 0:
@@ -345,16 +355,23 @@ def train(
 
             try:
                 batch = next(train_iterator)
-                if warn_assitant_loss and "assistant_masks" in batch["inputs"]:
-                    check_ast_token = np.any(batch["inputs"]["assistant_masks"])
-                    if not check_ast_token and jax.process_index() == 0:
-                        raise RuntimeError(
-                            "assistant_loss=True was requested but no assistant token was found. "
-                            "This can occur if the chat template does not distinguish assistant vs user tokens "
-                            "or if truncation (max_length) removed the assistant token. "
-                            "please fix this issue before proceeding"
-                        )
-                    warn_assitant_loss = False
+                sft_batch, kl_batch = batch
+                if warn_assitant_loss:
+                    for batch_name, current_batch in (
+                        ("sft", sft_batch),
+                        ("kl", kl_batch),
+                    ):
+                        if "assistant_masks" not in current_batch["inputs"]:
+                            continue
+                        check_ast_token = np.any(current_batch["inputs"]["assistant_masks"])
+                        if not check_ast_token and jax.process_index() == 0:
+                            raise RuntimeError(
+                                "assistant_loss=True was requested but no assistant token was found "
+                                f"in the {batch_name} batch. This can occur if the chat template does not "
+                                "distinguish assistant vs user tokens or if truncation (max_length) removed "
+                                "the assistant token. please fix this issue before proceeding"
+                            )
+                        warn_assitant_loss = False
             except StopIteration:
                 if jax.process_index() == 0:
                     print("dataloader is exhausted")
@@ -362,7 +379,7 @@ def train(
 
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
-                with jax.named_scope("compile train step"):
+                with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
 
                     @print_timing
                     def compile_train_step():
@@ -389,24 +406,15 @@ def train(
                     to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(
-                        model,
-                        base_model,
-                        batch,
-                        rngs=loop_rngs,
-                    )
+                    model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
+                    jax.set_mesh(model.mesh),
                 ):
-                    model, aux = train_step_fn(
-                        model,
-                        base_model,
-                        batch,
-                        rngs=loop_rngs,
-                    )
+                    model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
 
             callback_output = {}
             if model.callback_state is not None:
@@ -487,58 +495,63 @@ def main(config: sws.FinalConfig):
             rngs=model_rngs,
         )
         base_model = dataclasses.replace(model)
-        scheduler_config = (
-            config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
-        )
-        scheduler = make_scheduler(
-            config.lr_scheduler_name,
-            config.learning_rate,
-            config.max_train_step,
-            scheduler_config=scheduler_config,
-        )
-        if do_lora:
-            model = make_lora(
-                model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
-            )
-        model = dataclasses.replace(
-            model,
-            weights=model.prepare_weights(model.weights, config.store_weights),
-        )
-        model = make_optimizer(
-            config.optimizer_name,
-            model,
-            scheduler,
-            config.optimizer.to_dict(),
-        )
-        print_train_state_size(model)
 
-        if do_lora:
-            base_model = None
-        else:
-            base_model = dataclasses.replace(
-                base_model,
-                weights=base_model.prepare_weights(
-                    base_model.weights,
-                    config.store_weights,
-                ),
+        with jax.set_mesh(model.mesh):
+            scheduler_config = (
+                config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
             )
-            base_model = tree_util.copy(base_model)
-
-        if do_callback:
-            callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
+            scheduler = make_scheduler(
+                config.lr_scheduler_name,
+                config.learning_rate,
+                config.max_train_step,
+                scheduler_config=scheduler_config,
+            )
+            if do_lora:
+                model = make_lora(
+                    model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+                )
             model = dataclasses.replace(
                 model,
-                callback_state=callbacks.init(model.weights, model.opt_state),
-                callbacks=callbacks,
+                weights=model.prepare_weights(model.weights, config.store_weights),
             )
+            model = make_optimizer(
+                config.optimizer_name,
+                model,
+                scheduler,
+                config.optimizer.to_dict(),
+            )
+            print_train_state_size(model)
 
-        train_ds = make_ntp_data(
-            config.data.source_name,
-            config.data.source.to_dict(),
-            config.data.transforms_name,
-            config.data.transforms.to_dict(),
-            config.train_loader_name,
-            config.train_loader.to_dict(),
+            if do_lora:
+                base_model = None
+            else:
+                base_model = dataclasses.replace(
+                    base_model,
+                    weights=base_model.prepare_weights(
+                        base_model.weights,
+                        config.store_weights,
+                    ),
+                )
+                base_model = tree_util.copy(base_model)
+
+            if do_callback:
+                callbacks = make_callbacks(
+                    config.callback_name, config.callback.to_dict()
+                )
+                model = dataclasses.replace(
+                    model,
+                    callback_state=callbacks.init(model.weights, model.opt_state),
+                    callbacks=callbacks,
+                )
+
+        train_ds = make_ntp_with_kl_data(
+            config.data.sft.source.to_dict(),
+            config.data.sft.transforms.to_dict(),
+            config.data.kl.source.to_dict(),
+            config.data.kl.transforms.to_dict(),
+            config.data.loader.to_dict(),
+            streaming=config.data.streaming,
+            mesh=model.mesh,
         )
         eval_ds = None
         _, metrics = train(

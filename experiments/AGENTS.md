@@ -59,12 +59,12 @@ Current reusable factory areas in this repo:
 - Scheduler factory modules: `src/jaxformers/scheduler/`
 
 Important:
-- There is no separate `src/jaxformers/data/train_loader/` factory today. The config still uses `train_loader_name` and `train_loader.*`, but the implementation lives under `src/jaxformers/data/loader/`.
+- The loader implementation lives under `src/jaxformers/data/loader/`, and the current training configs should use `config.data.loader.*`.
 - Reuse the existing train script and transform pair when possible instead of cloning training code into `experiments/`.
 
 Examples:
-- Plain SFT or next-token prediction: use `src/jaxformers/train/ntp.py` with `data.transforms_name = "ntp"`.
-- SFT with KL regularization: use `src/jaxformers/train/ntp_with_kl_regularzier.py` with `data.transforms_name = "ntp_kl"`.
+- Plain SFT or next-token prediction: use `src/jaxformers/train/ntp.py` with `config.data.source`, `config.data.transforms`, and `config.data.loader`.
+- SFT with KL regularization: use `src/jaxformers/train/ntp_with_kl_regularzier.py` with `config.data.sft.{source,transforms}`, `config.data.kl.{source,transforms}`, and `config.data.loader`.
 
 ## When To Add New Factory Code
 

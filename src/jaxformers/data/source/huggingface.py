@@ -160,7 +160,7 @@ class HuggingFaceSourceMapDataset(grain.MapDataset):
         )
 
 
-def make_huggingface_datasets(load_kwargs: dict[str, Any], streaming=False):
+def make_huggingface_datasets(load_kwargs: list[dict[str, Any]], streaming: bool = False):
     datasets = []
     for load_kwarg in load_kwargs:
         dataset = load_dataset(**load_kwarg, streaming=streaming)

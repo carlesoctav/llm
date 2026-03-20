@@ -1,47 +1,16 @@
 import dataclasses as dc
 import typing as tp
-from dataclasses import dataclass
-from enum import auto, StrEnum
 
-import grain
 from grain import transforms as grain_transforms
 from jaxtyping import Array
 from transformers import PreTrainedTokenizerBase
 
 from .base import DatasetTransforms
-
-
-class DataType(StrEnum):
-    CHAT = auto()
-    TEXT = auto()
-    TOKEN = auto()
-
-
-@dataclass
-class ApplyFirstFitPacking(DatasetTransforms):
-    """Apply Grain first-fit packing transformation."""
-
-    length_struct: dict[str, int]
-    num_packing_bins: int | None = None
-    shuffle_bins: bool = True
-    meta_features: tp.Sequence[str] = ()
-
-    def __call__(self, dataset: grain.IterDataset) -> grain.IterDataset:
-        bins = self.num_packing_bins or max(self.length_struct.values())
-        packed = grain.experimental.FirstFitPackIterDataset(
-            dataset,
-            length_struct=self.length_struct,
-            num_packing_bins=bins,
-            shuffle_bins=self.shuffle_bins,
-            meta_features=self.meta_features,
-        )
-        return packed
+from .ntp import ApplyFirstFitPacking, DataType
 
 
 @dc.dataclass
 class TokenizeText(grain_transforms.Map):
-    """Tokenize raw text coming from a column."""
-
     column: str
     tokenizer: PreTrainedTokenizerBase
     packing: bool
@@ -53,6 +22,7 @@ class TokenizeText(grain_transforms.Map):
     def map(self, features: dict[str, tp.Any]) -> dict[str, Array]:
         if self.column not in features:
             raise KeyError(f"Column {self.column!r} not found in element")
+
         text = features[self.column]
         if self.data_type == DataType.CHAT:
             encoded = self.tokenizer.apply_chat_template(
@@ -74,14 +44,12 @@ class TokenizeText(grain_transforms.Map):
                 return_attention_mask=True,
                 return_token_type_ids=False,
             )
-        output = {k: v.squeeze(0)[:-1] for k, v in encoded.items()}
-        return output
+
+        return {k: v.squeeze(0) for k, v in encoded.items()}
 
 
 @dc.dataclass
 class NestInputs(grain_transforms.Map):
-    """Nest token arrays under an `inputs` dict for model consumption."""
-
     def map(self, features: dict[str, tp.Any]) -> dict[str, tp.Any]:
         if "inputs" in features:
             return features
@@ -92,9 +60,11 @@ class NestInputs(grain_transforms.Map):
         }
         if "input_ids_segment_ids" in features:
             inputs["segment_ids"] = features["input_ids_segment_ids"]
+        if "input_ids_segment_positions" in features:
+            inputs["segment_positions"] = features["input_ids_segment_positions"]
         if "assistant_masks" in features:
             inputs["assistant_masks"] = features["assistant_masks"]
-        return {"inputs": inputs, "labels": features["labels"]}
+        return {"inputs": inputs}
 
 
 def make(
@@ -105,10 +75,8 @@ def make(
     chat_template_path: str | None = None,
     assistant_loss: bool = False,
     packing: bool = False,
-    packing_bins: int | None = None,
+    packing_bins: int | None = 64,
 ) -> list[grain_transforms.Map | grain_transforms.RandomMap | DatasetTransforms]:
-    """Build the list of transforms required for next-token prediction."""
-
     if data_type is None:
         raise ValueError("data_type is required")
     if data_type not in tuple(DataType):
@@ -147,14 +115,13 @@ def make(
         length_struct = {
             "input_ids": max_length,
             "attention_mask": max_length,
-            "labels": max_length,
             **({"assistant_masks": max_length} if assistant_loss else {}),
         }
         transforms.append(
             ApplyFirstFitPacking(
                 length_struct=length_struct,
                 num_packing_bins=packing_bins,
-                meta_features=("attention_mask", "labels")
+                meta_features=("attention_mask",)
                 + (("assistant_masks",) if assistant_loss else ()),
             )
         )

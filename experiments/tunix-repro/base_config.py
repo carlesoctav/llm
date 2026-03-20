@@ -49,7 +49,7 @@ def get_config():
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.data.source_name = "huggingface"
-    config.data.source.streaming=True
+    config.data.streaming = True
     config.data.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",

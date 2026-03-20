@@ -10,9 +10,10 @@ def make_ntp_data(
     transforms_config: dict,
     loader_config: dict,
     *,
+    streaming: bool = False,
     mesh: Mesh | None = None,
 ):
-    datasets = make_huggingface_datasets(**source)
+    datasets = make_huggingface_datasets(source["load_kwargs"], streaming=streaming)
     transforms = make_ntp_transforms(**transforms_config)
     data_loader = make_simple_loader(datasets, transforms, mesh, **loader_config)
     return data_loader

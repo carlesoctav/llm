@@ -416,6 +416,7 @@ def main(config: sws.FinalConfig):
             config.data.source.to_dict(),
             config.data.transforms.to_dict(),
             config.data.loader.to_dict(),
+            streaming=config.data.streaming,
             mesh = model.mesh,
         )
 

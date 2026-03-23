@@ -115,7 +115,7 @@ class NestInputs(grain_transforms.Map):
         }
 
 
-def make_ntp_transforms(
+def make(
     column: str,
     max_length: int,
     data_type: str | None = None,

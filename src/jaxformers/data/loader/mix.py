@@ -6,7 +6,6 @@ from collections.abc import Sequence
 import grain
 import jax
 from grain import IterDataset, MapDataset
-from grain._src.python.dataset.transformations.zip import ZipIterDataset
 from jax import P
 from jax.sharding import Mesh
 
@@ -38,7 +37,7 @@ def make(
     seed: int = 0,
 ) -> ProcessShardedIterDataset | IterDataset[_T]:
     if not groups:
-        raise ValueError("zip loader requires at least one dataset group")
+        raise ValueError("mix loader requires at least one dataset group")
 
     if shard and not mesh:
         raise ValueError("need mesh if we shard the datasets")
@@ -62,9 +61,9 @@ def make(
         )
         prepared_groups.append(prepared_group)
 
-    zipped = ZipIterDataset(prepared_groups)
+    mixed = grain.IterDataset.mix(prepared_groups)
     mp_options = grain.MultiprocessingOptions(num_workers, per_worker_buffer_size)
-    zipped = zipped.mp_prefetch(mp_options)
+    mixed = mixed.mp_prefetch(mp_options)
     if shard:
-        return ProcessShardedIterDataset(zipped, P(BATCH), mesh)
-    return zipped
+        return ProcessShardedIterDataset(mixed, P(BATCH), mesh)
+    return mixed

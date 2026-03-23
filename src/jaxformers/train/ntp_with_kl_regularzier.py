@@ -22,7 +22,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_ntp_with_kl_data
+from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
@@ -89,8 +89,9 @@ def _preparse_absl_flags() -> None:
 def train_step(
     config: sws.FinalConfig, model: Model, base_model: Model | None, batch, *, rngs
 ):
-    def kl_loss_fn(train_weights, frozen_weights, batch, rngs):
-        _, kl_batch = batch
+    sft_batch, kl_batch = batch
+
+    def kl_loss_fn(train_weights, frozen_weights, kl_batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
         count = jnp.sum(kl_batch["_mask"])
@@ -132,8 +133,7 @@ def train_step(
             "batch": kl_batch["inputs"]["input_ids"].shape[0],
         }
 
-    def sft_loss_fn(train_weights, frozen_weights, batch, rngs):
-        sft_batch, _ = batch
+    def sft_loss_fn(train_weights, frozen_weights, sft_batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
 
@@ -171,26 +171,31 @@ def train_step(
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
 
     if config.grad_accum > 1:
-        microbatch_size = config.data.loader.batch_size // config.grad_accum
+        sft_microbatch_size = sft_batch["labels"].shape[0] // config.grad_accum
+        kl_microbatch_size = (
+            kl_batch["inputs"]["input_ids"].shape[0] // config.grad_accum
+        )
         sft_grad_fn = microbatch(
             jax.value_and_grad(sft_loss_fn, has_aux=True),
             argnums=2,
-            microbatch_size=microbatch_size,
+            microbatch_size=sft_microbatch_size,
         )
 
         kl_grad_fn = microbatch(
             jax.value_and_grad(kl_loss_fn, has_aux=True),
             argnums=2,
-            microbatch_size=microbatch_size,
+            microbatch_size=kl_microbatch_size,
         )
     else:
         sft_grad_fn = jax.value_and_grad(sft_loss_fn, has_aux=True)
         kl_grad_fn = jax.value_and_grad(kl_loss_fn, has_aux=True)
 
     (sft_loss, sft_aux), sft_grad = sft_grad_fn(
-        train_weights, frozen_weights, batch, rngs
+        train_weights, frozen_weights, sft_batch, rngs
     )
-    (kl_loss, kl_aux), kl_grad = kl_grad_fn(train_weights, frozen_weights, batch, rngs)
+    (kl_loss, kl_aux), kl_grad = kl_grad_fn(
+        train_weights, frozen_weights, kl_batch, rngs
+    )
 
     sft_token_count = sft_aux["token"]
     kl_token_count = kl_aux["token"]
@@ -452,13 +457,8 @@ def main(config: sws.FinalConfig):
                     callbacks=callbacks,
                 )
 
-        train_ds = make_ntp_with_kl_data(
-            config.data.sft.source.to_dict(),
-            config.data.sft.transforms.to_dict(),
-            config.data.kl.source.to_dict(),
-            config.data.kl.transforms.to_dict(),
-            config.data.loader.to_dict(),
-            streaming=config.data.streaming,
+        train_ds = make_data(
+            config.data.to_dict(),
             mesh=model.mesh,
         )
         eval_ds = None

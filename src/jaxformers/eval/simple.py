@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxformers import tree_util, metric_utils
-from jaxformers.data.source.huggingface import make_huggingface_datasets
+from jaxformers.data.source import make_source
 
 
 def _check_shape(shape, tree):
@@ -35,7 +35,7 @@ def make_eval(
     streaming: bool = False,
 ):
 
-    data = make_huggingface_datasets(load_data, streaming=streaming)
+    data = make_source("huggingface", load_data, streaming=streaming)
 
     def evaluator(model, loader):
         list_aux = []

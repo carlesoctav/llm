@@ -24,7 +24,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_ntp_data
+from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
@@ -117,7 +117,7 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
         return loss, aux
 
     if config.grad_accum > 1:
-        microbatch_size = config.data.loader.batch_size // config.grad_accum
+        microbatch_size = batch["labels"].shape[0] // config.grad_accum
         grad_fn = microbatch(
             jax.value_and_grad(loss_fn, has_aux=True),
             argnums=2,
@@ -355,11 +355,8 @@ def main(config: sws.FinalConfig):
                     callbacks=callbacks,
                 )
 
-        train_ds = make_ntp_data(
-            config.data.source.to_dict(),
-            config.data.transforms.to_dict(),
-            config.data.loader.to_dict(),
-            streaming=config.data.streaming,
+        train_ds = make_data(
+            config.data.to_dict(),
             mesh=model.mesh,
         )
 

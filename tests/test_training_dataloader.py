@@ -2,11 +2,12 @@ import dataclasses as dc
 
 import jax
 import numpy as np
-from datasets import Dataset, IterableDataset
+from datasets import Dataset
 from grain import transforms as grain_transforms
 from jax.sharding import Mesh, PartitionSpec
 
 from jaxformers.data.loader.simple import make_simple_loader
+from jaxformers.data.source.huggingface import HuggingFaceSourceIterDataset
 
 
 @dc.dataclass
@@ -37,7 +38,7 @@ def text_iterable_dataset(
     source: int | None = None,
     id_offset: int = 0,
     num_shards: int = 1,
-) -> IterableDataset:
+):
     ids = list(range(id_offset, id_offset + num_examples))
     data = {
         "id": ids,
@@ -46,7 +47,9 @@ def text_iterable_dataset(
     if source is not None:
         data["source"] = [source] * num_examples
 
-    return Dataset.from_dict(data).to_iterable_dataset(num_shards=num_shards)
+    return HuggingFaceSourceIterDataset(
+        Dataset.from_dict(data).to_iterable_dataset(num_shards=num_shards)
+    )
 
 
 def _flatten_batches(dataset, key: str) -> list[int]:
@@ -61,12 +64,11 @@ def test_training_cpu_only():
     dl = make_simple_loader(
         datasets=ds,
         transforms=[SimpleTokenize(max_length=4)],
+        mesh=None,
         batch_size=4,
-        dataloading_host_index=0,
-        dataloading_host_count=1,
+        shard=False,
         shuffle=False,
-        worker_count=0,
-        drop_remainder=True,
+        num_workers=0,
     )
 
     batch0 = next(iter(dl))
@@ -86,20 +88,17 @@ def test_training_cpu_only():
 def test_training_single_host_tpu():
     ds = text_iterable_dataset(4)
 
-    mesh = Mesh(np.array([jax.devices()[0]]), ("data",))
-    pspec = PartitionSpec("data")
+    mesh = Mesh(np.array([[jax.devices()[0]]]), ("dp_replicate", "dp_shard"))
+    pspec = PartitionSpec(("dp_replicate", "dp_shard"))
 
     dl = make_simple_loader(
         datasets=ds,
         transforms=[SimpleTokenize(max_length=4)],
-        batch_size=4,
-        dataloading_host_index=0,
-        dataloading_host_count=1,
-        shuffle=False,
-        worker_count=0,
-        drop_remainder=True,
         mesh=mesh,
-        pspec=pspec,
+        batch_size=4,
+        shard=True,
+        shuffle=False,
+        num_workers=0,
     )
 
     batch0 = next(iter(dl))
@@ -148,12 +147,11 @@ def test_training_mix_two_datasets_cpu_only():
     dl = make_simple_loader(
         datasets=[ds_a, ds_b],
         transforms=[SimpleTokenize(max_length=4)],
+        mesh=None,
         batch_size=2,
-        dataloading_host_index=0,
-        dataloading_host_count=1,
+        shard=False,
         shuffle=False,
-        worker_count=0,
-        drop_remainder=True,
+        num_workers=0,
     )
 
     it = iter(dl)

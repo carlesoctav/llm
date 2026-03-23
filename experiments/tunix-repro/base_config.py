@@ -56,26 +56,28 @@ def get_config():
 
     config.eval.val = make_eval()
 
-    config.data.source_name = "huggingface"
     config.data.streaming = True
-    config.data.source.load_kwargs = [
+    config.data.train.transforms_name = "ntp"
+    config.data.train.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
             "split": "train",
         }
     ]
 
-    config.data.transforms.column = "messages"
-    config.data.transforms.max_length = 2048
-    config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
+    config.data.train.transforms.column = "messages"
+    config.data.train.transforms.max_length = 2048
+    config.data.train.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
         config.model.model_id
     )
-    config.data.transforms.data_type = "chat"
-    config.data.transforms.assistant_loss = True
-    config.data.transforms.chat_template_path = "./temp/think.jinja"
-    config.data.transforms.packing = True
+    config.data.train.transforms.data_type = "chat"
+    config.data.train.transforms.assistant_loss = True
+    config.data.train.transforms.chat_template_path = "./temp/think.jinja"
+    config.data.train.transforms.packing = True
 
-    config.data.loader.batch_size = 32
+    config.data.loader.shard = False
+    config.data.train.loader.batch_size = 32
+    config.data.train.loader.shuffle = False
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

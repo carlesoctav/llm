@@ -2,6 +2,7 @@ import numpy as np
 from datasets import Dataset
 
 from jaxformers.data import make_loader, make_transforms
+from jaxformers.data.source.huggingface import HuggingFaceSourceIterDataset
 
 
 class DummyTokenizer:
@@ -25,9 +26,11 @@ class DummyTokenizer:
 
 
 def test_ntp_cpu():
-    hf_data = Dataset.from_list(
-        [{"text": "saya makan nasi"}, {"text": "tinggal di indonesia"}]
-    ).to_iterable_dataset()
+    hf_data = HuggingFaceSourceIterDataset(
+        Dataset.from_list(
+            [{"text": "saya makan nasi"}, {"text": "tinggal di indonesia"}]
+        ).to_iterable_dataset()
+    )
     ntp_transforms = make_transforms(
         "ntp",
         {
@@ -43,12 +46,10 @@ def test_ntp_cpu():
         hf_data,
         ntp_transforms,
         {
-            "global_batch_size": 2,
-            "dataloading_host_index": 0,
-            "dataloading_host_count": 1,
+            "batch_size": 2,
+            "shard": False,
             "shuffle": False,
-            "worker_count": 0,
-            "drop_remainder": True,
+            "num_workers": 0,
         },
     )
     data = next(iter(dataset))

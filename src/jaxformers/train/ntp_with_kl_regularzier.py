@@ -94,8 +94,8 @@ def train_step(
     def kl_loss_fn(train_weights, frozen_weights, kl_batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
-        count = jnp.sum(kl_batch["_mask"])
-        mask = kl_batch["_mask"]
+        count = jnp.sum(kl_batch["loss_mask"])
+        mask = kl_batch["loss_mask"]
 
         hidden_states = model.forward(
             weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
@@ -143,8 +143,8 @@ def train_step(
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = sft_batch["labels"].reshape(-1)
-        count = jnp.sum(sft_batch["_mask"])
-        mask = sft_batch["_mask"].reshape(-1)
+        count = jnp.sum(sft_batch["loss_mask"])
+        mask = sft_batch["loss_mask"].reshape(-1)
         loss = cross_entropy_loss(
             hidden_states,
             labels,

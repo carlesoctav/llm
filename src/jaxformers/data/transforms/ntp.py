@@ -78,7 +78,7 @@ class TokenizeText(grain_transforms.Map):
             )
         output = {k: v.squeeze(0)[:-1] for k, v in encoded.items()}
         output["labels"] = encoded["input_ids"].squeeze(0)[1:]
-        output["_mask"] = output["attention_mask"]
+        output["loss_mask"] = output["attention_mask"]
         if "assistant_masks" in output:
             if not np.any(output["assistant_masks"]) and jax.process_index() == 0:
                 raise RuntimeError(
@@ -87,7 +87,7 @@ class TokenizeText(grain_transforms.Map):
                     "or if truncation (max_length) removed the assistant token. "
                     "please fix this issue before proceeding"
                 )
-            output["_mask"] = output["_mask"] * output["assistant_masks"]
+            output["loss_mask"] = output["loss_mask"] * output["assistant_masks"]
         return output
 
 
@@ -107,11 +107,15 @@ class NestInputs(grain_transforms.Map):
             inputs["segment_ids"] = features["input_ids_segment_ids"]
         if "assistant_masks" in features:
             inputs["assistant_masks"] = features["assistant_masks"]
-        mask = features["_mask"] if "_mask" in features else features["attention_mask"]
+        loss_mask = (
+            features["loss_mask"]
+            if "loss_mask" in features
+            else features["attention_mask"]
+        )
         return {
             "inputs": inputs,
             "labels": features["labels"],
-            "_mask": mask,
+            "loss_mask": loss_mask,
         }
 
 
@@ -166,7 +170,7 @@ def make(
             "input_ids": max_length,
             "attention_mask": max_length,
             "labels": max_length,
-            **({"_mask": max_length} if data_type != DataType.TOKEN else {}),
+            **({"loss_mask": max_length} if data_type != DataType.TOKEN else {}),
             **({"assistant_masks": max_length} if assistant_loss else {}),
         }
         transforms.append(
@@ -174,7 +178,7 @@ def make(
                 length_struct=length_struct,
                 num_packing_bins=packing_bins,
                 meta_features=("attention_mask", "labels")
-                + (("_mask",) if data_type != DataType.TOKEN else ())
+                + (("loss_mask",) if data_type != DataType.TOKEN else ())
                 + (("assistant_masks",) if assistant_loss else ()),
             )
         )

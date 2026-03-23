@@ -4,7 +4,6 @@ from transformers import AutoTokenizer
 
 def get_config():
     config = sws.Config()
-    config.data.streaming = False
     config.data.loader.combine = "zip"
     config.data.loader.shard = False
 
@@ -14,12 +13,14 @@ def get_config():
             "split": "train",
         }
     ]
+    config.data.sft.source.streaming = False
     config.data.kl.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
             "split": "train",
         }
     ]
+    config.data.kl.source.streaming = False
 
     config.data.sft.transforms_name = "ntp"
     config.data.sft.transforms.column = "messages"

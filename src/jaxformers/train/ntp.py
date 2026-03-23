@@ -90,8 +90,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
-        count = jnp.sum(batch["_mask"])
-        mask = batch["_mask"].reshape(-1)
+        count = jnp.sum(batch["loss_mask"])
+        mask = batch["loss_mask"].reshape(-1)
         loss = cross_entropy_loss(
             hidden_states,
             labels,

@@ -1,10 +1,11 @@
 import dataclasses as dc
 
 import numpy as np
+import pytest
 from datasets import Dataset
 from grain import transforms as grain_transforms
 
-from jaxformers.data import make_data, make_loader, make_transforms
+from jaxformers.data import make_data, make_eval_data, make_loader, make_transforms
 from jaxformers.data.source.huggingface import HuggingFaceSourceIterDataset
 
 
@@ -74,18 +75,17 @@ def test_make_data_uses_single_group_loader(monkeypatch):
         Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
     )
 
-    def fake_make_source(source_name, source_config, *, streaming=False):
-        del source_name, source_config, streaming
+    def fake_make_source(source_name, source_config):
+        del source_name, source_config
         return [dataset]
 
     monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
 
     loader = make_data(
         {
-            "streaming": False,
             "loader": {"num_workers": 0, "shard": False},
             "train": {
-                "source": {"load_kwargs": []},
+                "source": {"load_kwargs": [], "streaming": False},
                 "transforms": [IdentityMap()],
                 "loader": {"batch_size": 2, "shuffle": False},
             },
@@ -94,6 +94,33 @@ def test_make_data_uses_single_group_loader(monkeypatch):
 
     batch = next(iter(loader))
     assert batch["id"].tolist() == [0, 1]
+
+
+def test_make_eval_data_uses_flat_loader(monkeypatch):
+    dataset = HuggingFaceSourceIterDataset(
+        Dataset.from_dict({"id": [0]}).to_iterable_dataset()
+    )
+
+    def fake_make_source(source_name, source_config):
+        del source_name, source_config
+        return [dataset]
+
+    monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
+
+    loader = make_eval_data(
+        {
+            "source": {"load_kwargs": [], "streaming": False},
+            "transforms": [IdentityMap()],
+            "loader": {"batch_size": 2, "shard": False, "shuffle": False},
+        }
+    )
+
+    iterator = iter(loader)
+    batch = next(iterator)
+    assert batch["id"].tolist() == [0, 0]
+    assert batch["_mask"].tolist() == [1, 0]
+    with pytest.raises(StopIteration):
+        next(iterator)
 
 
 def test_make_data_uses_zip_loader(monkeypatch):
@@ -106,23 +133,22 @@ def test_make_data_uses_zip_loader(monkeypatch):
         ),
     }
 
-    def fake_make_source(source_name, source_config, *, streaming=False):
-        del source_name, streaming
+    def fake_make_source(source_name, source_config):
+        del source_name
         return [datasets[source_config["name"]]]
 
     monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
 
     loader = make_data(
         {
-            "streaming": False,
             "loader": {"combine": "zip", "num_workers": 0, "shard": False},
             "sft": {
-                "source": {"name": "sft"},
+                "source": {"name": "sft", "streaming": False},
                 "transforms": [IdentityMap()],
                 "loader": {"batch_size": 2, "shuffle": False},
             },
             "kl": {
-                "source": {"name": "kl"},
+                "source": {"name": "kl", "streaming": False},
                 "transforms": [IdentityMap()],
                 "loader": {"batch_size": 1, "shuffle": False},
             },
@@ -144,23 +170,22 @@ def test_make_data_uses_mix_loader(monkeypatch):
         ),
     }
 
-    def fake_make_source(source_name, source_config, *, streaming=False):
-        del source_name, streaming
+    def fake_make_source(source_name, source_config):
+        del source_name
         return [datasets[source_config["name"]]]
 
     monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
 
     loader = make_data(
         {
-            "streaming": False,
             "loader": {"combine": "mix", "num_workers": 0, "shard": False},
             "a": {
-                "source": {"name": "a"},
+                "source": {"name": "a", "streaming": False},
                 "transforms": [IdentityMap()],
                 "loader": {"batch_size": 2, "shuffle": False},
             },
             "b": {
-                "source": {"name": "b"},
+                "source": {"name": "b", "streaming": False},
                 "transforms": [IdentityMap()],
                 "loader": {"batch_size": 1, "shuffle": False},
             },

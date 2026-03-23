@@ -57,7 +57,7 @@ def test_tokenize_text_sets_mask_from_attention_mask():
         max_length=3,
     ).map({"text": "hello"})
 
-    np.testing.assert_array_equal(output["_mask"], output["attention_mask"])
+    np.testing.assert_array_equal(output["loss_mask"], output["attention_mask"])
 
 
 def test_tokenize_text_sets_mask_from_assistant_mask():
@@ -71,7 +71,7 @@ def test_tokenize_text_sets_mask_from_assistant_mask():
     ).map({"text": [{"role": "user", "content": "hi"}]})
 
     np.testing.assert_array_equal(
-        output["_mask"], output["attention_mask"] * output["assistant_masks"]
+        output["loss_mask"], output["attention_mask"] * output["assistant_masks"]
     )
 
 
@@ -92,12 +92,12 @@ def test_nest_inputs_keeps_loss_mask_at_batch_root():
         "input_ids": np.array([1, 2, 3], dtype=np.int32),
         "attention_mask": np.array([1, 1, 0], dtype=np.int32),
         "labels": np.array([2, 3, 4], dtype=np.int32),
-        "_mask": np.array([1, 1, 0], dtype=np.int32),
+        "loss_mask": np.array([1, 1, 0], dtype=np.int32),
     }
 
     output = NestInputs().map(features)
 
-    np.testing.assert_array_equal(output["_mask"], features["_mask"])
+    np.testing.assert_array_equal(output["loss_mask"], features["loss_mask"])
     np.testing.assert_array_equal(
         output["inputs"]["attention_mask"], features["attention_mask"]
     )
@@ -112,4 +112,4 @@ def test_nest_inputs_uses_attention_mask_when_mask_is_missing():
 
     output = NestInputs().map(features)
 
-    np.testing.assert_array_equal(output["_mask"], features["attention_mask"])
+    np.testing.assert_array_equal(output["loss_mask"], features["attention_mask"])

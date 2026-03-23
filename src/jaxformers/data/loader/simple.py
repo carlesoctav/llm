@@ -4,6 +4,7 @@ import logging
 import time
 import typing as tp
 from collections.abc import Sequence
+from typing import Callable
 
 import grain
 import jax
@@ -114,6 +115,8 @@ def make_simple_loader(
     per_worker_buffer_size: int | None = 1,
     window_size: int = 1000,
     seed: int = 0,
+    batch_fn: Callable | None = None,
+    num_epochs: int | None = None,
 ) -> ProcessShardedIterDataset:
     if shard and not mesh:
         raise ValueError("need mesh if we shard the datasets")
@@ -133,6 +136,8 @@ def make_simple_loader(
         prefetch_buffer_size=prefetch_buffer_size,
         window_size=window_size,
         seed=seed,
+        batch_fn=batch_fn,
+        num_epochs=num_epochs,
     )
     mp_options = grain.MultiprocessingOptions(num_workers, per_worker_buffer_size)
     mixed = mixed.mp_prefetch(mp_options)
@@ -157,6 +162,8 @@ def make(
     per_worker_buffer_size: int | None = 1,
     window_size: int = 1000,
     seed: int = 0,
+    batch_fn: Callable | None = None,
+    num_epochs: int | None = None,
 ):
     return make_simple_loader(
         datasets,
@@ -172,4 +179,6 @@ def make(
         per_worker_buffer_size=per_worker_buffer_size,
         window_size=window_size,
         seed=seed,
+        batch_fn=batch_fn,
+        num_epochs=num_epochs,
     )

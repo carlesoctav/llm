@@ -63,7 +63,6 @@ def get_config():
     config.lora.alpha = 512
     config.lora.weights_path = list(DEFAULT_LORA_PATHS)
 
-    config.data.streaming = False
     config.data.loader.combine = "zip"
     config.data.loader.shard = False
     config.data.loader.seed = 42
@@ -74,12 +73,14 @@ def get_config():
             "split": "train",
         }
     ]
+    config.data.sft.source.streaming = False
     config.data.kl.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
             "split": "train",
         }
     ]
+    config.data.kl.source.streaming = False
 
     config.data.sft.transforms_name = "ntp"
     config.data.sft.transforms.column = "messages"

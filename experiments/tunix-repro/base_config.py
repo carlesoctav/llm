@@ -50,13 +50,22 @@ def get_config():
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
+    def transforms():
+        pass
+
     def make_eval():
-        return {"type": "loss", "load_data": "xxx", "transforms":"gg"}
+        return {
+            "type": "simple",
+            "data": {
+                "source": "xxx",
+                "transforms": "gg",
+                "loader": "yy",
+            },
+        }
 
 
     config.eval.val = make_eval()
 
-    config.data.streaming = True
     config.data.train.transforms_name = "ntp"
     config.data.train.source.load_kwargs = [
         {
@@ -64,6 +73,7 @@ def get_config():
             "split": "train",
         }
     ]
+    config.data.train.source.streaming = True
 
     config.data.train.transforms.column = "messages"
     config.data.train.transforms.max_length = 2048

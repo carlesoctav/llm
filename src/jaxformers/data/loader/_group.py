@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Sequence
+from typing import Callable
 
 import grain
 from grain import IterDataset, MapDataset, ReadOptions
@@ -24,6 +25,8 @@ def prepare_group(
     prefetch_buffer_size: int | None,
     window_size: int,
     seed: int,
+    batch_fn: Callable | None = None,
+    num_epochs: int | None = None,
 ):
     if isinstance(datasets, (MapDataset, IterDataset)) or not isinstance(
         datasets, Sequence
@@ -72,7 +75,7 @@ def prepare_group(
                     seed=group_seed,
                 )
 
-        ds = ds.repeat() if hasattr(ds, "repeat") else RepeatIterDataset(ds)
+        ds = ds.repeat(num_epochs = num_epochs) if hasattr(ds, "repeat") else RepeatIterDataset(ds, num_epochs=num_epochs)
         prepared.append(ds)
 
     mixed = (
@@ -80,6 +83,7 @@ def prepare_group(
         if is_map
         else grain.IterDataset.mix(prepared, dataset_weights)
     )
+
     mixed = (
         mixed.to_iter_dataset(
             read_options=ReadOptions(num_threads, prefetch_buffer_size)
@@ -87,6 +91,7 @@ def prepare_group(
         if is_map
         else mixed
     )
+
     mixed = transform_ds(mixed, *(transforms or ()))
     batch_size = batch_size // process_count if shard else batch_size
-    return mixed.batch(batch_size=batch_size)
+    return mixed.batch(batch_size=batch_size, batch_fn=batch_fn)

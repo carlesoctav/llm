@@ -6,6 +6,7 @@ from transformers import AutoTokenizer
 
 def get_config():
     config = sws.Config()
+    eval_every = 2500
 
     config.skip_eval = True
 
@@ -14,7 +15,7 @@ def get_config():
     config.dir = "gs://carles-git-good"
     config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.seed = 42
-    config.eval_every = None
+    config.eval_every = eval_every
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_implementation = "reference"
@@ -23,7 +24,7 @@ def get_config():
     config.logger_name = "wandb"
 
     config.use_checkpoint = False
-    config.checkpoint_options.save_interval_steps = 2500
+    config.checkpoint_options.save_interval_steps = eval_every
     config.checkpoint_options.max_to_keep = 1
 
     config.logger.project = lambda: config.project_name
@@ -32,6 +33,7 @@ def get_config():
     config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
     config.callback.log_performance.real_step_threshold = 0
     config.callback.log_performance.denom_keys = ["token"]
+
 
     config.init_model = "pretrained"
     config.init_lora = None
@@ -47,6 +49,12 @@ def get_config():
 
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
+
+    def make_eval():
+        return {"type": "loss", "load_data": "xxx", "transforms":"gg"}
+
+
+    config.eval.val = make_eval()
 
     config.data.source_name = "huggingface"
     config.data.streaming = True

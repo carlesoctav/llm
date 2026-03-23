@@ -10,13 +10,13 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import orbax.checkpoint as ocp
+import optax
 import sws
 from jax.experimental.rnn import PRNGKeyArray
 from optax import microbatch
 from tqdm.auto import tqdm
 
-from jaxformers import tree_util
+from jaxformers import metric_utils, tree_util
 from jaxformers.benchmark_utils import (
     print_compiled_memory_stats,
     print_flops,
@@ -33,6 +33,7 @@ from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
+from jaxformers.train.checkpointing import make_checkpointer, save_checkpoint
 
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
@@ -67,6 +68,17 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
+def predict_fn(model: Model, batch, rngs):
+    return model.unembed(model.weights, model.forward(model.weights, batch, rngs))
+
+
+def loss_fn(model, batch, rngs):
+    logits = predict_fn(model, batch, rngs)
+    return {
+        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
+    }
+
+
 def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     def loss_fn(train_weights, freeze_weights, batch, rngs):
         weights = tree_util.combine(train_weights, freeze_weights)
@@ -78,17 +90,8 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
-
-        if "assistant_masks" in batch["inputs"]:
-            count = jnp.sum(
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
-            )
-            mask = (
-                batch["inputs"]["attention_mask"] * batch["inputs"]["assistant_masks"]
-            ).reshape(-1)
-        else:
-            count = jnp.sum(batch["inputs"]["attention_mask"])
-            mask = (batch["inputs"]["attention_mask"]).reshape(-1)
+        count = jnp.sum(batch["_mask"])
+        mask = batch["_mask"].reshape(-1)
         loss = cross_entropy_loss(
             hidden_states,
             labels,
@@ -132,66 +135,22 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     updates, nst = model.tx.update(grad, model.opt_state, model.weights)
 
     nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
+    next_model = dataclasses.replace(model, weights=nweights, opt_state=nst)
     callback_state = model.callback_state
     if model.callback_state is not None:
-        callback_state = model.callbacks.update(
+        next_model, callback_state = model.callbacks.update(
+            next_model,
             model.callback_state,
             grad,
             updates,
-            nst,
-            nweights,
             aux,
         )
 
-    return dataclasses.replace(
-        model, weights=nweights, opt_state=nst, callback_state=callback_state
-    ), aux
+    return dataclasses.replace(next_model, callback_state=callback_state), aux
 
 
 def eval(model, eval_ds):
     raise NotImplementedError
-
-
-def process_aux(accum_aux: dict[str, Any], namespace=""):
-    def finalize(v: Any) -> Any:
-        if isinstance(v, tuple):
-            numer, denom = v
-            return numer / denom if denom else 0.0
-        return v
-
-    prefix = f"{namespace}/" if namespace else ""
-    return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
-
-
-def _to_host(tree):
-    tree = jax.device_get(tree)
-
-    def _item(value):
-        if isinstance(value, np.ndarray) and value.shape == ():
-            return value.item()
-        if isinstance(value, np.generic):
-            return value.item()
-        return value
-
-    return jtu.tree_map(_item, tree)
-
-
-def add_aux(accum_aux, aux):
-    is_tuple = lambda x: isinstance(x, tuple)
-
-    def f(path, accum_leaf, leaf):
-        method = DEFAULT_REDUCED[jtu.keystr(path, simple=True)]
-        match method:
-            case "max":
-                return max(accum_leaf, leaf)
-            case "sum":
-                return accum_leaf + leaf
-            case "min":
-                return min(accum_leaf, leaf)
-            case "mean":
-                return (accum_leaf[0] + leaf[0], accum_leaf[1] + leaf[1])
-
-    return jtu.tree_map_with_path(f, accum_aux, aux, is_leaf=is_tuple)
 
 
 def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -224,14 +183,10 @@ def train(
     ckpt_manager = None
 
     if need_save:
-        ckpt_options = ocp.CheckpointManagerOptions(
-            **config.checkpoint_options.to_dict()
-        )
-        ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
+        ckpt_manager = make_checkpointer(config)
 
     to_log_later = {}
     program_wall_t0 = None
-    warn_assitant_loss = config.data.transforms.assistant_loss
 
     pbar = None
     if jax.process_index() == 0:
@@ -247,21 +202,9 @@ def train(
     try:
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
-                eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(jax.device_get(eval_aux))
-
+                pass
             try:
                 batch = next(train_iterator)
-                if warn_assitant_loss and "assistant_masks" in batch["inputs"]:
-                    check_ast_token = np.any(batch["inputs"]["assistant_masks"])
-                    if not check_ast_token and jax.process_index() == 0:
-                        raise RuntimeError(
-                            "assistant_loss=True was requested but no assistant token was found. "
-                            "This can occur if the chat template does not distinguish assistant vs user tokens "
-                            "or if truncation (max_length) removed the assistant token. "
-                            "please fix this issue before proceeding"
-                        )
-                    warn_assitant_loss = False
             except StopIteration:
                 if jax.process_index() == 0:
                     print("dataloader is exhausted")
@@ -297,22 +240,26 @@ def train(
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                    jax.set_mesh(model.mesh)
+                    jax.set_mesh(model.mesh),
                 ):
                     model, aux = train_step_fn(model, batch, rngs=loop_rngs)
 
+            host_aux = metric_utils.to_host(aux, flatten=True)
+            global_aux = metric_utils.host_add_aux(
+                global_aux, host_aux, reduce_method=DEFAULT_REDUCED
+            )
+            processed_aux = metric_utils.process_aux(host_aux, "step")
+            cum_processed_aux = metric_utils.process_aux(global_aux, "cum")
             callback_output = {}
             if model.callback_state is not None:
-                callback_output, callback_state = model.callbacks.process(
+                callback_aux = {**processed_aux, **cum_processed_aux}
+                callback_output, model, callback_state = model.callbacks.process(
                     {},
+                    model,
                     model.callback_state,
-                    aux,
+                    callback_aux,
                 )
                 model = dataclasses.replace(model, callback_state=callback_state)
-            host_aux = _to_host(aux)
-            global_aux = add_aux(global_aux, host_aux)
-            processed_aux = process_aux(host_aux, "step")
-            cum_processed_aux = process_aux(global_aux, "cum")
             if jax.process_index() == 0:
                 logger.log(processed_aux, step=step)
                 logger.log(cum_processed_aux, step=step)
@@ -325,19 +272,12 @@ def train(
                     )
                     pbar.update(1)
             if need_save:
-                ckpt_manager.save(
-                    step,
-                    args=ocp.args.Composite(
-                        weights=ocp.args.StandardSave(model.weights),
-                        opt_state=ocp.args.StandardSave(model.opt_state),
-                        step=ocp.args.JsonSave(int(step)),
-                    ),
-                )
+                save_checkpoint(ckpt_manager, step, model)
             step += 1
 
     finally:
         to_log_later["program_time"] = time.monotonic() - program_wall_t0
-        to_log_later.update(process_aux(global_aux, "cum"))
+        to_log_later.update(metric_utils.process_aux(global_aux, "cum"))
         token_count = to_log_later.get("cum/token")
         program_time = to_log_later.get("program_time")
 
@@ -394,7 +334,8 @@ def main(config: sws.FinalConfig):
                     model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
                 )
             model = dataclasses.replace(
-                model, weights=model.prepare_weights(model.weights, config.store_weights)
+                model,
+                weights=model.prepare_weights(model.weights, config.store_weights),
             )
             model = make_optimizer(
                 config.optimizer_name,
@@ -405,7 +346,9 @@ def main(config: sws.FinalConfig):
             print_train_state_size(model)
 
             if do_callback:
-                callbacks = make_callbacks(config.callback_name, config.callback.to_dict())
+                callbacks = make_callbacks(
+                    config.callback_name, config.callback.to_dict()
+                )
                 model = dataclasses.replace(
                     model,
                     callback_state=callbacks.init(model.weights, model.opt_state),
@@ -417,7 +360,7 @@ def main(config: sws.FinalConfig):
             config.data.transforms.to_dict(),
             config.data.loader.to_dict(),
             streaming=config.data.streaming,
-            mesh = model.mesh,
+            mesh=model.mesh,
         )
 
         eval_ds = None

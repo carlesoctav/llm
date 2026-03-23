@@ -6,7 +6,7 @@ from transformers import AutoTokenizer
 
 def get_config():
     config = sws.Config()
-    eval_every = 2500
+    eval_every = 100
 
     config.skip_eval = True
 
@@ -50,44 +50,60 @@ def get_config():
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
-    def transforms():
-        pass
-
-    def make_eval():
+    def ds_config(ds_name, split, streaming):
         return {
-            "type": "simple",
-            "data": {
-                "source": "xxx",
-                "transforms": "gg",
-                "loader": "yy",
-            },
+            "load_kwargs": [
+                {
+                    "path": ds_name,
+                    "split": split,
+                }
+            ],
+            "streaming": streaming,
         }
 
+    def transforms_config():
+        return {
+            "column": "messages",
+            "max_length": 2048,
+            "tokenizer": lambda: AutoTokenizer.from_pretrained(config.model.model_id),
+            "data_type": "chat",
+            "assistant_loss": True,
+            "chat_template_path": "./temp/think.jinja",
+            "packing": True,
+        }
 
-    config.eval.val = make_eval()
+    def loader_config(
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
+        num_threads=1,
+        prefetch_buffer_size=500,
+        per_worker_buffer_size=1,
+    ):
+        return {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "num_threads": num_threads,
+            "prefetch_buffer_size": prefetch_buffer_size,
+            "per_worker_buffer_size": per_worker_buffer_size,
+        }
+
+    ds_name = "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages"
+
+    config.eval.minival.type = "simple"
+    config.eval.minival.fn_name = "loss"
+    config.eval.minival.transforms_name = "ntp"
+    config.eval.minival.data = ds_config(ds_name, "train[:1%]", True)
+    config.eval.minival.transforms = transforms_config()
+    config.eval.minival.loader = loader_config()
 
     config.data.train.transforms_name = "ntp"
-    config.data.train.source.load_kwargs = [
-        {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
-            "split": "train",
-        }
-    ]
-    config.data.train.source.streaming = True
-
-    config.data.train.transforms.column = "messages"
-    config.data.train.transforms.max_length = 2048
-    config.data.train.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
-        config.model.model_id
-    )
-    config.data.train.transforms.data_type = "chat"
-    config.data.train.transforms.assistant_loss = True
-    config.data.train.transforms.chat_template_path = "./temp/think.jinja"
-    config.data.train.transforms.packing = True
+    config.data.train.source = ds_config(ds_name, "train", True)
+    config.data.train.transforms = transforms_config()
 
     config.data.loader.shard = False
-    config.data.train.loader.batch_size = 32
-    config.data.train.loader.shuffle = False
+    config.data.train.loader = loader_config(num_workers=8)
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

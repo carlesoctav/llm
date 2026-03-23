@@ -4,7 +4,7 @@ import dataclasses
 import sys
 import time
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from jaxformers.benchmark_utils import (
 from jaxformers.callbacks import make_callbacks
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
+from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
 from jaxformers.models import make_model
@@ -68,12 +69,13 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def predict_fn(model: Model, batch, rngs):
-    return model.unembed(model.weights, model.forward(model.weights, batch, rngs))
+def predict_fn(model: Model, batch):
+    hidden = model.forward(model.weights, **batch["inputs"])
+    return model.unembed(model.weights, hidden)
 
 
-def loss_fn(model, batch, rngs):
-    logits = predict_fn(model, batch, rngs)
+def loss_fn(model, batch, rngs = None):
+    logits = predict_fn(model, batch)
     return {
         "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
     }
@@ -169,7 +171,7 @@ def train(
     config,
     model: Model,
     train_ds,
-    eval_ds,
+    evaluators: list[Callable[[Model]]],
     logger,
     *,
     rngs: PRNGKeyArray | None = None,
@@ -177,7 +179,7 @@ def train(
     train_iterator = iter(train_ds)
     step = model.step or 0
     global_aux = dict(DEFAULT_AUX)
-    skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
+    skip_eval = config.skip_eval or config.eval_every is None or evaluators is None
     first_step = True
     need_save = config.checkpoint_options.save_interval_steps > 0
     ckpt_manager = None
@@ -202,7 +204,10 @@ def train(
     try:
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
-                pass
+                eval_process = {}
+                for name, evaluator in evaluators.items():
+                    eval_process[name] = evaluator(model)
+                    print("DEBUGPRINT {eval_process}:", eval_process)
             try:
                 batch = next(train_iterator)
             except StopIteration:
@@ -210,7 +215,7 @@ def train(
                     print("dataloader is exhausted")
                 break
 
-            loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
+            step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
 
@@ -220,7 +225,7 @@ def train(
                             partial(train_step, config),
                             donate_argnums=(0,),
                         )
-                        lower = train_step_jit.lower(model, batch, rngs=loop_rngs)
+                        lower = train_step_jit.lower(model, batch, rngs=step_rngs)
                         train_step_fn = lower.compile()
                         return train_step_fn
 
@@ -234,7 +239,7 @@ def train(
                     to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs=step_rngs)
                     first_step = False
             else:
                 with (
@@ -242,7 +247,7 @@ def train(
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                     jax.set_mesh(model.mesh),
                 ):
-                    model, aux = train_step_fn(model, batch, rngs=loop_rngs)
+                    model, aux = train_step_fn(model, batch, rngs=step_rngs)
 
             host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
@@ -360,8 +365,10 @@ def main(config: sws.FinalConfig):
             mesh=model.mesh,
         )
 
-        eval_ds = None
-        _, metrics = train(config, model, train_ds, eval_ds, logger, rngs=train_rngs)
+        evaluators = make_eval(
+            config.eval.to_dict(), {"predict": predict_fn, "loss": loss_fn}
+        )
+        _, metrics = train(config, model, train_ds, evaluators, logger, rngs=train_rngs)
         return metrics
     finally:
         if logger is not None:

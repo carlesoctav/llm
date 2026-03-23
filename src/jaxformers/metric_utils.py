@@ -55,7 +55,7 @@ def jittable_add_aux(*aux, reduce_method: dict | None):
 
     return jtu.tree_map_with_path(f, *aux, is_leaf=is_tuple)
 
-def host_add_aux(*aux, reduce_method: dict | None):
+def host_add_aux(*aux, reduce_method: dict | None = None):
     is_tuple = lambda x: isinstance(x, tuple)
     use_predefine_method = True if reduce_method else False
 

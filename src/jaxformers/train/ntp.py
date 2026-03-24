@@ -4,7 +4,7 @@ import dataclasses
 import sys
 import time
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +24,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
+from jaxformers.checkpointing import Checkpointer, make_checkpointer
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.eval import make_eval
@@ -34,7 +35,6 @@ from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
-from jaxformers.train.checkpointing import make_checkpointer, save_checkpoint
 
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
@@ -74,7 +74,7 @@ def predict_fn(model: Model, batch):
     return model.unembed(model.weights, hidden)
 
 
-def loss_fn(model, batch, rngs = None):
+def loss_fn(model, batch, rngs=None):
     logits = predict_fn(model, batch)
     return {
         "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
@@ -170,9 +170,10 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
 def train(
     config,
     model: Model,
-    train_ds,
-    evaluators: list[Callable[[Model]]],
-    logger,
+    train_ds: Iterable,
+    evaluators: list[Callable[[Model]]] | None = None,
+    logger: None = None,
+    ckptr: Checkpointer | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
@@ -181,11 +182,6 @@ def train(
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or evaluators is None
     first_step = True
-    need_save = config.checkpoint_options.save_interval_steps > 0
-    ckpt_manager = None
-
-    if need_save:
-        ckpt_manager = make_checkpointer(config)
 
     to_log_later = {}
     program_wall_t0 = None
@@ -207,7 +203,6 @@ def train(
                 eval_process = {}
                 for name, evaluator in evaluators.items():
                     eval_process[name] = evaluator(model)
-                    print("DEBUGPRINT {eval_process}:", eval_process)
             try:
                 batch = next(train_iterator)
             except StopIteration:
@@ -276,8 +271,8 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if need_save:
-                save_checkpoint(ckpt_manager, step, model)
+            if ckptr is not None:
+                ckptr.save(step, model, train_iterator)
             step += 1
 
     finally:
@@ -297,8 +292,8 @@ def train(
                 print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
-        if ckpt_manager is not None:
-            ckpt_manager.close()
+        if ckptr is not None:
+            ckptr.close()
 
     return model, to_log_later
 
@@ -356,10 +351,15 @@ def main(config: sws.FinalConfig):
                 )
                 model = dataclasses.replace(
                     model,
-                    callback_state=callbacks.init(model.weights, model.opt_state),
+                    callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
 
+        ckptr = None
+        if config.enable_checkpoint:
+            ckptr = make_checkpointer(
+                model, **config.checkpoint.to_dict()
+            )
         train_ds = make_data(
             config.data.to_dict(),
             mesh=model.mesh,
@@ -368,7 +368,15 @@ def main(config: sws.FinalConfig):
         evaluators = make_eval(
             config.eval.to_dict(), {"predict": predict_fn, "loss": loss_fn}
         )
-        _, metrics = train(config, model, train_ds, evaluators, logger, rngs=train_rngs)
+        _, metrics = train(
+            config,
+            model,
+            train_ds,
+            evaluators,
+            logger,
+            ckptr,
+            rngs=train_rngs,
+        )
         return metrics
     finally:
         if logger is not None:

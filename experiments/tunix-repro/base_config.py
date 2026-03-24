@@ -10,10 +10,9 @@ def get_config():
 
     config.skip_eval = True
 
-    config.exp_name = ""
     config.project_name = ""
+    config.exp_name = ""
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.seed = 42
     config.eval_every = eval_every
     config.max_train_step = 10_000
@@ -23,9 +22,11 @@ def get_config():
 
     config.logger_name = "wandb"
 
-    config.use_checkpoint = False
-    config.checkpoint_options.save_interval_steps = eval_every
-    config.checkpoint_options.max_to_keep = 1
+    config.enable_checkpoint = True
+    config.checkpoint.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.save_interval_steps = eval_every
+    config.checkpoint.max_to_keep = None
+    config.checkpoint.save_only_trainable = True
 
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
@@ -96,7 +97,7 @@ def get_config():
     config.eval.minival.transforms_name = "ntp"
     config.eval.minival.data = ds_config(ds_name, "train[:1%]", True)
     config.eval.minival.transforms = transforms_config()
-    config.eval.minival.loader = loader_config()
+    config.eval.minival.loader = loader_config(num_workers=8)
 
     config.data.train.transforms_name = "ntp"
     config.data.train.source = ds_config(ds_name, "train", True)

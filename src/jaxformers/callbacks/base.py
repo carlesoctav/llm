@@ -2,7 +2,7 @@ from typing import Callable, NamedTuple
 
 
 class Callback(NamedTuple):
-    init: Callable  # (weights, opt_state)
+    init: Callable  # (model)
     update: Callable  # (model, callback_state, grad, updates, aux) -> (model, callback_state)
     process: Callable  # (output, model, callback_state, aux) -> (output, model, callback_state)
 
@@ -13,8 +13,8 @@ def callback_chain(*args: Callback) -> Callback:
 
     init_fns, update_fns, process_fns = zip(*args)
 
-    def init_fn(weights, opt_state):
-        return tuple(fn(weights, opt_state) for fn in init_fns)
+    def init_fn(model):
+        return tuple(fn(model) for fn in init_fns)
 
     def update_fn(model, callback_state, grad, updates, aux):
         new_state = []

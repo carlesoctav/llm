@@ -29,9 +29,8 @@ class LogLearningRateState(NamedTuple):
 
 
 def log_learning_rate() -> Callback:
-    def init(weights, opt_state):
-        del weights
-        shape = jax.eval_shape(find_learning_rate, opt_state)
+    def init(model):
+        shape = jax.eval_shape(find_learning_rate, model.opt_state)
         zeros = jax.tree.map(
             lambda shape: jnp.zeros_like(shape, dtype=jnp.float32), shape
         )

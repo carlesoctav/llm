@@ -22,6 +22,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
+from jaxformers.checkpointing import make_checkpointer, save_checkpoint
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
@@ -31,7 +32,6 @@ from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sws_utils import run as sws_run
-from jaxformers.train.checkpointing import make_checkpointer, save_checkpoint
 
 
 DEFAULT_REDUCED = {
@@ -261,11 +261,14 @@ def train(
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
-    need_save = config.checkpoint_options.save_interval_steps > 0
-    ckpt_manager = None
-
-    if need_save:
-        ckpt_manager = make_checkpointer(config)
+    ckpt_manager = make_checkpointer(
+        config.ckpt_path,
+        config.checkpoint.save_interval_steps,
+        config.checkpoint.max_to_keep,
+        config.checkpoint.save_only_trainable,
+        model,
+        config.to_json(),
+    )
 
     to_log_later = {}
     program_wall_t0 = None
@@ -359,7 +362,7 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if need_save:
+            if ckpt_manager is not None:
                 save_checkpoint(ckpt_manager, step, model)
             step += 1
 
@@ -453,7 +456,7 @@ def main(config: sws.FinalConfig):
                 )
                 model = dataclasses.replace(
                     model,
-                    callback_state=callbacks.init(model.weights, model.opt_state),
+                    callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
 

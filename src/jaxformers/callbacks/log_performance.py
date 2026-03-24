@@ -22,8 +22,8 @@ def log_performance(
         "step": 0,
     }
 
-    def init(weights, opt_state):
-        del weights, opt_state
+    def init(model):
+        del model
         denom_count = {}
         for denom in denom_keys:
             denom_count[denom] = jnp.zeros([], dtype=jnp.int32)

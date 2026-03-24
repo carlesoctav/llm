@@ -12,8 +12,8 @@ class LogGradNormState(NamedTuple):
 
 
 def log_grad_norm() -> Callback:
-    def init(weights, opt_state):
-        del weights, opt_state
+    def init(model):
+        del model
         return LogGradNormState(jnp.zeros([], dtype=jnp.float32))
 
     def update(model, callback_state, grad, updates, aux):

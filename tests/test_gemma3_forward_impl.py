@@ -28,7 +28,7 @@ def test_gemma3_forward_impls_match_on_small_config():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=jax.devices("cpu"),
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
             "forward_impl": "loop",
         },
@@ -56,7 +56,6 @@ def test_gemma3_forward_impls_match_on_small_config():
         impl_weights = gemma3.prepare_weights(
             impl_config,
             model.weights,
-            forward_impl,
         )
         impl_hidden = gemma3.forward(
             impl_config,
@@ -85,7 +84,7 @@ def test_scan_block_forward_handles_unstacked_lora_weights():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=jax.devices("cpu"),
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
             "forward_impl": "scan_block",
         },
@@ -144,7 +143,7 @@ def test_init_accepts_model_id_without_explicit_config(monkeypatch):
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=jax.devices("cpu"),
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
         },
         param_dtype=jnp.float32,

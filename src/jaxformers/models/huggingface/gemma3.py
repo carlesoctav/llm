@@ -96,19 +96,19 @@ def get_sharding(key, sharding_rules):
 def prepare_weights(
     config: Config,
     weights: dict[str, Array],
-    store_weights: str = False,
 ) -> dict[str, Array]:
+    weights_impl = config.additional_config["weights_impl"]
 
-    if store_weights not in tuple(StoreWeights):
+    if weights_impl not in tuple(StoreWeights):
         raise ValueError(
-            f"Unsupported Gemma-3 store_weights implementation: {store_weights!r}"
+            f"Unsupported Gemma-3 weights implementation: {weights_impl!r}"
         )
 
     other_weights, layers = tree_util.split_layer_weights(
         weights,
         config.num_hidden_layers,
         LAYER_PATTERN,
-        stack=store_weights == StoreWeights.STACK,
+        stack=weights_impl == StoreWeights.STACK,
     )
 
     prepared_weights = dict(other_weights)
@@ -205,7 +205,7 @@ def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array
 
 
 def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
-    attn_impl = config.additional_config["attn_implementation"]
+    attn_impl = config.additional_config["attn_impl"]
     if attn_impl not in ATTENTION_MASK_INTERFACE:
         return {
             "full_attention": None,
@@ -273,7 +273,7 @@ def forward_layer(
         ),
     )
 
-    attn_impl = config.additional_config["attn_implementation"]
+    attn_impl = config.additional_config["attn_impl"]
     attention_interface = ATTENTION_INTERFACE[attn_impl]
 
     q = linear_3d(

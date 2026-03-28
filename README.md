@@ -67,7 +67,7 @@ Typical top-level config areas are:
 - data: `data.source_name`, `data.source.*`, `data.transforms_name`, `data.transforms.*`, `train_loader_name`, `train_loader.*`
 - optimization: `optimizer_*`, `learning_rate`, `lr_scheduler_*`
 - logging and callbacks: `logger_name`, `callback_name`
-- loss selection: `loss_implementation`
+- loss selection: `loss_impl`
 
 A minimal example looks like this:
 
@@ -91,7 +91,7 @@ def get_config():
     config.skip_eval = True
     config.eval_every = None
     config.forward_dtype = lambda: jnp.bfloat16
-    config.loss_implementation = "xla_chunked"
+    config.loss_impl = "xla_chunked"
     config.grad_accum = 4
     config.checkpoint_options.save_interval_steps = 0
     config.checkpoint_options.max_to_keep = 1
@@ -110,8 +110,9 @@ def get_config():
         "tp": 1,
     }
     config.model.additional_config.remat_layer = False
-    config.model.additional_config.attn_implementation = "xla_chunked"
+    config.model.additional_config.attn_impl = "xla_chunked"
     config.model.additional_config.sequence_parallelism = True
+    config.model.additional_config.weights_impl = "stack"
     config.model.additional_config.forward_impl = "loop"
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
@@ -171,7 +172,7 @@ The repo includes chunked implementations to reduce peak activation and logits m
 
 ### Attention
 
-Set `config.model.additional_config.attn_implementation` to one of:
+Set `config.model.additional_config.attn_impl` to one of:
 
 - `"eager"`: simple JAX path
 - `"sdpa"`: Tokamax scaled dot-product attention
@@ -182,7 +183,7 @@ In this repo, `"xla_chunked"` is intentionally mapped to the manual chunked impl
 
 ### Cross Entropy
 
-Set `config.loss_implementation` to one of:
+Set `config.loss_impl` to one of:
 
 - `"xla_chunked"`: fused chunked XLA cross entropy
 - `"reference"`: dense reference implementation
@@ -271,4 +272,4 @@ tests/           unit tests
 - If you do not want Weights & Biases, set `logger_name = "noop"`.
 - If you use the provided experiment configs, update checkpoint and project paths before launching.
 - Keep `skip_eval = True` unless you also implement an evaluation path.
-- For local experimentation, start with `loss_implementation = "reference"` if you want the simplest loss path, then switch to `"xla_chunked"` when tuning memory and scale.
+- For local experimentation, start with `loss_impl = "reference"` if you want the simplest loss path, then switch to `"xla_chunked"` when tuning memory and scale.

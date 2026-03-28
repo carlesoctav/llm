@@ -41,7 +41,7 @@ def test_gemma3_1b_it_cpu():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=devices,
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
         },
         param_dtype=jnp.float32,
@@ -88,7 +88,7 @@ def test_gemma3_1b_it_tpu_tp():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=tpu_devices,
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
         },
         param_dtype=jnp.float32,

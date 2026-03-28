@@ -161,12 +161,12 @@ def train_step(
                     weights[model.lm_head_key],
                     logical_to_physical(("none", "none"), model.config.sharding_rules),
                 )
-                if (config.loss_implementation or None) != "reference"
+                if (config.loss_impl or None) != "reference"
                 else weights[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
-            implementation=config.loss_implementation or None,
+            implementation=config.loss_impl or None,
         )
 
         batch_size = sft_batch["labels"].shape[0]
@@ -422,7 +422,7 @@ def main(config: sws.FinalConfig):
                 )
             model = dataclasses.replace(
                 model,
-                weights=model.prepare_weights(model.weights, config.store_weights),
+                weights=model.prepare_weights(model.weights),
             )
             model = make_optimizer(
                 config.optimizer_name,
@@ -437,10 +437,7 @@ def main(config: sws.FinalConfig):
             else:
                 base_model = dataclasses.replace(
                     base_model,
-                    weights=base_model.prepare_weights(
-                        base_model.weights,
-                        config.store_weights,
-                    ),
+                    weights=base_model.prepare_weights(base_model.weights),
                 )
                 base_model = tree_util.copy(base_model)
 

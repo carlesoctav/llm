@@ -5,7 +5,7 @@ Usage:
     base_config=experiments/tunix-repro/lora_gemma3_config.py \
     dir=/mnt/carles/llm/.agents/sweeps \
     name=loss_impl \
-    'loss_implementation:=[\"xla_chunked\",\"reference\"]' \
+    'loss_impl:=[\"xla_chunked\",\"reference\"]' \
     'data.train.transforms.max_length:=[512,1024]' \
     'group:=[{\"optimizer_name\":\"adam\"},{\"optimizer_name\":\"sgd\"}]'
 

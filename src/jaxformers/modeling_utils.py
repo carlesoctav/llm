@@ -47,15 +47,17 @@ def logical_to_physical(logical, rules):
 class AdditionalConfig(TypedDict):
     remat_layer: bool
 
-    attn_implementation: str = "sdpa"
+    attn_impl: str = "sdpa"
     sequence_parallelism: bool = True
+    weights_impl: str = "stack"
     forward_impl: str = "loop"
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
-    "attn_implementation": "sdpa",
+    "attn_impl": "sdpa",
     "sequence_parallelism": True,
+    "weights_impl": "stack",
     "forward_impl": "loop",
 }
 

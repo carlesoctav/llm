@@ -110,12 +110,12 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
                     weights[model.lm_head_key],
                     logical_to_physical(("none", "none"), model.config.sharding_rules),
                 )
-                if (config.loss_implementation or None) != "reference"
+                if (config.loss_impl or None) != "reference"
                 else weights[model.lm_head_key]
             ),
             reduction="sum",
             weight=mask,
-            implementation=config.loss_implementation or None,
+            implementation=config.loss_impl or None,
         )
 
         batch_size = batch["labels"].shape[0]
@@ -338,7 +338,7 @@ def main(config: sws.FinalConfig):
                 )
             model = dataclasses.replace(
                 model,
-                weights=model.prepare_weights(model.weights, config.store_weights),
+                weights=model.prepare_weights(model.weights),
             )
             model = make_optimizer(
                 config.optimizer_name,

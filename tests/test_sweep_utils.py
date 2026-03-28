@@ -9,19 +9,19 @@ from jaxformers.sweep_utils import (
 def test_build_sweep_space_keeps_singleton_dimension():
     overrides = {
         "learning_rate": 1e-5,
-        "loss_implementation": ["xla_chunked", "reference"],
+        "loss_impl": ["xla_chunked", "reference"],
     }
     space = build_sweep_space(overrides=overrides, group=[])
 
     assert len(space) == 2
     runs = [run for _, run in space]
     assert all(run["learning_rate"] == 1e-5 for run in runs)
-    assert {run["loss_implementation"] for run in runs} == {"xla_chunked", "reference"}
+    assert {run["loss_impl"] for run in runs} == {"xla_chunked", "reference"}
 
 
 def test_build_sweep_space_group_multiplies_by_free_dimensions():
     space = build_sweep_space(
-        overrides={"loss_implementation": ["xla_chunked", "reference"]},
+        overrides={"loss_impl": ["xla_chunked", "reference"]},
         group=[
             {"learning_rate": 1e-4, "optimizer_name": "adam"},
             {"learning_rate": 1e-5, "optimizer_name": "sgd"},

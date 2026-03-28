@@ -22,7 +22,7 @@ def test_bert_base_cpu_parity():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=devices,
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
             "sequence_parallelism": False,
         },
         param_dtype=jnp.float32,
@@ -64,7 +64,7 @@ def test_pass_bert_200M_tpu():
         parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
         devices=[tpu_devices[0]],
         additional_config={
-            "attn_implementation": "eager",
+            "attn_impl": "eager",
         },
         param_dtype=jnp.float32,
     )

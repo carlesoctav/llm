@@ -9,13 +9,12 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import optax
-import orbax.checkpoint as ocp
 import sws
 from jax.experimental.rnn import PRNGKeyArray
 from optax import microbatch
 from tqdm.auto import tqdm
 
-from jaxformers import tree_util
+from jaxformers import metric_utils, tree_util
 from jaxformers.benchmark_utils import (
     print_compiled_memory_stats,
     print_flops,
@@ -23,7 +22,8 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.data import make_ntp_with_kl_data
+from jaxformers.checkpointing import make_checkpointer, save_checkpoint
+from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import logical_to_physical, Model
@@ -89,22 +89,13 @@ def _preparse_absl_flags() -> None:
 def train_step(
     config: sws.FinalConfig, model: Model, base_model: Model | None, batch, *, rngs
 ):
-    def kl_loss_fn(train_weights, frozen_weights, batch, rngs):
-        _, kl_batch = batch
+    sft_batch, kl_batch = batch
+
+    def kl_loss_fn(train_weights, frozen_weights, kl_batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
-        if "assistant_masks" in kl_batch["inputs"]:
-            count = jnp.sum(
-                kl_batch["inputs"]["attention_mask"]
-                * kl_batch["inputs"]["assistant_masks"]
-            )
-            mask = (
-                kl_batch["inputs"]["attention_mask"]
-                * kl_batch["inputs"]["assistant_masks"]
-            )
-        else:
-            count = jnp.sum(kl_batch["inputs"]["attention_mask"])
-            mask = kl_batch["inputs"]["attention_mask"]
+        count = jnp.sum(kl_batch["loss_mask"])
+        mask = kl_batch["loss_mask"]
 
         hidden_states = model.forward(
             weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
@@ -142,9 +133,7 @@ def train_step(
             "batch": kl_batch["inputs"]["input_ids"].shape[0],
         }
 
-
-    def sft_loss_fn(train_weights, frozen_weights, batch, rngs):
-        sft_batch, _ = batch
+    def sft_loss_fn(train_weights, frozen_weights, sft_batch, rngs):
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
 
@@ -154,19 +143,8 @@ def train_step(
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = sft_batch["labels"].reshape(-1)
-
-        if "assistant_masks" in sft_batch["inputs"]:
-            count = jnp.sum(
-                sft_batch["inputs"]["attention_mask"]
-                * sft_batch["inputs"]["assistant_masks"]
-            )
-            mask = (
-                sft_batch["inputs"]["attention_mask"]
-                * sft_batch["inputs"]["assistant_masks"]
-            ).reshape(-1)
-        else:
-            count = jnp.sum(sft_batch["inputs"]["attention_mask"])
-            mask = sft_batch["inputs"]["attention_mask"].reshape(-1)
+        count = jnp.sum(sft_batch["loss_mask"])
+        mask = sft_batch["loss_mask"].reshape(-1)
         loss = cross_entropy_loss(
             hidden_states,
             labels,
@@ -193,26 +171,31 @@ def train_step(
     train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
 
     if config.grad_accum > 1:
-        microbatch_size = config.data.loader.batch_size // config.grad_accum
+        sft_microbatch_size = sft_batch["labels"].shape[0] // config.grad_accum
+        kl_microbatch_size = (
+            kl_batch["inputs"]["input_ids"].shape[0] // config.grad_accum
+        )
         sft_grad_fn = microbatch(
             jax.value_and_grad(sft_loss_fn, has_aux=True),
             argnums=2,
-            microbatch_size=microbatch_size,
+            microbatch_size=sft_microbatch_size,
         )
 
         kl_grad_fn = microbatch(
             jax.value_and_grad(kl_loss_fn, has_aux=True),
             argnums=2,
-            microbatch_size=microbatch_size,
+            microbatch_size=kl_microbatch_size,
         )
     else:
         sft_grad_fn = jax.value_and_grad(sft_loss_fn, has_aux=True)
         kl_grad_fn = jax.value_and_grad(kl_loss_fn, has_aux=True)
 
     (sft_loss, sft_aux), sft_grad = sft_grad_fn(
-        train_weights, frozen_weights, batch, rngs
+        train_weights, frozen_weights, sft_batch, rngs
     )
-    (kl_loss, kl_aux), kl_grad = kl_grad_fn(train_weights, frozen_weights, batch, rngs)
+    (kl_loss, kl_aux), kl_grad = kl_grad_fn(
+        train_weights, frozen_weights, kl_batch, rngs
+    )
 
     sft_token_count = sft_aux["token"]
     kl_token_count = kl_aux["token"]
@@ -230,70 +213,25 @@ def train_step(
 
     updates, nst = model.tx.update(grad, model.opt_state, model.weights)
     nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
-    total_aux = add_aux(sft_aux, kl_aux)
+    total_aux = metric_utils.jittable_add_aux(sft_aux, kl_aux, reduce_method=DEFAULT_REDUCED)
     aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
 
+    next_model = dataclasses.replace(model, weights=nweights, opt_state=nst)
     callback_state = model.callback_state
     if model.callback_state is not None:
-        callback_state = model.callbacks.update(
+        next_model, callback_state = model.callbacks.update(
+            next_model,
             model.callback_state,
             grad,
             updates,
-            nst,
-            nweights,
             aux,
         )
 
-    return dataclasses.replace(
-        model, weights=nweights, opt_state=nst, callback_state=callback_state
-    ), aux
+    return dataclasses.replace(next_model, callback_state=callback_state), aux
 
 
 def eval(model, eval_ds):
     raise NotImplementedError
-
-
-def process_aux(accum_aux: dict[str, Any], namespace=""):
-    def finalize(v: Any) -> Any:
-        if isinstance(v, tuple):
-            numer, denom = v
-            return numer / denom if denom else 0.0
-        return v
-
-    prefix = f"{namespace}/" if namespace else ""
-    return {f"{prefix}{k}": finalize(v) for k, v in accum_aux.items()}
-
-
-def _to_host(tree):
-    tree = jax.device_get(tree)
-    flat_tree = tree_util.flatten(tree, is_leaf=lambda x: isinstance(x, tuple))
-
-    def _item(value):
-        if isinstance(value, np.ndarray) and value.shape == ():
-            return value.item()
-        if isinstance(value, np.generic):
-            return value.item()
-        return value
-
-    return jtu.tree_map(_item, flat_tree)
-
-
-def add_aux(accum_aux, aux):
-    is_tuple = lambda x: isinstance(x, tuple)
-
-    def f(path, accum_leaf, leaf):
-        method = DEFAULT_REDUCED[jtu.keystr(path, simple=True)]
-        match method:
-            case "max":
-                return max(accum_leaf, leaf)
-            case "sum":
-                return accum_leaf + leaf
-            case "min":
-                return min(accum_leaf, leaf)
-            case "mean":
-                return (accum_leaf[0] + leaf[0], accum_leaf[1] + leaf[1])
-
-    return jtu.tree_map_with_path(f, accum_aux, aux, is_leaf=is_tuple)
 
 
 def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -323,18 +261,17 @@ def train(
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
-    need_save = config.checkpoint_options.save_interval_steps > 0
-    ckpt_manager = None
-
-    if need_save:
-        ckpt_options = ocp.CheckpointManagerOptions(
-            **config.checkpoint_options.to_dict()
-        )
-        ckpt_manager = ocp.CheckpointManager(config.ckpt_path, options=ckpt_options)
+    ckpt_manager = make_checkpointer(
+        config.ckpt_path,
+        config.checkpoint.save_interval_steps,
+        config.checkpoint.max_to_keep,
+        config.checkpoint.save_only_trainable,
+        model,
+        config.to_json(),
+    )
 
     to_log_later = {}
     program_wall_t0 = None
-    warn_assitant_loss = config.data.sft.transforms.assistant_loss
 
     pbar = None
     if jax.process_index() == 0:
@@ -351,27 +288,9 @@ def train(
         while step < config.max_train_step:
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_aux = eval(model, eval_ds)
-                processed_aux = process_aux(jax.device_get(eval_aux))
 
             try:
                 batch = next(train_iterator)
-                sft_batch, kl_batch = batch
-                if warn_assitant_loss:
-                    for batch_name, current_batch in (
-                        ("sft", sft_batch),
-                        ("kl", kl_batch),
-                    ):
-                        if "assistant_masks" not in current_batch["inputs"]:
-                            continue
-                        check_ast_token = np.any(current_batch["inputs"]["assistant_masks"])
-                        if not check_ast_token and jax.process_index() == 0:
-                            raise RuntimeError(
-                                "assistant_loss=True was requested but no assistant token was found "
-                                f"in the {batch_name} batch. This can occur if the chat template does not "
-                                "distinguish assistant vs user tokens or if truncation (max_length) removed "
-                                "the assistant token. please fix this issue before proceeding"
-                            )
-                        warn_assitant_loss = False
             except StopIteration:
                 if jax.process_index() == 0:
                     print("dataloader is exhausted")
@@ -385,7 +304,7 @@ def train(
                     def compile_train_step():
                         train_step_jit = jax.jit(
                             partial(train_step, config),
-                            donate_argnums=(0,),
+                            donate_argnums=(0,1),
                         )
                         lower = train_step_jit.lower(
                             model,
@@ -416,18 +335,22 @@ def train(
                 ):
                     model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
 
+            host_aux = metric_utils.to_host(aux, flatten = True)
+            global_aux = metric_utils.host_add_aux(
+                global_aux, host_aux, reduce_method=DEFAULT_REDUCED
+            )
+            processed_aux = metric_utils.process_aux(host_aux, "step")
+            cum_processed_aux = metric_utils.process_aux(global_aux, "cum")
             callback_output = {}
             if model.callback_state is not None:
-                callback_output, callback_state = model.callbacks.process(
+                callback_aux = {**processed_aux, **cum_processed_aux}
+                callback_output, model, callback_state = model.callbacks.process(
                     {},
+                    model,
                     model.callback_state,
-                    aux,
+                    callback_aux,
                 )
                 model = dataclasses.replace(model, callback_state=callback_state)
-            host_aux = _to_host(aux)
-            global_aux = add_aux(global_aux, host_aux)
-            processed_aux = process_aux(host_aux, "step")
-            cum_processed_aux = process_aux(global_aux, "cum")
             if jax.process_index() == 0:
                 logger.log(processed_aux, step=step)
                 logger.log(cum_processed_aux, step=step)
@@ -439,21 +362,14 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if need_save:
-                ckpt_manager.save(
-                    step,
-                    args=ocp.args.Composite(
-                        weights=ocp.args.StandardSave(model.weights),
-                        opt_state=ocp.args.StandardSave(model.opt_state),
-                        step=ocp.args.JsonSave(int(step)),
-                    ),
-                )
+            if ckpt_manager is not None:
+                save_checkpoint(ckpt_manager, step, model)
             step += 1
 
     finally:
         if program_wall_t0 is not None:
             to_log_later["program_time"] = time.monotonic() - program_wall_t0
-        to_log_later.update(process_aux(global_aux, "cum"))
+        to_log_later.update(metric_utils.process_aux(global_aux, "cum"))
         token_count = to_log_later.get("cum/token")
         program_time = to_log_later.get("program_time")
 
@@ -540,17 +456,12 @@ def main(config: sws.FinalConfig):
                 )
                 model = dataclasses.replace(
                     model,
-                    callback_state=callbacks.init(model.weights, model.opt_state),
+                    callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
 
-        train_ds = make_ntp_with_kl_data(
-            config.data.sft.source.to_dict(),
-            config.data.sft.transforms.to_dict(),
-            config.data.kl.source.to_dict(),
-            config.data.kl.transforms.to_dict(),
-            config.data.loader.to_dict(),
-            streaming=config.data.streaming,
+        train_ds = make_data(
+            config.data.to_dict(),
             mesh=model.mesh,
         )
         eval_ds = None

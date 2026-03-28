@@ -3,17 +3,17 @@ from __future__ import annotations
 import logging
 import time
 import typing as tp
-import warnings
 from collections.abc import Sequence
+from typing import Callable
 
 import grain
 import jax
-from grain import DatasetIterator, IterDataset, MapDataset, ReadOptions
-from grain.experimental import RepeatIterDataset, WindowShuffleIterDataset
+from grain import DatasetIterator, IterDataset, MapDataset
 from jax import P
 from jax.sharding import Mesh, PartitionSpec
 
-from jaxformers.data.transforms.base import transform_ds, TransformFn
+from jaxformers.data.loader._group import prepare_group
+from jaxformers.data.transforms.base import TransformFn
 from jaxformers.distributed.parallel import BATCH
 
 
@@ -115,73 +115,70 @@ def make_simple_loader(
     per_worker_buffer_size: int | None = 1,
     window_size: int = 1000,
     seed: int = 0,
+    batch_fn: Callable | None = None,
+    num_epochs: int | None = None,
 ) -> ProcessShardedIterDataset:
-
-    prepared: list[grain.IterDataset] = []
     if shard and not mesh:
         raise ValueError("need mesh if we shard the datasets")
 
-    if isinstance(datasets, (MapDataset, IterDataset)) or not isinstance(
-        datasets, Sequence
-    ):
-        datasets = (datasets,)
-    else:
-        datasets = tuple(datasets)
-
-    ds_type = type(datasets[0])
-    is_map = isinstance(datasets[0], MapDataset)
-    if not all(isinstance(x, ds_type) for x in datasets):
-        raise ValueError(
-            "All datasets must have the same type, either MapDataset or IterDataset"
-        )
-
     process_count = jax.process_count()
     process_index = jax.process_index()
-    seed = seed + process_index if shard else seed
-    for ds in datasets:
-        if shard:
-            if not hasattr(ds, "shard") and not hasattr(ds, "num_shards"):
-                raise NotImplementedError(
-                    "shard is active but ds doenst have shard method and num_shards attribute"
-                )
-            if ds.num_shards < process_count:
-                raise ValueError(
-                    f"Number of dataset shards (or MapDataset rows) ({ds.num_shards}) is less than the number of processes ({process_count}). "
-                    "Some processes will not receive any data."
-                )
-            ds = ds.shard(process_count, process_index)
-
-        if shuffle:
-            warnings.warn(
-                "Shuffling a MapDataset may not yield optimal performance due to memory-mapped access. "
-                "If shuffling is important for your workflow, please pre-shuffle the dataset."
-            )
-            if hasattr(ds, "shuffle"):
-                ds = ds.shuffle(seed)
-            else:
-                ds = WindowShuffleIterDataset(ds, window_size=window_size, seed=seed)
-
-        ds = ds.repeat() if hasattr(ds, "repeat") else RepeatIterDataset(ds)
-        prepared.append(ds)
-
-    mixed = (
-        grain.MapDataset.mix(prepared, dataset_weights)
-        if is_map
-        else grain.IterDataset.mix(prepared, dataset_weights)
+    mixed = prepare_group(
+        datasets,
+        transforms,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        dataset_weights=dataset_weights,
+        shard=shard,
+        process_count=process_count,
+        process_index=process_index,
+        num_threads=num_threads,
+        prefetch_buffer_size=prefetch_buffer_size,
+        window_size=window_size,
+        seed=seed,
+        batch_fn=batch_fn,
+        num_epochs=num_epochs,
     )
-    mixed = (
-        mixed.to_iter_dataset(
-            read_options=ReadOptions(num_threads, prefetch_buffer_size)
-        )
-        if is_map
-        else mixed
-    )
-    mixed = transform_ds(mixed, *transforms)
-    batch_size = batch_size // process_count if shard else batch_size
-    mixed = mixed.batch(batch_size=batch_size)
     mp_options = grain.MultiprocessingOptions(num_workers, per_worker_buffer_size)
     mixed = mixed.mp_prefetch(mp_options)
     # think more about local data -> global data
     if shard:
         return ProcessShardedIterDataset(mixed, P(BATCH), mesh)
     return mixed
+
+
+def make(
+    datasets: Sequence[MapDataset] | Sequence[IterDataset],
+    transforms: Sequence[TransformFn] | None,
+    mesh: Mesh | None,
+    batch_size: int,
+    shard: bool = False,
+    shuffle: bool = False,
+    dataset_weights: Sequence[float] | None = None,
+    *,
+    num_workers: int = 0,
+    num_threads: int = 1,
+    prefetch_buffer_size: int | None = 500,
+    per_worker_buffer_size: int | None = 1,
+    window_size: int = 1000,
+    seed: int = 0,
+    batch_fn: Callable | None = None,
+    num_epochs: int | None = None,
+):
+    return make_simple_loader(
+        datasets,
+        transforms,
+        mesh,
+        batch_size,
+        shard,
+        shuffle,
+        dataset_weights,
+        num_workers=num_workers,
+        num_threads=num_threads,
+        prefetch_buffer_size=prefetch_buffer_size,
+        per_worker_buffer_size=per_worker_buffer_size,
+        window_size=window_size,
+        seed=seed,
+        batch_fn=batch_fn,
+        num_epochs=num_epochs,
+    )

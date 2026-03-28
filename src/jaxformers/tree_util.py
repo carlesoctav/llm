@@ -1,4 +1,5 @@
 import re
+from functools import partial
 from operator import itemgetter
 
 import jax
@@ -12,6 +13,7 @@ from jax.tree_util import (
     KeyPath,
     SequenceKey,
 )
+from jaxtyping import Array
 
 
 def optimizerstr(keys: KeyPath, separator: str = "/") -> str:
@@ -93,7 +95,6 @@ def maybe_unstack(trees: list | dict):
         return trees
     trees = jax.tree.map(lambda leaf: jnp.unstack(leaf), trees)
     N = len(jax.tree.leaves(trees, is_leaf=lambda x: isinstance(x, tuple))[0])
-    print("DEBUGPRINT {N}:", N)
     return [
         jax.tree.map(
             lambda leaf: leaf[i], trees, is_leaf=lambda x: isinstance(x, tuple)
@@ -282,3 +283,18 @@ def unflatten(arg):
         obj[key] = obj[key].getvalue()
 
     return data
+
+
+def to_abstract(tree):
+    def _f(leaf):
+        if isinstance(leaf, Array):
+            return jax.ShapeDtypeStruct(
+                shape=leaf.shape, dtype=leaf.dtype, sharding=leaf.sharding
+            )
+        else:
+            return leaf
+
+    return jax.tree.map(_f, tree)
+
+
+none_map = partial(jax.tree.map, is_leaf=lambda x: x is None)

@@ -7,14 +7,11 @@ from transformers import AutoTokenizer
 def get_config():
     config = sws.Config()
 
-    config.skip_eval = True
-
-    config.exp_name = ""
     config.project_name = ""
+    config.exp_name = ""
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.seed = 42
-    config.eval_every = None
+    config.eval_every = 100
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_implementation = "reference"
@@ -22,9 +19,11 @@ def get_config():
 
     config.logger_name = "wandb"
 
-    config.use_checkpoint = False
-    config.checkpoint_options.save_interval_steps = 2500
-    config.checkpoint_options.max_to_keep = 1
+    config.enable_checkpoint = True
+    config.checkpoint.path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.save_interval_steps = lambda: config.eval_every
+    config.checkpoint.max_to_keep = None
+    config.checkpoint.save_only_trainable = True
 
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
@@ -33,7 +32,11 @@ def get_config():
     config.callback.log_performance.real_step_threshold = 0
     config.callback.log_performance.denom_keys = ["token"]
 
+
     config.init_model = "pretrained"
+    # config.load_model.path =
+    # config.load_model.target =
+    # config.load_model.step =
     config.init_lora = None
     config.store_weights = "stack"
 
@@ -48,26 +51,60 @@ def get_config():
     config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
-    config.data.source_name = "huggingface"
-    config.data.streaming = True
-    config.data.source.load_kwargs = [
-        {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
-            "split": "train",
+    def ds_config(ds_name, split, streaming):
+        return {
+            "load_kwargs": [
+                {
+                    "path": ds_name,
+                    "split": split,
+                }
+            ],
+            "streaming": streaming,
         }
-    ]
 
-    config.data.transforms.column = "messages"
-    config.data.transforms.max_length = 2048
-    config.data.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
-        config.model.model_id
-    )
-    config.data.transforms.data_type = "chat"
-    config.data.transforms.assistant_loss = True
-    config.data.transforms.chat_template_path = "./temp/think.jinja"
-    config.data.transforms.packing = True
+    def transforms_config():
+        return {
+            "column": "messages",
+            "max_length": 2048,
+            "tokenizer": lambda: AutoTokenizer.from_pretrained(config.model.model_id),
+            "data_type": "chat",
+            "assistant_loss": True,
+            "chat_template_path": "./temp/think.jinja",
+            "packing": True,
+        }
 
-    config.data.loader.batch_size = 32
+    def loader_config(
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
+        num_threads=1,
+        prefetch_buffer_size=500,
+        per_worker_buffer_size=1,
+    ):
+        return {
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "num_threads": num_threads,
+            "prefetch_buffer_size": prefetch_buffer_size,
+            "per_worker_buffer_size": per_worker_buffer_size,
+        }
+
+    ds_name = "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages"
+
+    config.eval.minival.type = "simple"
+    config.eval.minival.fn_name = "loss"
+    config.eval.minival.transforms_name = "ntp"
+    config.eval.minival.data = ds_config(ds_name, "train[:1%]", True)
+    config.eval.minival.transforms = transforms_config()
+    config.eval.minival.loader = loader_config(num_workers=8)
+
+    config.data.train.transforms_name = "ntp"
+    config.data.train.source = ds_config(ds_name, "train", True)
+    config.data.train.transforms = transforms_config()
+
+    config.data.loader.shard = False
+    config.data.train.loader = loader_config(num_workers=8)
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

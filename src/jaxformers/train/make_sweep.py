@@ -6,7 +6,7 @@ Usage:
     dir=/mnt/carles/llm/.agents/sweeps \
     name=loss_impl \
     'loss_implementation:=[\"xla_chunked\",\"reference\"]' \
-    'data.transforms.max_length:=[512,1024]' \
+    'data.train.transforms.max_length:=[512,1024]' \
     'group:=[{\"optimizer_name\":\"adam\"},{\"optimizer_name\":\"sgd\"}]'
 
 This writes:

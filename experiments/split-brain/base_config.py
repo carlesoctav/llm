@@ -43,8 +43,9 @@ def get_config():
 
     config.callback_name = []
 
-    config.checkpoint_options.save_interval_steps = 0
-    config.checkpoint_options.max_to_keep = 1
+    config.checkpoint.save_interval_steps = 100
+    config.checkpoint.max_to_keep = 1
+    config.checkpoint.save_only_trainable = False
 
     config.init_model = "pretrained"
     config.init_lora = "random"
@@ -62,7 +63,10 @@ def get_config():
     config.lora.rank = 256
     config.lora.alpha = 512
     config.lora.weights_path = list(DEFAULT_LORA_PATHS)
-    config.data.streaming = False
+
+    config.data.loader.combine = "zip"
+    config.data.loader.shard = False
+    config.data.loader.seed = 42
 
     config.data.sft.source.load_kwargs = [
         {
@@ -70,13 +74,16 @@ def get_config():
             "split": "train",
         }
     ]
+    config.data.sft.source.streaming = False
     config.data.kl.source.load_kwargs = [
         {
             "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
             "split": "train",
         }
     ]
+    config.data.kl.source.streaming = False
 
+    config.data.sft.transforms_name = "ntp"
     config.data.sft.transforms.column = "messages"
     config.data.sft.transforms.max_length = 2048
     config.data.sft.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
@@ -88,6 +95,7 @@ def get_config():
     config.data.sft.transforms.packing = False
     config.data.sft.transforms.packing_bins = 64
 
+    config.data.kl.transforms_name = "kl"
     config.data.kl.transforms.column = "messages"
     config.data.kl.transforms.max_length = 2048
     config.data.kl.transforms.tokenizer = lambda: AutoTokenizer.from_pretrained(
@@ -99,9 +107,10 @@ def get_config():
     config.data.kl.transforms.packing = False
     config.data.kl.transforms.packing_bins = 64
 
-    config.data.loader.batch_size = 32
-    config.data.loader.seed = 42
-    config.data.loader.shuffle = False
+    config.data.sft.loader.batch_size = 32
+    config.data.sft.loader.shuffle = False
+    config.data.kl.loader.batch_size = 32
+    config.data.kl.loader.shuffle = False
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

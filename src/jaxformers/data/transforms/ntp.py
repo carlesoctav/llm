@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import auto, StrEnum
 
 import grain
+import jax
+import numpy as np
 from grain import transforms as grain_transforms
 from jaxtyping import Array
 from transformers import PreTrainedTokenizerBase
@@ -76,6 +78,16 @@ class TokenizeText(grain_transforms.Map):
             )
         output = {k: v.squeeze(0)[:-1] for k, v in encoded.items()}
         output["labels"] = encoded["input_ids"].squeeze(0)[1:]
+        output["loss_mask"] = output["attention_mask"]
+        if "assistant_masks" in output:
+            if not np.any(output["assistant_masks"]) and jax.process_index() == 0:
+                raise RuntimeError(
+                    "assistant_loss=True was requested but no assistant token was found. "
+                    "This can occur if the chat template does not distinguish assistant vs user tokens "
+                    "or if truncation (max_length) removed the assistant token. "
+                    "please fix this issue before proceeding"
+                )
+            output["loss_mask"] = output["loss_mask"] * output["assistant_masks"]
         return output
 
 
@@ -95,10 +107,19 @@ class NestInputs(grain_transforms.Map):
             inputs["segment_ids"] = features["input_ids_segment_ids"]
         if "assistant_masks" in features:
             inputs["assistant_masks"] = features["assistant_masks"]
-        return {"inputs": inputs, "labels": features["labels"]}
+        loss_mask = (
+            features["loss_mask"]
+            if "loss_mask" in features
+            else features["attention_mask"]
+        )
+        return {
+            "inputs": inputs,
+            "labels": features["labels"],
+            "loss_mask": loss_mask,
+        }
 
 
-def make_ntp_transforms(
+def make(
     column: str,
     max_length: int,
     data_type: str | None = None,
@@ -149,6 +170,7 @@ def make_ntp_transforms(
             "input_ids": max_length,
             "attention_mask": max_length,
             "labels": max_length,
+            **({"loss_mask": max_length} if data_type != DataType.TOKEN else {}),
             **({"assistant_masks": max_length} if assistant_loss else {}),
         }
         transforms.append(
@@ -156,6 +178,7 @@ def make_ntp_transforms(
                 length_struct=length_struct,
                 num_packing_bins=packing_bins,
                 meta_features=("attention_mask", "labels")
+                + (("loss_mask",) if data_type != DataType.TOKEN else ())
                 + (("assistant_masks",) if assistant_loss else ()),
             )
         )

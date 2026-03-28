@@ -99,7 +99,7 @@ def tree_pprint(
     width: int = 80,
     indent: int = 2,
     short_arrays: bool = True,
-    struct_as_array: bool = False,
+    struct_as_array: bool = True,
     truncate_leaf: Callable[[Any], bool] = _false,
 ) -> None:
     """Pretty-prints a PyTree as a string, whilst abbreviating JAX arrays.

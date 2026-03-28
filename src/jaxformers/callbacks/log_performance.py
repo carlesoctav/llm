@@ -22,8 +22,8 @@ def log_performance(
         "step": 0,
     }
 
-    def init(weights, opt_state):
-        del weights, opt_state
+    def init(model):
+        del model
         denom_count = {}
         for denom in denom_keys:
             denom_count[denom] = jnp.zeros([], dtype=jnp.int32)
@@ -32,9 +32,8 @@ def log_performance(
 
         return LogPerformanceState(denom_count=denom_count)
 
-    def update(callback_state, grad, updates, opt_state, weights, aux):
-        del callback_state
-        del grad, updates, opt_state, weights
+    def update(model, callback_state, grad, updates, aux):
+        del callback_state, grad, updates
         denom_count = {}
         for denom in denom_keys:
             if denom in aux:
@@ -48,9 +47,10 @@ def log_performance(
                     f"Missing required performance denominator '{denom}' in aux. "
                     f"Expected one of: {denom_keys!r}. Available keys: {available_keys}"
                 )
-        return LogPerformanceState(denom_count=denom_count)
+        return model, LogPerformanceState(denom_count=denom_count)
 
-    def process(output, callback_state, aux):
+    def process(output, model, callback_state, aux):
+        del aux
         dispatch_delta = time.monotonic() - host_state["last_time"]
         for k, v in callback_state.denom_count.items():
             output[f"performance/dispatch_{k}_per_s"] = float(v / dispatch_delta)
@@ -58,7 +58,7 @@ def log_performance(
         output["performance/dispatch_time_per_step"] = float(dispatch_delta)
 
         if host_state["step"] < real_step_threshold:
-            jax.block_until_ready(aux)
+            jax.block_until_ready(callback_state.denom_count)
             real_delta = time.monotonic() - host_state["last_time"]
             for k, v in callback_state.denom_count.items():
                 output[f"performance/real_{k}_per_s"] = float(v / real_delta)
@@ -67,7 +67,7 @@ def log_performance(
 
         host_state["last_time"] = time.monotonic()
         host_state["step"] += 1
-        return output, callback_state
+        return output, model, callback_state
 
     return Callback(init, update, process)
 

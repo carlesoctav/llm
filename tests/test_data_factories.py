@@ -1,10 +1,12 @@
 import dataclasses as dc
 
 import numpy as np
+import pytest
 from datasets import Dataset
 from grain import transforms as grain_transforms
 
-from jaxformers.data import make_loader, make_transforms
+from jaxformers.data import make_data, make_eval_data, make_loader, make_transforms
+from jaxformers.data.source.huggingface import HuggingFaceSourceIterDataset
 
 
 @dc.dataclass
@@ -14,18 +16,18 @@ class IdentityMap(grain_transforms.Map):
 
 
 def test_make_loader_simple_uses_named_loader():
-    dataset = Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
+    dataset = HuggingFaceSourceIterDataset(
+        Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
+    )
     loader = make_loader(
         "simple",
         dataset,
         [IdentityMap()],
         {
-            "global_batch_size": 2,
-            "dataloading_host_index": 0,
-            "dataloading_host_count": 1,
+            "batch_size": 2,
+            "shard": False,
             "shuffle": False,
-            "worker_count": 0,
-            "drop_remainder": True,
+            "num_workers": 0,
         },
     )
 
@@ -66,3 +68,132 @@ def test_make_transforms_ntp_supports_new_data_type():
     )
 
     assert len(transforms) == 2
+
+
+def test_make_data_uses_single_group_loader(monkeypatch):
+    dataset = HuggingFaceSourceIterDataset(
+        Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
+    )
+
+    def fake_make_source(source_name, source_config):
+        del source_name, source_config
+        return [dataset]
+
+    monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
+
+    loader = make_data(
+        {
+            "loader": {"num_workers": 0, "shard": False},
+            "train": {
+                "source": {"load_kwargs": [], "streaming": False},
+                "transforms": [IdentityMap()],
+                "loader": {"batch_size": 2, "shuffle": False},
+            },
+        }
+    )
+
+    batch = next(iter(loader))
+    assert batch["id"].tolist() == [0, 1]
+
+
+def test_make_eval_data_uses_flat_loader(monkeypatch):
+    dataset = HuggingFaceSourceIterDataset(
+        Dataset.from_dict({"id": [0]}).to_iterable_dataset()
+    )
+
+    def fake_make_source(source_name, source_config):
+        del source_name, source_config
+        return [dataset]
+
+    monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
+
+    loader = make_eval_data(
+        {
+            "source": {"load_kwargs": [], "streaming": False},
+            "transforms": [IdentityMap()],
+            "loader": {"batch_size": 2, "shard": False, "shuffle": False},
+        }
+    )
+
+    iterator = iter(loader)
+    batch = next(iterator)
+    assert batch["id"].tolist() == [0, 0]
+    assert batch["_mask"].tolist() == [1, 0]
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+def test_make_data_uses_zip_loader(monkeypatch):
+    datasets = {
+        "sft": HuggingFaceSourceIterDataset(
+            Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
+        ),
+        "kl": HuggingFaceSourceIterDataset(
+            Dataset.from_dict({"id": [10, 11]}).to_iterable_dataset()
+        ),
+    }
+
+    def fake_make_source(source_name, source_config):
+        del source_name
+        return [datasets[source_config["name"]]]
+
+    monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
+
+    loader = make_data(
+        {
+            "loader": {"combine": "zip", "num_workers": 0, "shard": False},
+            "sft": {
+                "source": {"name": "sft", "streaming": False},
+                "transforms": [IdentityMap()],
+                "loader": {"batch_size": 2, "shuffle": False},
+            },
+            "kl": {
+                "source": {"name": "kl", "streaming": False},
+                "transforms": [IdentityMap()],
+                "loader": {"batch_size": 1, "shuffle": False},
+            },
+        }
+    )
+
+    sft_batch, kl_batch = next(iter(loader))
+    assert sft_batch["id"].tolist() == [0, 1]
+    assert kl_batch["id"].tolist() == [10]
+
+
+def test_make_data_uses_mix_loader(monkeypatch):
+    datasets = {
+        "a": HuggingFaceSourceIterDataset(
+            Dataset.from_dict({"id": [0, 1]}).to_iterable_dataset()
+        ),
+        "b": HuggingFaceSourceIterDataset(
+            Dataset.from_dict({"id": [10, 11]}).to_iterable_dataset()
+        ),
+    }
+
+    def fake_make_source(source_name, source_config):
+        del source_name
+        return [datasets[source_config["name"]]]
+
+    monkeypatch.setattr("jaxformers.data.make_source", fake_make_source)
+
+    loader = make_data(
+        {
+            "loader": {"combine": "mix", "num_workers": 0, "shard": False},
+            "a": {
+                "source": {"name": "a", "streaming": False},
+                "transforms": [IdentityMap()],
+                "loader": {"batch_size": 2, "shuffle": False},
+            },
+            "b": {
+                "source": {"name": "b", "streaming": False},
+                "transforms": [IdentityMap()],
+                "loader": {"batch_size": 1, "shuffle": False},
+            },
+        }
+    )
+
+    it = iter(loader)
+    batch0 = next(it)
+    batch1 = next(it)
+    batch_sizes = sorted([len(batch0["id"]), len(batch1["id"])])
+    assert batch_sizes == [1, 2]

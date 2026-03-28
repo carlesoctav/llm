@@ -1,6 +1,8 @@
 import dataclasses as dc
 import typing as tp
 
+import jax
+import numpy as np
 from grain import transforms as grain_transforms
 from jaxtyping import Array
 from transformers import PreTrainedTokenizerBase
@@ -45,7 +47,18 @@ class TokenizeText(grain_transforms.Map):
                 return_token_type_ids=False,
             )
 
-        return {k: v.squeeze(0) for k, v in encoded.items()}
+        output = {k: v.squeeze(0) for k, v in encoded.items()}
+        output["loss_mask"] = output["attention_mask"]
+        if "assistant_masks" in output:
+            if not np.any(output["assistant_masks"]) and jax.process_index() == 0:
+                raise RuntimeError(
+                    "assistant_loss=True was requested but no assistant token was found. "
+                    "This can occur if the chat template does not distinguish assistant vs user tokens "
+                    "or if truncation (max_length) removed the assistant token. "
+                    "please fix this issue before proceeding"
+                )
+            output["loss_mask"] = output["loss_mask"] * output["assistant_masks"]
+        return output
 
 
 @dc.dataclass
@@ -64,7 +77,12 @@ class NestInputs(grain_transforms.Map):
             inputs["segment_positions"] = features["input_ids_segment_positions"]
         if "assistant_masks" in features:
             inputs["assistant_masks"] = features["assistant_masks"]
-        return {"inputs": inputs}
+        loss_mask = (
+            features["loss_mask"]
+            if "loss_mask" in features
+            else features["attention_mask"]
+        )
+        return {"inputs": inputs, "loss_mask": loss_mask}
 
 
 def make(
@@ -115,6 +133,7 @@ def make(
         length_struct = {
             "input_ids": max_length,
             "attention_mask": max_length,
+            **({"loss_mask": max_length} if data_type != DataType.TOKEN else {}),
             **({"assistant_masks": max_length} if assistant_loss else {}),
         }
         transforms.append(
@@ -122,6 +141,7 @@ def make(
                 length_struct=length_struct,
                 num_packing_bins=packing_bins,
                 meta_features=("attention_mask",)
+                + (("loss_mask",) if data_type != DataType.TOKEN else ())
                 + (("assistant_masks",) if assistant_loss else ()),
             )
         )

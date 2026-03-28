@@ -26,7 +26,9 @@ def get_config():
     config.exp_name = "gemma3-1b-it-lora-kl"
     config.project_name = "split-brain"
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.path = lambda: (
+        f"{config.dir}/{config.project_name}/{config.exp_name}"
+    )
     config.seed = 42
     config.eval_every = None
     config.max_train_step = 1000

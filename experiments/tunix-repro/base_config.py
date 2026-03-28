@@ -18,8 +18,6 @@ def get_config():
     config.grad_accum = 4
 
     config.logger_name = "wandb"
-
-    config.enable_checkpoint = True
     config.checkpoint.path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.checkpoint.save_interval_steps = lambda: config.eval_every
     config.checkpoint.max_to_keep = None

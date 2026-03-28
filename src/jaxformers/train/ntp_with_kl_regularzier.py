@@ -2,7 +2,7 @@ import dataclasses
 import sys
 import time
 from functools import partial
-from typing import Any
+from typing import Any, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +22,12 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.checkpointing import make_checkpointer, save_checkpoint
+from jaxformers.checkpointing import (
+    CheckpointerWithInfo,
+    is_used_checkpoint,
+    load_checkpoint_from_path,
+    make_checkpointer,
+)
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.logger import make_logger
@@ -250,9 +255,10 @@ def train(
     config,
     model: Model,
     base_model: Model | None,
-    train_ds,
+    train_ds: Iterable,
     eval_ds,
     logger,
+    ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
@@ -261,14 +267,6 @@ def train(
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
     first_step = True
-    ckpt_manager = make_checkpointer(
-        config.ckpt_path,
-        config.checkpoint.save_interval_steps,
-        config.checkpoint.max_to_keep,
-        config.checkpoint.save_only_trainable,
-        model,
-        config.to_json(),
-    )
 
     to_log_later = {}
     program_wall_t0 = None
@@ -286,16 +284,12 @@ def train(
 
     try:
         while step < config.max_train_step:
+            if ckptr is not None:
+                ckptr.save_checkpoint(step, model, train_iterator)
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_aux = eval(model, eval_ds)
 
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                if jax.process_index() == 0:
-                    print("dataloader is exhausted")
-                break
-
+            batch = next(train_iterator)
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
@@ -362,8 +356,6 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if ckpt_manager is not None:
-                save_checkpoint(ckpt_manager, step, model)
             step += 1
 
     finally:
@@ -384,8 +376,8 @@ def train(
                 print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
-        if ckpt_manager is not None:
-            ckpt_manager.close()
+        if ckptr is not None:
+            ckptr.close()
 
     return model, to_log_later
 
@@ -393,6 +385,8 @@ def train(
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
     do_callback = getattr(config, "callback_name", None)
+    do_load_model = getattr(config, "load_model", None)
+    do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
 
     logger = None
@@ -459,6 +453,19 @@ def main(config: sws.FinalConfig):
                     callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
+            if do_load_model:
+                if do_checkpoint and is_used_checkpoint(config.checkpoint.path):
+                    raise ValueError(
+                        f"Both 'load_model' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
+                        f"To resume training from {config.checkpoint.path}, set load_model=None. "
+                        f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
+                    )
+                model = load_checkpoint_from_path(model, **config.load_model.to_dict())
+
+        ckptr = None
+        if do_checkpoint:
+            ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
+            model = ckptr.load_checkpoint(model)
 
         train_ds = make_data(
             config.data.to_dict(),
@@ -466,7 +473,14 @@ def main(config: sws.FinalConfig):
         )
         eval_ds = None
         _, metrics = train(
-            config, model, base_model, train_ds, eval_ds, logger, rngs=train_rngs
+            config,
+            model,
+            base_model,
+            train_ds,
+            eval_ds,
+            logger,
+            ckptr,
+            rngs=train_rngs,
         )
         return metrics
     finally:

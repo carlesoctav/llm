@@ -20,14 +20,10 @@ def _check_shape(shape, tree):
 def _eval_step(fn, model, batch):
     mask = None
     metrics = fn(model, batch)
-    print("DEBUGPRINT {metrics}:", metrics)
     _mask = batch.get("_mask", None)
     loss_mask = batch.get("loss_mask")
     mask = _mask[:, None] & loss_mask  # (B, ) #(B, T )
-    print("DEBUGPRINT {mask}:", mask)
-    print("DEBUGPRINT {loss_mask}:", loss_mask)
     if mask is not None:
-        print("DEBUGPRINT {mask}:", mask)
         _check_shape(mask.shape, metrics)
         count = jnp.sum(mask)
         return jax.tree.map(lambda m: (jnp.sum(mask * m), count), metrics)

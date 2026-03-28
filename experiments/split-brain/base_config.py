@@ -43,7 +43,7 @@ def get_config():
 
     config.callback_name = []
 
-    config.checkpoint.save_interval_steps = 0
+    config.checkpoint.save_interval_steps = 100
     config.checkpoint.max_to_keep = 1
     config.checkpoint.save_only_trainable = False
 

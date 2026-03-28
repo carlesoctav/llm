@@ -24,7 +24,12 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.checkpointing import Checkpointer, make_checkpointer
+from jaxformers.checkpointing import (
+    CheckpointerWithInfo,
+    is_used_checkpoint,
+    load_checkpoint_from_path,
+    make_checkpointer,
+)
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.eval import make_eval
@@ -173,14 +178,14 @@ def train(
     train_ds: Iterable,
     evaluators: list[Callable[[Model]]] | None = None,
     logger: None = None,
-    ckptr: Checkpointer | None = None,
+    ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
     step = model.step or 0
     global_aux = dict(DEFAULT_AUX)
-    skip_eval = config.skip_eval or config.eval_every is None or evaluators is None
+    skip_eval = config.eval_every is None or evaluators is None
     first_step = True
 
     to_log_later = {}
@@ -199,17 +204,14 @@ def train(
 
     try:
         while step < config.max_train_step:
+            if ckptr is not None:
+                ckptr.save_checkpoint(step, model, train_iterator)
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_process = {}
                 for name, evaluator in evaluators.items():
                     eval_process[name] = evaluator(model)
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                if jax.process_index() == 0:
-                    print("dataloader is exhausted")
-                break
 
+            batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
@@ -271,8 +273,6 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if ckptr is not None:
-                ckptr.save(step, model, train_iterator)
             step += 1
 
     finally:
@@ -301,7 +301,10 @@ def train(
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
     do_callback = getattr(config, "callback_name", None)
+    do_load_model = getattr(config, "load_model", None)
+    do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
+    do_eval = getattr(config, "eval", None)
 
     logger = None
     if jax.process_index() == 0:
@@ -354,20 +357,31 @@ def main(config: sws.FinalConfig):
                     callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
+            if do_load_model:
+                if do_checkpoint and is_used_checkpoint(config.checkpoint.path):
+                    raise ValueError(
+                        f"Both 'load_model' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
+                        f"To resume training from {config.checkpoint.path}, set load_model=None. "
+                        f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
+                    )
+                model = load_checkpoint_from_path(model, **config.load_model.to_dict())
 
         ckptr = None
-        if config.enable_checkpoint:
-            ckptr = make_checkpointer(
-                model, **config.checkpoint.to_dict()
-            )
+        if do_checkpoint:
+            ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
+            model = ckptr.load_checkpoint(model)
+
         train_ds = make_data(
             config.data.to_dict(),
             mesh=model.mesh,
         )
 
-        evaluators = make_eval(
-            config.eval.to_dict(), {"predict": predict_fn, "loss": loss_fn}
-        )
+        evaluators = None
+        if do_eval:
+            evaluators = make_eval(
+                config.eval.to_dict(), {"predict": predict_fn, "loss": loss_fn}
+            )
+
         _, metrics = train(
             config,
             model,

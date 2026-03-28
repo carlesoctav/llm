@@ -65,7 +65,6 @@ class HuggingFaceSourceIterDataset(grain.IterDataset):
         contiguous = bool(sequential_slice)
 
         if self._source.num_shards < sl.step:
-            print("DEBUGPRINT {self._source.num_shards}:", self._source.num_shards)
             raise ValueError(
                 f"The HuggingFace dataset has fewer shards ({self.num_shards}) than the number of workers ({sl.step}); some workers will receive no data."
             )

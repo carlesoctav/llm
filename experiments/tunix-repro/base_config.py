@@ -6,15 +6,12 @@ from transformers import AutoTokenizer
 
 def get_config():
     config = sws.Config()
-    eval_every = 100
-
-    config.skip_eval = True
 
     config.project_name = ""
     config.exp_name = ""
     config.dir = "gs://carles-git-good"
     config.seed = 42
-    config.eval_every = eval_every
+    config.eval_every = 100
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_implementation = "reference"
@@ -23,8 +20,8 @@ def get_config():
     config.logger_name = "wandb"
 
     config.enable_checkpoint = True
-    config.checkpoint.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
-    config.checkpoint.save_interval_steps = eval_every
+    config.checkpoint.path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.save_interval_steps = lambda: config.eval_every
     config.checkpoint.max_to_keep = None
     config.checkpoint.save_only_trainable = True
 
@@ -37,6 +34,9 @@ def get_config():
 
 
     config.init_model = "pretrained"
+    # config.load_model.path =
+    # config.load_model.target =
+    # config.load_model.step =
     config.init_lora = None
     config.store_weights = "stack"
 

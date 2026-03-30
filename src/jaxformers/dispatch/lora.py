@@ -186,7 +186,7 @@ def loraify(
 
     def _loraify(path, weight):
         nonlocal rngs, counter
-        keystr = jtu.keystr(path, simple=True)
+        keystr = jtu.keystr(path, simple=True, separator = ".")
         if _is_match(keystr, weights_path):
             out_features, in_features = weight.shape
             s0, s1 = tuple(weight.sharding.spec)

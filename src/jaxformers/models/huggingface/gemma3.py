@@ -546,8 +546,6 @@ def init(
         )
 
     if model_id is not None:
-        if not isinstance(config, PreTrainedConfig):
-            raise TypeError(f"Expected HF config, got {type(config)!r}")
         config = AutoConfig.from_pretrained(model_id)
 
     if parallel_dims is None:

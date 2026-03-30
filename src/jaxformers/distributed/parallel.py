@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -8,6 +10,7 @@ MODEL = ("tp",)
 SEQ = ("tp", "cp")
 CONTEXT = ("cp",)
 AxisName = str | tuple[str, ...] | None
+_CURRENT_RULE = ContextVar("sharding_rule", default=None)
 
 
 @dataclass
@@ -65,6 +68,22 @@ def mutate_sharding_rule_parallel_dims(
             rules[rule_key] = drop_axis(rule_val, axis_name)
 
     return rules
+
+
+@contextmanager
+def set_rule(rule):
+    token = _CURRENT_RULE.set(rule)
+    try:
+        yield
+    finally:
+        _CURRENT_RULE.reset(token)
+
+
+def current_rule():
+    rule = _CURRENT_RULE.get()
+    if rule is None:
+        raise ValueError("No active sharding rule. Enter `set_rule(...)` first.")
+    return rule
 
 
 def check_mesh_axis_for_inference(parallel_dims: ParallelDims):

@@ -4,6 +4,7 @@ from enum import auto, StrEnum
 from functools import partial
 from typing import Any, Callable, TypedDict, TypeVar
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -16,6 +17,7 @@ from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
 from jaxformers import tree_util
 from jaxformers.dispatch.lora import lora_get_w
+from jaxformers.module_utils import Stackable, StackModule
 from jaxformers.print_utils import tree_pformat
 
 
@@ -57,7 +59,6 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
     "attn_impl": "sdpa",
     "sequence_parallelism": True,
-    "weights_impl": "stack",
     "forward_impl": "loop",
 }
 
@@ -172,3 +173,32 @@ def load_weights_vectorize(
             weights[k] = jnp.stack(v)
 
     return weights
+
+
+class PreTrainedModel(eqx.Module):
+    def stack(self):
+        _is_leaf = lambda x: isinstance(x, list)
+        print("DEBUGPRINT {halllooo}:")
+
+        def f(path, leaf):
+            if isinstance(leaf, list):
+                l0 = leaf[0]
+                print(path)
+                if isinstance(l0, Stackable):
+                    print(
+                        f"{jtu.keystr(path, simple=True, separator='.')} is a stackable list, converthing to stack"
+                    )
+                    return StackModule(
+                        type(l0),
+                        leaf,
+                        l0.argnums,
+                        argnames = l0.argnames,
+                        in_axes = l0.in_axes,
+                        remat = l0.remat,
+                    )
+                else:
+                    return leaf
+            else:
+                return leaf
+
+        return jax.tree.map_with_path(f, self, is_leaf=_is_leaf)

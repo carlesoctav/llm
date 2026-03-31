@@ -18,10 +18,10 @@
 
 This repo is centered on post-training and fine-tuning rather than a full pretraining platform. The main entrypoints today are:
 
-- `src/jaxformers/train/ntp.py` for next-token prediction
+- `src/jaxformers/train/ntp.py` for next-token prediction and module-based fine-tuning
 - `src/jaxformers/train/ntp_with_kl_regularzier.py` for KL-regularized training
 
-Evaluation in `ntp.py` is currently not implemented, so the example configs run with `skip_eval = True`.
+Evaluation is currently not implemented, so the example configs run with `skip_eval = True`.
 
 ## Installation
 
@@ -63,7 +63,7 @@ Typical top-level config areas are:
 
 - experiment metadata: `exp_name`, `project_name`, `dir`, `ckpt_path`
 - runtime: `seed`, `max_train_step`, `forward_dtype`, `grad_accum`
-- model: `model_name`, `init_model`, `model.*`
+- model: `model_name`, `model.*`
 - data: `data.source_name`, `data.source.*`, `data.transforms_name`, `data.transforms.*`, `train_loader_name`, `train_loader.*`
 - optimization: `optimizer_*`, `learning_rate`, `lr_scheduler_*`
 - logging and callbacks: `logger_name`, `callback_name`
@@ -93,28 +93,29 @@ def get_config():
     config.forward_dtype = lambda: jnp.bfloat16
     config.loss_impl = "xla_chunked"
     config.grad_accum = 4
+    config.weights_impl = "stack"
     config.checkpoint_options.save_interval_steps = 0
     config.checkpoint_options.max_to_keep = 1
 
     config.logger_name = "noop"
 
-    config.init_model = "pretrained"
     config.init_lora = None
 
-    config.model_name = "huggingface.gemma3"
+    config.model_name = (
+        "{MODEL_DIR}.huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
+    )
     config.model.model_id = "google/gemma-3-1b-it"
-    config.model.parallel_dims = {
+    config.parallel.parallel_dims = {
         "dp_replicate": 1,
         "dp_shard": 4,
         "cp": 1,
         "tp": 1,
     }
+    config.parallel.devices = lambda: jax.devices()
+    config.parallel.multihost = False
     config.model.additional_config.remat_layer = False
     config.model.additional_config.attn_impl = "xla_chunked"
-    config.model.additional_config.sequence_parallelism = True
-    config.model.additional_config.weights_impl = "stack"
     config.model.additional_config.forward_impl = "loop"
-    config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.data.source_name = "huggingface"

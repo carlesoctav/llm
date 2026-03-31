@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 import sys
 import time
@@ -23,7 +25,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.checkpointing import (
+from jaxformers.checkpoint_utils import (
     CheckpointerWithInfo,
     is_used_checkpoint,
     load_checkpoint_from_path,
@@ -43,7 +45,6 @@ from jaxformers.modeling_utils import (
     logical_to_physical,
 )
 from jaxformers.models import make_model
-from jaxformers.models import model_accepts_kwarg
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
@@ -194,7 +195,7 @@ def train_step(
                 else get_lm_head_weight(weights)
             ),
             reduction="sum",
-            weight=mask,
+            mask=mask,
             implementation=config.loss_impl or None,
         )
 
@@ -246,11 +247,15 @@ def train_step(
     )
 
     updates, nst = model.tx.update(grad, model.opt_state, model.model)
-    nweights = tree_util.apply_updates(model.model, updates, config.forward_dtype)
-    total_aux = metric_utils.jittable_add_aux(sft_aux, kl_aux, reduce_method=DEFAULT_REDUCED)
+    nmodel = tree_util.apply_updates(model.model, updates)
+    total_aux = metric_utils.jittable_add_aux(
+        sft_aux,
+        kl_aux,
+        reduce_method=DEFAULT_REDUCED,
+    )
     aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
 
-    next_model = dataclasses.replace(model, weights=nweights, opt_state=nst)
+    next_model = dataclasses.replace(model, model=nmodel, opt_state=nst)
     callback_state = model.callback_state
     if model.callback_state is not None:
         next_model, callback_state = model.callbacks.update(
@@ -327,7 +332,7 @@ def train(
                     def compile_train_step():
                         train_step_jit = jax.jit(
                             partial(train_step, config),
-                            donate_argnums=(0,1),
+                            donate_argnums=(0, 1),
                         )
                         lower = train_step_jit.lower(
                             model,
@@ -358,7 +363,7 @@ def train(
                 ):
                     model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
 
-            host_aux = metric_utils.to_host(aux, flatten = True)
+            host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
                 global_aux, host_aux, reduce_method=DEFAULT_REDUCED
             )
@@ -414,7 +419,7 @@ def train(
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
     do_callback = getattr(config, "callback_name", None)
-    do_load_model = getattr(config, "load_model", None)
+    do_load_state = getattr(config, "load_state", None)
     do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
 
@@ -427,27 +432,14 @@ def main(config: sws.FinalConfig):
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
-        model_kwargs = config.model.to_dict()
-        parallel_dims = model_kwargs.pop("parallel_dims")
-        devices = model_kwargs.pop("devices") if "devices" in model_kwargs else None
-        multihost = (
-            model_kwargs.pop("multihost") if "multihost" in model_kwargs else False
-        )
-        rule = make_logical_axis_rules(
-            parallel_dims,
-            sequence_parallelism=model_kwargs["additional_config"][
-                "sequence_parallelism"
-            ],
-        )
-        mesh = make_mesh(parallel_dims, devices=devices, multihost=multihost)
-        if model_rngs is not None and model_accepts_kwarg(config.model_name, "rngs"):
-            model_kwargs["rngs"] = model_rngs
-        model = make_model(
-            config.model_name,
-            mesh=mesh,
-            rule=rule,
-            **model_kwargs,
-        )
+        rule = make_logical_axis_rules(**config.parallel.to_dict())
+        mesh = make_mesh(**config.parallel.to_dict())
+        with jax.set_mesh(mesh), with_logical_axis(rule):
+            model = make_model(
+                config.model_name,
+                **config.model.to_dict(),
+                rngs=model_rngs,
+            )
         model = TrainState(model, mesh, rule=rule)
         base_model = dataclasses.replace(model)
 
@@ -467,9 +459,9 @@ def main(config: sws.FinalConfig):
                 )
             model = dataclasses.replace(
                 model,
-                weights=(
+                model=(
                     model.model.stack()
-                    if config.model.additional_config.weights_impl == "stack"
+                    if config.weights_impl == "stack"
                     else model.model
                 ),
             )
@@ -486,9 +478,9 @@ def main(config: sws.FinalConfig):
             else:
                 base_model = dataclasses.replace(
                     base_model,
-                    weights=(
+                    model=(
                         base_model.model.stack()
-                        if config.model.additional_config.weights_impl == "stack"
+                        if config.weights_impl == "stack"
                         else base_model.model
                     ),
                 )
@@ -503,14 +495,14 @@ def main(config: sws.FinalConfig):
                     callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
-            if do_load_model:
+            if do_load_state:
                 if do_checkpoint and is_used_checkpoint(config.checkpoint.path):
                     raise ValueError(
-                        f"Both 'load_model' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
-                        f"To resume training from {config.checkpoint.path}, set load_model=None. "
+                        f"Both 'load_state' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
+                        f"To resume training from {config.checkpoint.path}, set load_state=None. "
                         f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
                     )
-                model = load_checkpoint_from_path(model, **config.load_model.to_dict())
+                model = load_checkpoint_from_path(model, **config.load_state.to_dict())
 
         ckptr = None
         if do_checkpoint:

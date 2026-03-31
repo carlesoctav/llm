@@ -81,7 +81,7 @@ def cross_entropy_loss(
     block_sizes: BlockSizes | None = None,
     *,
     reduction: Reduction = "sum",
-    weight: Float[Array, " B"] | None = None,
+    mask: Float[Array, " B"] | None = None,
     logsumexp_weight: float | None = 0.0,
     dtype: jnp.dtype | None = jnp.float32,
     logit_soft_cap: float | None = None,
@@ -134,5 +134,5 @@ def cross_entropy_loss(
 
         if need_lse:
             loss = loss + logsumexp_weight * (lse**2)
-        return _apply_reduction(loss, reduction, weight)
+        return _apply_reduction(loss, reduction, mask)
     raise ExceptionGroup("all implementations failed", errors)

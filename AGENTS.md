@@ -13,21 +13,19 @@ Rules:
 
 ## Typed Factory Layout
 
-Prefer a configurable layout with one file per concrete type under its typed folder.
+Prefer a configurable layout with one file per concrete type under its typed folder, and keep the top-level factory thin.
 
 Rules:
-- Use folders like `data/source/`, `data/transforms/`, and `data/loader/`.
+- Use typed folders like `data/source/`, `data/transforms/`, and `data/loader/`.
 - Put each concrete implementation in its own file, for example `data/source/huggingface.py`.
 - Each concrete implementation file must expose a `make(...)` function.
-- `__init__.py` factory helpers like `make_source`, `make_transforms`, and `make_loader` should only:
-  1. import the target module from the typed folder
-  2. call that module’s `make(...)`
+- `__init__.py` factory helpers like `make_source`, `make_transforms`, and `make_loader` should only import the target module from the typed folder and call that module’s `make(...)`.
 - Pass config into `make(...)` from a dict produced by the main `sws.Config`, and call it as `make(**config_xx)`.
 - Do not use catch-all `**kwargs` in those concrete `make(...)` functions; extra config should fail fast with a normal Python argument error.
 
 Intentional exceptions:
-- It is acceptable for some factories to use a different concrete entrypoint name when the domain needs it, for example model modules using `.load(...)` or `.init(...)` instead of `.make(...)`.
-- It is acceptable for scheduler and optimizer factories to pass shared leading runtime args from `__init__.py` when those args are guaranteed across all concrete implementations, for example `learning_rate` and `num_train_steps` for schedulers, or `scheduler` and `model` for optimizers.
+- Models are not a `make(...)` factory folder in this repo. Model targets are resolved from a string or callable and may point to a module function, classmethod, or other callable such as `Gemma3ForCausalLM.from_pretrained`.
+- It is acceptable for factories to pass shared leading runtime args from `__init__.py` when those args are guaranteed across all concrete implementations, for example `datasets`, `transforms`, and `mesh` for loaders, or `scheduler` and `train_state` for optimizers.
 - It is acceptable to keep small built-in cases in `__init__.py` when a dedicated file would be pointless, for example a constant scheduler that is just `learning_rate`.
 - Chained factories are expected in places like callbacks: `config.xx_name` may be either a single string or a list of names, and the per-item config should live under `config.xx[name]` after `config.xx.to_dict()`.
 
@@ -50,19 +48,6 @@ Rules:
 - Jaxtyping treats `"x"` and `" x"` the same way, so prefer the leading-space
   form for single-axis shapes in this repo.
 
-## Model Weight Layout
-
-Prefer explicit, model-owned weight preparation with shared tree utilities.
-
-Rules:
-- Structural weight transforms such as stacking, splitting, or nesting layer weights should be an explicit lifecycle step, not hidden inside checkpoint loading by default.
-- Prefer calling a model hook like `model.prepare_weights(...)` from top-level assembly or training code instead of branching on `model_name` or using external model-specific preparation helpers.
-- Run structural weight preparation before creating optimizer state or checkpoint state so downstream state uses the final weight tree layout.
-- Put reusable tree reshaping logic in shared utilities such as `tree_util.py`, not duplicated inside each model file.
-- Prefer one canonical prepared container for repeated structures like layers, for example `weights["model.layers"]`, and use lightweight adapters such as stack or unstack only at the consumption boundary.
-
-
-
 ## Don't
 - Prefer inlining trivial helper functions (one to three lines) rather than creating a separate function. For example, instead of:
    def get_forward_impl(config: Config | PreTrainedConfig) -> str:
@@ -81,6 +66,10 @@ Rules:
   over calling .get(...) with a fallback. Minimize use of None for required fields on Config or other classes — reserve None only for truly optional values.
 
 - Remove dead compatibility code once the upstream contract or validation already guarantees the invariant.
+
+- Do not add backward-compatible config fallbacks just because another train script or old config used a different shape. Match the active entrypoint exactly, update callers to that contract, and remove config fields that the target code does not use.
+
+- Do not introduce subclass-specific hooks or override points when the base class can implement the behavior directly from `cls` and the existing shared contract. Keep the generic path in one place, and add a narrow hook only when the subclass has a real schema or mapping difference.
 
 - Prefer minimal code paths over defensive abstractions when the caller, config, or upstream library is trusted.
 

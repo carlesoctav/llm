@@ -1,8 +1,10 @@
+from jaxformers.distributed.parallel import from_logical_rules
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 import optax
+from jax import P, reshard
 from jaxtyping import Array, Float, Int
 
 from jaxformers.dispatch import einsum
@@ -32,6 +34,7 @@ def cross_entropy_reference(
     if logit_soft_cap is not None:
         logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
+    logits = reshard(logits, from_logical_rules("batch", None))
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
     lse = jax.nn.logsumexp(logits, axis=-1)
 

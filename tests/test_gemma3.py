@@ -3,9 +3,22 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from transformers.models.gemma3 import Gemma3ForCausalLM
+from transformers.models.gemma3 import Gemma3ForCausalLM as HFGemma3ForCausalLM
 
-from jaxformers.models import gemma3
+from jaxformers.distributed import make_logical_axis_rules, make_mesh, with_logical_axis
+from jaxformers.models.huggingface.gemma3 import Gemma3ForCausalLM as JaxGemma3ForCausalLM
+
+
+PARALLEL_DIMS = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1}
+
+
+def make_context(devices):
+    rule = make_logical_axis_rules(
+        PARALLEL_DIMS,
+        sequence_parallelism=False,
+    )
+    mesh = make_mesh(PARALLEL_DIMS, devices=devices)
+    return mesh, rule
 
 
 def stack_with_padding(arrays: list[np.ndarray], pad_value=0):
@@ -25,9 +38,33 @@ def stack_with_padding(arrays: list[np.ndarray], pad_value=0):
     return np.vstack(collect_before_pad), np.vstack(collect_for_mask)
 
 
+def get_jax_logits(model, mesh, rule, input_ids, attention_mask=None):
+    with jax.set_mesh(mesh), with_logical_axis(rule):
+        hidden = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            dtype=jnp.float32,
+        )
+        return jax.device_get(model.unembed(hidden))
+
+
+def load_jax_model(model_id: str, devices):
+    mesh, rule = make_context(devices)
+    with jax.set_mesh(mesh), with_logical_axis(rule):
+        model = JaxGemma3ForCausalLM.from_pretrained(
+            model_id=model_id,
+            additional_config={
+                "attn_impl": "eager",
+                "sequence_parallelism": False,
+            },
+            param_dtype=jnp.float32,
+        )
+    return model, mesh, rule
+
+
 def test_gemma3_1b_it_cpu():
     model_id = "google/gemma-3-1b-it"
-    hf_model = Gemma3ForCausalLM.from_pretrained(
+    hf_model = HFGemma3ForCausalLM.from_pretrained(
         model_id,
         low_cpu_mem_usage=False,
         attn_implementation="eager",
@@ -35,20 +72,11 @@ def test_gemma3_1b_it_cpu():
     )
     hf_model.eval()
 
-    devices = jax.devices("cpu")
-    jax_model = gemma3.load(
-        model_id=model_id,
-        parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
-        devices=devices,
-        additional_config={
-            "attn_impl": "eager",
-            "sequence_parallelism": False,
-        },
-        param_dtype=jnp.float32,
-    )
+    cpu_devices = jax.devices("cpu")
+    jax_model, mesh, rule = load_jax_model(model_id, cpu_devices)
 
     for_batching = []
-    for i, num_token in enumerate([512, 1024, 8192]):
+    for num_token in [512, 1024, 8192]:
         input_ids = np.random.randint(0, hf_model.vocab_size, (1, num_token))
         with torch.no_grad():
             hf_logits = (
@@ -57,7 +85,7 @@ def test_gemma3_1b_it_cpu():
                 .cpu()
                 .numpy()
             )
-        jax_logits = jax_model.forward(jax_model.weights, input_ids=input_ids)
+        jax_logits = get_jax_logits(jax_model, mesh, rule, input_ids)
         np.testing.assert_allclose(jax_logits, hf_logits, atol=1e-2, rtol=1e-2)
         for_batching.append(input_ids)
 
@@ -73,9 +101,7 @@ def test_gemma3_1b_it_cpu():
             .numpy()
         )
 
-    jax_logits = jax_model.forward(
-        jax_model.weights, input_ids=input_ids, attention_mask=attention_mask
-    )
+    jax_logits = get_jax_logits(jax_model, mesh, rule, input_ids, attention_mask)
     np.testing.assert_allclose(jax_logits, hf_logits, atol=1e-2, rtol=1e-2)
 
 
@@ -83,21 +109,13 @@ def test_gemma3_1b_it_cpu():
 def test_gemma3_1b_it_tpu_tp():
     model_id = "google/gemma-3-1b-it"
     tpu_devices = jax.devices("tpu")
-    jax_model = gemma3.load(
-        model_id=model_id,
-        parallel_dims={"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1},
-        devices=tpu_devices,
-        additional_config={
-            "attn_impl": "eager",
-            "sequence_parallelism": False,
-        },
-        param_dtype=jnp.float32,
-    )
-    jax_token = jnp.ones((1, 13), dtype=jnp.int32)
-    jax_logits = jax_model.forward(jax_token, weights=jax_model.weights)
+    jax_model, mesh, rule = load_jax_model(model_id, tpu_devices)
+    input_ids = jnp.ones((1, 13), dtype=jnp.int32)
+
+    jax_logits = get_jax_logits(jax_model, mesh, rule, input_ids)
 
     assert jax_logits.ndim == 3
-    assert jax_logits.shape == (1, 13, jax_model.config.vocab_size)
+    assert jax_logits.shape == (1, 13, jax_model.model.config.vocab_size)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,13 @@
 import importlib
 import inspect
+import os
 from collections.abc import Callable
-from contextlib import ExitStack
 from typing import Any
 
-import jax
-
 from jaxformers.benchmark_utils import print_timing
-from jaxformers.distributed.parallel import with_logical_axis
+
+
+MODEL_DIR = os.environ.get("MODEL_DIR", "jaxformers.models")
 
 
 def resolve_model_target(model_name: str | Callable[..., Any]) -> Callable[..., Any]:
@@ -17,6 +17,7 @@ def resolve_model_target(model_name: str | Callable[..., Any]) -> Callable[..., 
     parts = model_name.split(".")
     for i in range(len(parts), 0, -1):
         module_name = ".".join(parts[:i])
+        module_name = f"{MODEL_DIR}.{module_name}"
         try:
             target = importlib.import_module(module_name)
             break
@@ -47,11 +48,4 @@ def model_accepts_kwarg(model_name: str | Callable[..., Any], kwarg_name: str) -
 @print_timing
 def make_model(model_name: str | Callable[..., Any], *model_args, **model_kwargs):
     model_factory = resolve_model_target(model_name)
-    mesh = model_kwargs.pop("mesh", None)
-    rule = model_kwargs.pop("rule", None)
-    with ExitStack() as stack:
-        if mesh is not None:
-            stack.enter_context(jax.set_mesh(mesh))
-        if rule is not None:
-            stack.enter_context(with_logical_axis(rule))
-        return model_factory(*model_args, **model_kwargs)
+    return model_factory(*model_args, **model_kwargs)

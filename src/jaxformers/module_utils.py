@@ -1,20 +1,48 @@
+import abc
 import dataclasses
+from contextlib import ExitStack
 from enum import auto, StrEnum
-from typing import Generic, TypeVar
+from pathlib import Path
+from typing import Any, Generic, TypedDict, TypeVar
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.tree_util as jtu
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+from transformers import AutoConfig, PreTrainedConfig
 
+from jaxformers import tree_util
+from jaxformers.distributed.parallel import get_logical_axis_rules
 from jaxformers.scan_utils import make_scan_fwd
 
 
 M = TypeVar("M", bound=eqx.Module)
-
+class ForwardImpl(StrEnum):
+    LOOP = auto()
+    SCAN_LAYER = auto()
 
 class StackImpl(StrEnum):
     STACK = auto()
     FREE = auto()
+
+class AdditionalConfig(TypedDict):
+    remat_layer: bool
+
+    attn_impl: str = "sdpa"
+    sequence_parallelism: bool = True
+    weights_impl: str = "stack"
+    forward_impl: str = "loop"
+
+
+DEFAULT_ADDITIONAL_CONFIG = {
+    "remat_layer": False,
+    "attn_impl": "sdpa",
+    "sequence_parallelism": True,
+    "weights_impl": "stack",
+    "forward_impl": "loop",
+}
 
 
 def module_replace(module, **kwargs):
@@ -115,3 +143,148 @@ class StackModule(eqx.Module, Generic[M]):
             argnames=self.argnames,
             in_axes=self.in_axes,
         )(*args, self.layers, **kwargs)
+
+
+class AbstractModel(eqx.Module):
+    config: eqx.AbstractVar[Any]
+
+    @abc.abstractmethod
+    def get_config(self): ...
+
+    def stack(self):
+        _is_leaf = lambda x: isinstance(x, list)
+
+        def f(path, leaf):
+            if isinstance(leaf, list):
+                l0 = leaf[0]
+                if isinstance(l0, Stackable):
+                    print(
+                        f"{jtu.keystr(path, simple=True, separator='.')} is a stackable list, converthing to stack"
+                    )
+                    return StackModule(
+                        type(l0),
+                        leaf,
+                        l0.argnums,
+                        argnames=l0.argnames,
+                        in_axes=l0.in_axes,
+                        remat=l0.remat,
+                    )
+                else:
+                    return leaf
+            else:
+                return leaf
+
+        return jax.tree.map_with_path(f, self, is_leaf=_is_leaf)
+
+
+class AbstractHuggingFacePreTrainedModel(AbstractModel):
+    config: eqx.AbstractVar[PreTrainedConfig]
+
+    def get_config(self):
+        return self.config.to_diff_dict()
+
+    @classmethod
+    def init(
+        cls,
+        config: PreTrainedConfig | None = None,
+        model_id: str | None = None,
+        additional_config: AdditionalConfig | None = None,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs,
+    ):
+        if (config is None) == (model_id is None):
+            raise ValueError(
+                f"Exactly one of `config` or `model_id` must be provided to {cls.__name__}.init()."
+            )
+
+        if model_id is not None:
+            config = AutoConfig.from_pretrained(model_id)
+
+        if not isinstance(config, PreTrainedConfig):
+            raise TypeError(f"Expected HF config, got {type(config)!r}")
+
+        additional_config = {
+            **DEFAULT_ADDITIONAL_CONFIG,
+            **(additional_config or {}),
+        }
+        config.sharding_rules = get_logical_axis_rules()
+        config.additional_config = additional_config
+        return cls(
+            config,
+            additional_config,
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id: str,
+        local_dir: str | None = None,
+        additional_config: AdditionalConfig | None = None,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs=None,
+    ):
+        if rngs is None:
+            rngs = jax.random.key(0)
+        additional_config = {
+            **DEFAULT_ADDITIONAL_CONFIG,
+            **(additional_config or {}),
+        }
+
+        model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
+        config = AutoConfig.from_pretrained(model_ckpt_dir)
+        if not isinstance(config, PreTrainedConfig):
+            raise TypeError(f"Expected HF config, got {type(config)!r}")
+        config.sharding_rules = get_logical_axis_rules()
+        config.additional_config = additional_config
+        with ExitStack() as stack:
+            missing_key = set()
+            used_key = set()
+            state_dict = {}
+            for file in model_ckpt_dir.glob("*.safetensors"):
+                file_pointer = stack.enter_context(safe_open(file, framework="numpy"))
+                for key in file_pointer.keys():
+                    state_dict[key] = file_pointer.get_slice(key)
+
+            safetensor_key = set(state_dict.keys())
+            abstract_model = jax.eval_shape(
+                lambda: cls(
+                    config,
+                    additional_config,
+                    rngs=rngs,
+                    param_dtype=param_dtype,
+                )
+            )
+            needed_model_key = set(tree_util.flatten(abstract_model).keys())
+
+            def load_leaf(path, leaf):
+                key = jax.tree_util.keystr(path, simple=True, separator=".")
+                if key not in state_dict:
+                    return leaf
+                tensor = state_dict[key][:].astype(param_dtype)
+                used_key.add(key)
+                return jax.device_put(tensor, leaf.sharding.spec)
+
+            model = jax.tree.map_with_path(
+                load_leaf,
+                abstract_model,
+            )
+
+        if missing_key := needed_model_key - used_key:
+            print(
+                "Warning: The following required keys are missing from the safetensors archive and will be "
+                "left as default-initialized:",
+                *sorted(missing_key),
+            )
+
+        if not_used_key := safetensor_key - used_key:
+            print(
+                f"Some keys are present in the safetensors archive but are not required by the model {cls}. "
+                "This can be expected if the safetensors weights were derived from a different model variant "
+                "(for example, one with an added classification head). Please review whether this is an expected outcome:",
+                *not_used_key,
+            )
+        return model

@@ -42,10 +42,10 @@ def get_config():
 
     config.init_lora = None
     config.model_name = (
-        "jaxformers.models.experimental.gemma3.Gemma3ForCausalLM.from_pretrained"
+        "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
     )
     config.model.model_id = "google/gemma-3-1b-it"
-    config.model.additional_config.remat_layer = False
+    config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_impl = "sdpa"
     config.model.additional_config.forward_impl = "scan_layer"
     config.model.param_dtype = lambda: jnp.bfloat16

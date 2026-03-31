@@ -1,4 +1,3 @@
-import jax.numpy as jnp
 import dataclasses
 from typing import Any, Iterator
 
@@ -7,7 +6,7 @@ import orbax.checkpoint.experimental.v1 as ocp
 from etils import epath
 
 from jaxformers import tree_util
-from jaxformers.modeling_utils import TrainState, get_model_config
+from jaxformers.modeling_utils import TrainState
 from jaxformers.print_utils import tree_pformat, tree_pprint
 
 
@@ -100,12 +99,21 @@ class CheckpointerWithInfo:
             }
 
         else:
-            trainable, _ = tree_util.partition(train_state.model, train_state.train_mask)
-            checkpointables = {
-                "model": trainable,
-                "opt_state": train_state.opt_state,
-                "train_mask": train_state.train_mask,
-            }
+            if self.save_only_trainable:
+                trainable, _ = tree_util.partition(
+                    train_state.model, train_state.train_mask
+                )
+                checkpointables = {
+                    "model": trainable,
+                    "opt_state": train_state.opt_state,
+                    "train_mask": train_state.train_mask,
+                }
+            else:
+                checkpointables = {
+                    "model": train_state.model,
+                    "opt_state": train_state.opt_state,
+                    "train_mask": train_state.train_mask,
+                }
 
         return self.ckptr.save_checkpointables_async(step, checkpointables)
 
@@ -135,10 +143,12 @@ def make_checkpointer(
                     "Please use a matching configuration or remove the existing checkpoint."
                 )
         for item in things_to_check_pytree:
-            existing, existing_treedef = jax.tree.flatten(old_ocp.load_checkpointables(
+            existing, existing_treedef = jax.tree.flatten(
+                old_ocp.load_checkpointables(
                     0, {item: tree_util.to_abstract(getattr(train_state, item))}
-                )[item])
-            requested, requested_treedef= jax.tree.flatten(getattr(train_state, item))
+                )[item]
+            )
+            requested, requested_treedef = jax.tree.flatten(getattr(train_state, item))
             if requested_treedef != existing_treedef:
                 raise ValueError(
                     f"Structure mismatch for checkpoint item '{item}' in the existing checkpoint at {path}."
@@ -175,7 +185,7 @@ def make_checkpointer(
         "save_internal_steps": save_interval_steps,
         "max_to_keep": max_to_keep,
         "save_only_trainable": save_only_trainable,
-        "config": get_model_config(train_state.model).to_diff_dict(),
+        "config": train_state.model.get_config(),
     }
 
     ckptr = ocp.training.Checkpointer(

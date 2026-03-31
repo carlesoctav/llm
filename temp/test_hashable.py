@@ -25,4 +25,3 @@ def train_step(model):
 
 
 a = train_step(model)
-print("DEBUGPRINT {a}:", a)

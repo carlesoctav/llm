@@ -26,7 +26,7 @@ from jaxformers.print_utils import tree_pformat
 
 
 if TYPE_CHECKING:
-    from jaxformers.modeling_utils import Model
+    from jaxformers.modeling_utils import TrainState
 
 default_init = jax.nn.initializers.variance_scaling(
     1 / 3.0, "fan_in", "uniform", in_axis=-1, out_axis=-2, batch_axis=()
@@ -39,12 +39,12 @@ class InitLora(StrEnum):
 
 
 def make_lora(
-    model: Model,
+    model: TrainState,
     init_lora: str | None,
     lora_config: dict,
     *,
     rngs: PRNGKeyArray | None = None,
-) -> Model:
+) -> TrainState:
     if init_lora in (InitLora.RANDOM, None):
         if rngs is None:
             raise ValueError("random LoRA init requires an rng key")
@@ -170,7 +170,7 @@ def random_weight(key, shape):
 
 @print_timing
 def loraify(
-    model: Model,
+    train_state: TrainState,
     weights_path: list[str],
     rank: int,
     alpha: float,
@@ -214,11 +214,11 @@ def loraify(
         else:
             return weight
 
-    weights = jtu.tree_map_with_path(_loraify, model.weights)
+    model = jtu.tree_map_with_path(_loraify, train_state.model)
     print("Model weights converted to LoRA:", tree_pformat(loraify_weight))
     return replace(
-        model,
-        weights=weights,
+        train_state,
+        model=model,
         is_lora=True,
         # Don't wrap the whole forward pass in `quaxify`, as some implementations
         # (e.g. shard_map-based attention) are not compatible with Quax's custom trace.

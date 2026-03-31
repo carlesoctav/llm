@@ -1,7 +1,9 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import TypedDict
+from typing import TypeAlias, TypedDict
+
+import jax
+from jax.sharding import AxisType, PartitionSpec as P
 
 
 BATCH = ("dp_replicate", "dp_shard")
@@ -10,10 +12,19 @@ MODEL = ("tp",)
 SEQ = ("tp", "cp")
 CONTEXT = ("cp",)
 AxisName = str | tuple[str, ...] | None
-_CURRENT_RULE = ContextVar("sharding_rule", default=None)
+LogicalRules: TypeAlias = dict[str, AxisName]
+
+DEFAULT_LOGICAL_AXIS_RULES: LogicalRules = {
+    "none": None,
+    "batch": BATCH,
+    "fsdp": FSDP,
+    "model": MODEL,
+    "sequence": SEQ,
+    "context": CONTEXT,
+}
+_CURRENT_LOGICAL_AXIS_RULES = ContextVar("logical_axis_rules", default={})
 
 
-@dataclass
 class ParallelDims(TypedDict):
     dp_replicate: int
     dp_shard: int
@@ -24,14 +35,10 @@ class ParallelDims(TypedDict):
 DEFAULT_PARALLEL_DIMS = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1}
 
 
-@dataclass
 class SparseParallelDims(TypedDict):
     dp_replicate: int
     dp_shard: int
     cp: int
-    ep: int
-    etp: int
-
     ep: int
     etp: int
 
@@ -47,43 +54,111 @@ def drop_axis(mesh_axes: AxisName, axis_name: str) -> AxisName:
 
 
 def mutate_sharding_rule_parallel_dims(
-    rules: dict[str, AxisName],
+    sharding_rules: LogicalRules,
     parallel_dims: ParallelDims,
     sequence_parallelism: bool = True,
 ):
+    rules = dict(sharding_rules)
     if not sequence_parallelism:
-        rules["context"] = drop_axis(rules.get("context"), "tp")
-        rules["sequence"] = drop_axis(rules.get("sequence"), "tp")
+        rules["sequence"] = drop_axis(rules["sequence"], "tp")
 
-    if parallel_dims["cp"] == 1:
-        rules["context"] = drop_axis(rules.get("context"), "cp")
-        rules["sequence"] = drop_axis(rules.get("sequence"), "cp")
+    # if parallel_dims["cp"] == 1:
+    #     rules["context"] = drop_axis(rules["context"], "cp")
+    #     rules["sequence"] = drop_axis(rules["sequence"], "cp")
 
-    # Avoid explicit singleton mesh axes in PartitionSpecs. These can trigger sharding
-    # mismatches in transposes/VJPs (e.g. reductions) on newer JAX versions.
-    for axis_name, axis_size in parallel_dims.items():
-        if axis_size != 1:
-            continue
-        for rule_key, rule_val in list(rules.items()):
-            rules[rule_key] = drop_axis(rule_val, axis_name)
+    # # Avoid explicit singleton mesh axes in PartitionSpecs. These can trigger sharding
+    # # mismatches in transposes/VJPs (e.g. reductions) on newer JAX versions.
+    # for axis_name, axis_size in parallel_dims.items():
+    #     if axis_size != 1:
+    #         continue
+    #     for rule_key, rule_val in list(rules.items()):
+    #         rules[rule_key] = drop_axis(rule_val, axis_name)
 
     return rules
 
 
+def make_logical_axis_rules(
+    parallel_dims: ParallelDims,
+    *,
+    sequence_parallelism: bool = True,
+    **kwargs,
+) -> LogicalRules:
+    return mutate_sharding_rule_parallel_dims(
+        DEFAULT_LOGICAL_AXIS_RULES,
+        parallel_dims,
+        sequence_parallelism=sequence_parallelism,
+    )
+
+
+def make_mesh(
+    parallel_dims: ParallelDims,
+    devices: list | None = None,
+    *,
+    multihost: bool = False,
+    **kwargs,
+):
+    if multihost:
+        jax.distributed.initialize()
+
+    axis_shapes = tuple(parallel_dims.values())
+    axis_names = tuple(parallel_dims.keys())
+    axis_types = tuple(AxisType.Explicit for _ in axis_names)
+    return jax.make_mesh(
+        axis_shapes,
+        axis_names,
+        axis_types=axis_types,
+        devices=devices,
+    )
+
+
 @contextmanager
-def set_rule(rule):
-    token = _CURRENT_RULE.set(rule)
+def with_logical_axis(rules: LogicalRules):
+    token = _CURRENT_LOGICAL_AXIS_RULES.set(rules)
     try:
         yield
     finally:
-        _CURRENT_RULE.reset(token)
+        _CURRENT_LOGICAL_AXIS_RULES.reset(token)
 
 
-def current_rule():
-    rule = _CURRENT_RULE.get()
-    if rule is None:
-        raise ValueError("No active sharding rule. Enter `set_rule(...)` first.")
-    return rule
+def get_logical_axis_rules() -> LogicalRules:
+    return _CURRENT_LOGICAL_AXIS_RULES.get()
+
+
+def remove_size_one_mesh_axis(spec, mesh):
+    if spec is None:
+        return None
+
+    new_spec = []
+    for s in spec:
+        if s is None or s == P.UNCONSTRAINED:
+            new_spec.append(s)
+        elif isinstance(s, tuple):
+            new_spec.append(tuple(i for i in s if mesh.shape.get(i, 1) != 1))
+        else:
+            new_spec.append(None if mesh.shape.get(s, 1) == 1 else s)
+
+    return P(*new_spec, unreduced=spec.unreduced, reduced=spec.reduced)
+
+
+def from_logical_rules(
+    sharding: tuple[str | None, ...],
+    sharding_rules: LogicalRules | None = None,
+) -> P:
+    if get_logical_axis_rules() or sharding_rules:
+        context_rules = get_logical_axis_rules()
+        rules = sharding_rules or context_rules
+        spec = P(
+            *tuple(
+                rules[str(s)] if (s and str(s) in rules) else s for s in sharding
+            )
+        )
+    else:
+        spec = P(*sharding)
+    try:
+        mesh = jax.sharding.get_abstract_mesh()
+    except Exception:
+        return spec
+    return remove_size_one_mesh_axis(spec, mesh)
 
 
 def check_mesh_axis_for_inference(parallel_dims: ParallelDims):

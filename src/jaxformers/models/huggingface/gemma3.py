@@ -30,8 +30,9 @@ from jaxformers.modeling_utils import (
     ForwardImpl,
     load_weights,
     logical_to_physical,
-    Model,
+    resolve_model_dir,
     StoreWeights,
+    TrainState as Model,
 )
 from jaxformers.scan_utils import make_scan_fwd
 
@@ -695,7 +696,7 @@ def init(
             if config.tie_word_embeddings
             else "lm_head.weight"
         ),
-        mesh = mesh,
+        mesh=mesh,
     )
 
 
@@ -719,6 +720,7 @@ def load(
         sequence_parallelism=additional_config["sequence_parallelism"],
     )
 
+    local_dir = resolve_model_dir(local_dir)
     model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
     tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
     config = AutoConfig.from_pretrained(model_ckpt_dir)
@@ -739,7 +741,9 @@ def load(
     )
 
     with jax.set_mesh(mesh):
-        weights = load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding)
+        weights = load_weights(
+            model_ckpt_dir, param_dtype, sharding_rules, get_sharding
+        )
     # weights = prepare_weights(config, weights)
 
     if "model.embed_tokens.weight" not in weights:
@@ -767,5 +771,5 @@ def load(
             if config.tie_word_embeddings
             else "lm_head.weight"
         ),
-        mesh = mesh
+        mesh=mesh,
     )

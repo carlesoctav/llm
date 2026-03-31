@@ -2,21 +2,20 @@ import re
 from dataclasses import dataclass
 from enum import auto, StrEnum
 from functools import partial
-from typing import Any, Callable, TypedDict, TypeVar
+from typing import Any, TypedDict, TypeVar
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import optax
-from jax import P
 from jax.sharding import Mesh
-from jaxtyping import Bool, Float, PyTree
+from jaxtyping import Bool, PyTree
 from safetensors import safe_open
-from transformers import PreTrainedConfig, PreTrainedTokenizerFast
 
 from jaxformers import tree_util
 from jaxformers.dispatch.lora import lora_get_w
+from jaxformers.distributed.parallel import from_logical_rules
 from jaxformers.module_utils import Stackable, StackModule
 from jaxformers.print_utils import tree_pformat
 
@@ -36,14 +35,14 @@ class ForwardImpl(StrEnum):
 
 
 def logical_to_physical(logical, rules):
-    spec = [rules[lo] for lo in logical]
+    spec = from_logical_rules(logical, rules)
     flat_leaves = jtu.tree_leaves(spec)
     if len(flat_leaves) != len(set(flat_leaves)):
         raise ValueError(
-            f"Colliding physical axes from translating logical spec {logical} -> {spec}"
+            f"Colliding physical axes from translating logical spec {logical} -> {tuple(spec)}"
         )
 
-    return P(*spec)
+    return spec
 
 
 class AdditionalConfig(TypedDict):
@@ -58,7 +57,6 @@ class AdditionalConfig(TypedDict):
 DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
     "attn_impl": "sdpa",
-    "sequence_parallelism": True,
     "forward_impl": "loop",
 }
 
@@ -66,39 +64,25 @@ DEFAULT_ADDITIONAL_CONFIG = {
 @partial(
     jtu.register_dataclass,
     data_fields=[
-        "weights",
+        "model",
         "opt_state",
         "step",
         "callback_state",
     ],
     meta_fields=[
-        "name",
-        "tokenizer",
-        "forward",
-        "prepare_weights",
-        "config",
         "tx",
         "is_lora",
         "train_mask",
-        "embed",
-        "unembed",
-        "lm_head_key",
         "callbacks",
         "mesh",
+        "rule",
     ],
 )
 @dataclass
-class Model:
-    name: str
-    config: PreTrainedConfig
-    weights: PyTree[Float, "ModelWeights"]
-    forward: Callable
-    embed: Callable
-    unembed: Callable
-    prepare_weights: Callable
-    tokenizer: PreTrainedTokenizerFast
-    lm_head_key: str
+class TrainState:
+    model: eqx.Module
     mesh: Mesh
+    rule: tuple[tuple[str, str | tuple[str, ...] | None], ...] = ()
 
     opt_state: PyTree["ModelWeights"] | None = None
     tx: optax.GradientTransformation | None = None
@@ -108,28 +92,33 @@ class Model:
     callbacks: Any | None = None
 
     train_mask: PyTree[Bool] | None = None
-    # make this str_enum
     is_lora: bool = False
 
     def __repr__(self):
-        return self.name + "\n" + tree_pformat(self.weights)
+        return tree_pformat(self.model)
 
     @property
     def params(
         self,
     ):
-        return self.weights
+        return self.model
 
     @property
     def trainable_params(self) -> tuple[PyTree, PyTree]:
-        return tree_util.partition(self.weights, self.train_mask)
+        return tree_util.partition(self.model, self.train_mask)
 
     @property
     def base_params(self):
         if self.is_lora:
-            return lora_get_w(self.weights)
+            return lora_get_w(self.model)
         else:
-            return self.weights
+            return self.model
+
+
+def get_model_config(weights):
+    if hasattr(weights, "config"):
+        return weights.config
+    return weights.model.config
 
 
 def load_weights(model_ckpt_dir, param_dtype, sharding_rules, get_sharding):
@@ -176,14 +165,22 @@ def load_weights_vectorize(
 
 
 class PreTrainedModel(eqx.Module):
+    @classmethod
+    def init(cls, *args, **kwargs):
+        raise NotImplementedError(f"{cls.__name__}.init() is not implemented.")
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        raise NotImplementedError(
+            f"{cls.__name__}.from_pretrained() is not implemented."
+        )
+
     def stack(self):
         _is_leaf = lambda x: isinstance(x, list)
-        print("DEBUGPRINT {halllooo}:")
 
         def f(path, leaf):
             if isinstance(leaf, list):
                 l0 = leaf[0]
-                print(path)
                 if isinstance(l0, Stackable):
                     print(
                         f"{jtu.keystr(path, simple=True, separator='.')} is a stackable list, converthing to stack"
@@ -192,9 +189,9 @@ class PreTrainedModel(eqx.Module):
                         type(l0),
                         leaf,
                         l0.argnums,
-                        argnames = l0.argnames,
-                        in_axes = l0.in_axes,
-                        remat = l0.remat,
+                        argnames=l0.argnames,
+                        in_axes=l0.in_axes,
+                        remat=l0.remat,
                     )
                 else:
                     return leaf

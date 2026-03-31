@@ -51,7 +51,9 @@ def get_config():
 
     config.init_model = "pretrained"
     config.init_lora = "random"
-    config.model_name = "huggingface.gemma3"
+    config.model_name = (
+        "jaxformers.models.experimental.gemma3.Gemma3ForCausalLM.from_pretrained"
+    )
     config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True

@@ -1,4 +1,4 @@
-from jaxformers.print_utils import tree_pprint
+import struct
 from contextlib import ExitStack
 from dataclasses import fields
 from pathlib import Path
@@ -9,23 +9,14 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from huggingface_hub import snapshot_download
-from jax.sharding import AxisType, PartitionSpec as P, reshard
+from jax.sharding import PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer, PreTrainedConfig
+from transformers import AutoConfig, PreTrainedConfig
 
 from jaxformers.attention_utils import ATTENTION_INTERFACE
 from jaxformers.dispatch.einsum import einsum
-from jaxformers.distributed import (
-    BATCH,
-    CONTEXT,
-    current_rule,
-    FSDP,
-    MODEL,
-    mutate_sharding_rule_parallel_dims,
-    SEQ,
-)
-from jaxformers.distributed.parallel import ParallelDims
+from jaxformers.distributed import from_logical_rules, get_logical_axis_rules
 from jaxformers.masking_utils import (
     ATTENTION_MASK_INTERFACE,
     make_causal_mask,
@@ -35,10 +26,10 @@ from jaxformers.modeling_utils import (
     AdditionalConfig,
     DEFAULT_ADDITIONAL_CONFIG,
     ForwardImpl,
-    logical_to_physical,
-    Model, PreTrainedModel,
+    PreTrainedModel,
 )
 from jaxformers.module_utils import Stackable, StackModule
+from jaxformers.print_utils import tree_pprint
 
 
 Config: TypeAlias = PreTrainedConfig
@@ -46,30 +37,9 @@ default_init = jax.nn.initializers.variance_scaling(
     1 / 3.0, "fan_in", "uniform", in_axis=-1, out_axis=-2, batch_axis=()
 )
 
-SHARDING_RULES = {
-    "none": None,
-    "batch": BATCH,
-    "fsdp": FSDP,
-    "model": MODEL,
-    "sequence": SEQ,
-    "context": CONTEXT,
-}
-
-
-def _resolve_sharding(logical):
-    if logical is None:
-        return None
-    return logical_to_physical(logical, current_rule())
-
-
-def _physical_sharding(logical, rule):
-    if logical is None:
-        return None
-    return logical_to_physical(logical, rule)
-
 
 def _reshard_logical(x, logical):
-    return reshard(x, _resolve_sharding(logical))
+    return reshard(x, from_logical_rules(logical))
 
 
 def get_layer_metadata(config: Config) -> tuple[jax.Array, jax.Array]:
@@ -309,7 +279,6 @@ class Gemma3Attention(eqx.Module):
         attn_impl: str,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
-        rule,
     ):
         hidden_size = config.hidden_size
         head_dim = config.head_dim
@@ -330,8 +299,8 @@ class Gemma3Attention(eqx.Module):
             rngs=q_proj_rngs,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            out_sharding=_physical_sharding(("batch", "context", "none"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "context", "none")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         self.k_proj = Linear(
             hidden_size,
@@ -339,8 +308,8 @@ class Gemma3Attention(eqx.Module):
             rngs=k_proj_rngs,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            out_sharding=_physical_sharding(("batch", "context", "none"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "context", "none")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         self.v_proj = Linear(
             hidden_size,
@@ -348,8 +317,8 @@ class Gemma3Attention(eqx.Module):
             rngs=v_proj_rngs,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            out_sharding=_physical_sharding(("batch", "context", "none"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "context", "none")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         self.o_proj = Linear(
             q_out,
@@ -357,8 +326,8 @@ class Gemma3Attention(eqx.Module):
             rngs=o_proj_rngs,
             param_dtype=param_dtype,
             use_bias=config.attention_bias,
-            out_sharding=_physical_sharding(("batch", "sequence", "none"), rule),
-            w_sharding=_physical_sharding(("fsdp", "model"), rule),
+            out_sharding=from_logical_rules(("batch", "sequence", "none")),
+            w_sharding=from_logical_rules(("fsdp", "model")),
         )
         self.q_norm = RMSNorm(
             head_dim,
@@ -388,7 +357,7 @@ class Gemma3Attention(eqx.Module):
     ):
         q_sharding = jax.NamedSharding(
             jax.sharding.get_abstract_mesh(),
-            _resolve_sharding(("batch", "context", "model", "none")),
+            from_logical_rules(("batch", "context", "model", "none")),
         )
         attention_interface = ATTENTION_INTERFACE[self.attn_impl]
 
@@ -461,7 +430,6 @@ class Gemma3MLP(eqx.Module):
         act_fn: str,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
-        rule,
     ):
         gate_proj_rngs, up_proj_rngs, down_proj_rngs = jax.random.split(rngs, 3)
         self.gate_proj = Linear(
@@ -470,8 +438,8 @@ class Gemma3MLP(eqx.Module):
             rngs=gate_proj_rngs,
             param_dtype=param_dtype,
             use_bias=False,
-            out_sharding=_physical_sharding(("batch", "context", "model"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "context", "model")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         self.up_proj = Linear(
             config.hidden_size,
@@ -479,8 +447,8 @@ class Gemma3MLP(eqx.Module):
             rngs=up_proj_rngs,
             param_dtype=param_dtype,
             use_bias=False,
-            out_sharding=_physical_sharding(("batch", "context", "model"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "context", "model")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         self.down_proj = Linear(
             config.intermediate_size,
@@ -488,8 +456,8 @@ class Gemma3MLP(eqx.Module):
             rngs=down_proj_rngs,
             param_dtype=param_dtype,
             use_bias=False,
-            out_sharding=_physical_sharding(("batch", "sequence", "none"), rule),
-            w_sharding=_physical_sharding(("fsdp", "model"), rule),
+            out_sharding=from_logical_rules(("batch", "sequence", "none")),
+            w_sharding=from_logical_rules(("fsdp", "model")),
         )
         self.act_fn = act_fn
 
@@ -509,7 +477,9 @@ class Gemma3Layer(eqx.Module, Stackable):
     post_feedforward_layernorm: RMSNorm
 
     argnums: tuple[int, ...] = eqx.field(static=True, default=0)
-    argnames: tuple[str, ...] = eqx.field(static=True, default=("rope_theta", "is_sliding"))
+    argnames: tuple[str, ...] = eqx.field(
+        static=True, default=("rope_theta", "is_sliding")
+    )
     in_axes: int = eqx.field(static=True, default=0)
 
     remat: bool = eqx.field(static=True, default=True)
@@ -522,7 +492,6 @@ class Gemma3Layer(eqx.Module, Stackable):
         layer_idx: int,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
-        rule,
     ):
         (
             self_attn_rngs,
@@ -537,14 +506,12 @@ class Gemma3Layer(eqx.Module, Stackable):
             attn_impl=additional_config["attn_impl"],
             rngs=self_attn_rngs,
             param_dtype=param_dtype,
-            rule=rule,
         )
         self.mlp = Gemma3MLP(
             config,
             act_fn=config.hidden_activation,
             rngs=mlp_rngs,
             param_dtype=param_dtype,
-            rule=rule,
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -613,18 +580,14 @@ class Gemma3Model(eqx.Module):
     norm: RMSNorm
 
     config: Config = eqx.field(static=True)
-    mesh: jax.sharding.Mesh = eqx.field(static=True)
-    rule: dict[str, tuple[str, ...] | str | None] = eqx.field(static=True)
 
     def __init__(
         self,
         config: Config,
         additional_config: AdditionalConfig,
-        mesh,
         *,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
-        rule,
     ):
         embed_tokens_rngs, layers_rngs, norm_rngs = jax.random.split(rngs, 3)
         self.embed_tokens = Embedding(
@@ -634,8 +597,8 @@ class Gemma3Model(eqx.Module):
             rngs=embed_tokens_rngs,
             param_dtype=param_dtype,
             embed_scale=config.hidden_size**0.5,
-            out_sharding=_physical_sharding(("batch", "sequence", "none"), rule),
-            w_sharding=_physical_sharding(("model", "fsdp"), rule),
+            out_sharding=from_logical_rules(("batch", "sequence", "none")),
+            w_sharding=from_logical_rules(("model", "fsdp")),
         )
         layer_rngs = jax.random.split(layers_rngs, config.num_hidden_layers)
         self.layers = [
@@ -645,7 +608,6 @@ class Gemma3Model(eqx.Module):
                 layer_idx=layer_idx,
                 rngs=layer_rngs[layer_idx],
                 param_dtype=param_dtype,
-                rule=rule,
             )
             for layer_idx in range(config.num_hidden_layers)
         ]
@@ -656,8 +618,6 @@ class Gemma3Model(eqx.Module):
             eps=config.rms_norm_eps,
         )
         self.config = config
-        self.mesh = mesh
-        self.rule = rule
 
     def __call__(
         self,
@@ -735,27 +695,21 @@ class Gemma3Model(eqx.Module):
 class Gemma3ForCausalLM(PreTrainedModel):
     model: Gemma3Model
     lm_head: Linear | None
-    mesh: jax.sharding.Mesh = eqx.field(static=True)
-    rule: dict[str, tuple[str, ...] | str | None] = eqx.field(static=True)
 
     def __init__(
         self,
         config: Config,
         additional_config: AdditionalConfig,
-        mesh,
         *,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype = jnp.bfloat16,
-        rule,
     ):
         model_rngs, lm_head_rngs = jax.random.split(rngs)
         self.model = Gemma3Model(
             config,
             additional_config,
-            mesh,
             rngs=model_rngs,
             param_dtype=param_dtype,
-            rule=rule,
         )
         self.lm_head = None
         if not config.tie_word_embeddings:
@@ -765,11 +719,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 rngs=lm_head_rngs,
                 param_dtype=param_dtype,
                 use_bias=False,
-                out_sharding=_physical_sharding(("batch", "context", "model"), rule),
-                w_sharding=_physical_sharding(("model", "fsdp"), rule),
+                out_sharding=from_logical_rules(("batch", "context", "model")),
+                w_sharding=from_logical_rules(("model", "fsdp")),
             )
-        self.mesh = mesh
-        self.rule = rule
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -795,189 +747,92 @@ class Gemma3ForCausalLM(PreTrainedModel):
             "btd,vd->btv",
             hidden_states,
             out_embed,
-            out_sharding=_resolve_sharding(("batch", "context", "model")),
+            out_sharding=from_logical_rules(("batch", "context", "model")),
             preferred_element_type=jnp.float32,
         )
 
-
-def forward(weights: Gemma3ForCausalLM, *args, **kwargs):
-    return weights(*args, **kwargs)
-
-
-def embed(weights: Gemma3ForCausalLM, *args, **kwargs):
-    return weights.embed(*args, **kwargs)
-
-
-def unembed(weights: Gemma3ForCausalLM, *args, **kwargs):
-    return weights.unembed(*args, **kwargs)
-
-
-def prepare_weights(weights: Gemma3ForCausalLM):
-    return weights
-
-
-def as_model(
-    weights: Gemma3ForCausalLM,
-    *,
-    tokenizer=None,
-):
-    config = weights.model.config
-    return Model(
-        name=__name__,
-        config=config,
-        weights=weights,
-        forward=forward,
-        prepare_weights=prepare_weights,
-        tokenizer=tokenizer,
-        embed=embed,
-        unembed=unembed,
-        lm_head_key=(
-            "model.embed_tokens.weight"
-            if config.tie_word_embeddings
-            else "lm_head.weight"
-        ),
-        mesh=weights.mesh,
-    )
-
-
-def init(
-    config: Config | None = None,
-    model_id: str | None = None,
-    parallel_dims: ParallelDims | None = None,
-    devices: list | None = None,
-    multihost: bool = False,
-    additional_config: AdditionalConfig | None = None,
-    param_dtype: jnp.dtype = jnp.bfloat16,
-    *,
-    rngs: PRNGKeyArray,
-) -> Gemma3ForCausalLM:
-    if (config is None) == (model_id is None):
-        raise ValueError(
-            "Exactly one of `config` or `model_id` must be provided to gemma3.init()."
-        )
-
-    if model_id is not None:
-        config = AutoConfig.from_pretrained(model_id)
-
-    if not isinstance(config, PreTrainedConfig):
-        raise TypeError(f"Expected HF config, got {type(config)!r}")
-
-    if parallel_dims is None:
-        raise ValueError("`parallel_dims` must be provided to gemma3.init().")
-
-    additional_config = {
-        **DEFAULT_ADDITIONAL_CONFIG,
-        **(additional_config or {}),
-    }
-
-    sharding_rules = mutate_sharding_rule_parallel_dims(
-        dict(SHARDING_RULES),
-        parallel_dims,
-        sequence_parallelism=additional_config["sequence_parallelism"],
-    )
-
-    if multihost:
-        jax.distributed.initialize()
-
-    axis_shapes = tuple(parallel_dims.values())
-    axis_names = tuple(parallel_dims.keys())
-    axis_types = tuple(AxisType.Explicit for _ in axis_names)
-    mesh = jax.make_mesh(
-        axis_shapes,
-        axis_names,
-        axis_types=axis_types,
-        devices=devices,
-    )
-
-    config.additional_config = additional_config
-    config.parallel_dims = parallel_dims
-    config.rule = sharding_rules
-    config.sharding_rules = sharding_rules
-
-    with jax.set_mesh(mesh):
-        return Gemma3ForCausalLM(
-            config,
-            additional_config,
-            mesh,
-            rngs=rngs,
-            param_dtype=param_dtype,
-            rule=sharding_rules,
-        )
-
-
-def load(
-    model_id: str,
-    parallel_dims: ParallelDims,
-    devices: list | None = None,
-    local_dir: str | None = None,
-    multihost: bool = False,
-    additional_config: AdditionalConfig | None = None,
-    param_dtype: jnp.dtype = jnp.bfloat16,
-    *,
-    rngs: PRNGKeyArray | None = None,
-) -> Model:
-    if rngs is None:
-        rngs = jax.random.key(0)
-
-    additional_config = {
-        **DEFAULT_ADDITIONAL_CONFIG,
-        **(additional_config or {}),
-    }
-
-    sharding_rules = mutate_sharding_rule_parallel_dims(
-        dict(SHARDING_RULES),
-        parallel_dims,
-        sequence_parallelism=additional_config["sequence_parallelism"],
-    )
-
-    model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
-    tokenizer = AutoTokenizer.from_pretrained(model_ckpt_dir, use_fast=True)
-    config = AutoConfig.from_pretrained(model_ckpt_dir)
-    if not isinstance(config, PreTrainedConfig):
-        raise TypeError(f"Expected HF config, got {type(config)!r}")
-
-    if multihost:
-        jax.distributed.initialize()
-
-    axis_shapes = tuple(parallel_dims.values())
-    axis_names = tuple(parallel_dims.keys())
-    axis_types = tuple(AxisType.Explicit for _ in axis_names)
-    mesh = jax.make_mesh(
-        axis_shapes,
-        axis_names,
-        axis_types=axis_types,
-        devices=devices,
-    )
-
-    config.additional_config = additional_config
-    config.parallel_dims = parallel_dims
-    config.rule = sharding_rules
-    config.sharding_rules = sharding_rules
-
-    load_additional_config = {
-        **additional_config,
-    }
-
-    load_failures = {}
-    with ExitStack() as stack:
-        hf_index = {}
-        for file in model_ckpt_dir.glob("*.safetensors"):
-            opened = stack.enter_context(safe_open(file, framework="numpy"))
-            for key in opened.keys():
-                hf_index[key] = opened
-
-        with jax.set_mesh(mesh):
-            abstract_model = jax.eval_shape(
-                lambda: Gemma3ForCausalLM(
-                    config,
-                    load_additional_config,
-                    mesh,
-                    rngs=rngs,
-                    param_dtype=param_dtype,
-                    rule=sharding_rules,
-                )
+    @classmethod
+    def init(
+        cls,
+        config: Config | None = None,
+        model_id: str | None = None,
+        additional_config: AdditionalConfig | None = None,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: PRNGKeyArray,
+    ) -> "Gemma3ForCausalLM":
+        if (config is None) == (model_id is None):
+            raise ValueError(
+                "Exactly one of `config` or `model_id` must be provided to gemma3.init()."
             )
 
+        if model_id is not None:
+            config = AutoConfig.from_pretrained(model_id)
+
+        if not isinstance(config, PreTrainedConfig):
+            raise TypeError(f"Expected HF config, got {type(config)!r}")
+
+        additional_config = {
+            **DEFAULT_ADDITIONAL_CONFIG,
+            **(additional_config or {}),
+        }
+
+        config.additional_config = additional_config
+        config.sharding_rules = get_logical_axis_rules()
+
+        return cls(
+            config,
+            additional_config,
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id: str,
+        local_dir: str | None = None,
+        additional_config: AdditionalConfig | None = None,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        rngs: PRNGKeyArray | None = None,
+    ) -> "Gemma3ForCausalLM":
+        if rngs is None:
+            rngs = jax.random.key(0)
+
+        additional_config = {
+            **DEFAULT_ADDITIONAL_CONFIG,
+            **(additional_config or {}),
+        }
+
+        model_ckpt_dir = Path(snapshot_download(repo_id=model_id, local_dir=local_dir))
+        config = AutoConfig.from_pretrained(model_ckpt_dir)
+        if not isinstance(config, PreTrainedConfig):
+            raise TypeError(f"Expected HF config, got {type(config)!r}")
+
+        config.additional_config = additional_config
+        config.sharding_rules = get_logical_axis_rules()
+
+        load_additional_config = {
+            **additional_config,
+        }
+
+        load_failures = {}
+        with ExitStack() as stack:
+            hf_index = {}
+            for file in model_ckpt_dir.glob("*.safetensors"):
+                opened = stack.enter_context(safe_open(file, framework="numpy"))
+                for key in opened.keys():
+                    hf_index[key] = opened
+
+            abstract_model = jax.eval_shape(
+                lambda: cls(
+                    config,
+                    load_additional_config,
+                    rngs=rngs,
+                    param_dtype=param_dtype,
+                )
+            )
             def load_leaf(path, leaf):
                 key = jax.tree_util.keystr(path, simple=True, separator=".")
                 if key not in hf_index:
@@ -990,12 +845,9 @@ def load(
                 load_leaf,
                 abstract_model,
             )
-    if load_failures:
-        print("Gemma3 load failed tensors:")
-        for key, reason in sorted(load_failures.items()):
-            print(f"{key}: {reason}")
+        if load_failures:
+            print("Gemma3 load failed tensors:")
+            for key, reason in sorted(load_failures.items()):
+                print(f"{key}: {reason}")
 
-    return as_model(
-        model,
-        tokenizer=tokenizer,
-    )
+        return model

@@ -85,7 +85,7 @@ def tree_pformat(
     width: int = 80,
     indent: int = 2,
     short_arrays: bool = True,
-    struct_as_array: bool = False,
+    struct_as_array: bool = True,
     static: bool = True,
     truncate_leaf: Callable[[Any], bool] = _false,
 ) -> str:

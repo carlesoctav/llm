@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 import time
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Iterable
 
@@ -32,10 +33,20 @@ from jaxformers.checkpointing import (
 )
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
+from jaxformers.distributed.parallel import (
+    make_logical_axis_rules,
+    make_mesh,
+    with_logical_axis,
+)
 from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
-from jaxformers.modeling_utils import logical_to_physical, Model
+from jaxformers.modeling_utils import (
+    TrainState,
+    get_model_config,
+    logical_to_physical,
+)
 from jaxformers.models import make_model
+from jaxformers.models import model_accepts_kwarg
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
@@ -44,6 +55,19 @@ from jaxformers.sws_utils import run as sws_run
 
 DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
 DEFAULT_AUX = {"loss": (0.0, 0), "token": 0, "batch": 0}
+
+
+@contextmanager
+def train_state_context(train_state: TrainState):
+    with jax.set_mesh(train_state.mesh), with_logical_axis(train_state.rule):
+        yield
+
+
+def get_lm_head_weight(weights):
+    config = get_model_config(weights)
+    if config.tie_word_embeddings:
+        return weights.model.embed_tokens.weight
+    return weights.lm_head.weight
 
 
 def _preparse_absl_flags() -> None:
@@ -74,9 +98,10 @@ def _preparse_absl_flags() -> None:
     flags.FLAGS(sys.argv, known_only=True)
 
 
-def predict_fn(model: Model, batch):
-    hidden = model.forward(model.weights, **batch["inputs"])
-    return model.unembed(model.weights, hidden)
+def predict_fn(model: TrainState, batch):
+    with train_state_context(model):
+        hidden = model.model(**batch["inputs"])
+        return model.model.unembed(hidden)
 
 
 def loss_fn(model, batch, rngs=None):
@@ -86,14 +111,12 @@ def loss_fn(model, batch, rngs=None):
     }
 
 
-def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
+def train_step(config: sws.FinalConfig, model: TrainState, batch, *, rngs):
     def loss_fn(train_weights, freeze_weights, batch, rngs):
         weights = tree_util.combine(train_weights, freeze_weights)
         forward_dtype = config.forward_dtype
 
-        hidden_states = model.forward(
-            weights, **batch["inputs"], rngs=rngs, dtype=forward_dtype
-        )
+        hidden_states = weights(**batch["inputs"], rngs=rngs, dtype=forward_dtype)
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
@@ -107,11 +130,14 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
                 # vocab weights; avoid forcing replication for the reference
                 # implementation to match Tunix's fsdp-sharded embed/lm_head.
                 jax.reshard(
-                    weights[model.lm_head_key],
-                    logical_to_physical(("none", "none"), model.config.sharding_rules),
+                    get_lm_head_weight(weights),
+                    logical_to_physical(
+                        ("none", "none"),
+                        get_model_config(weights).sharding_rules,
+                    ),
                 )
                 if (config.loss_impl or None) != "reference"
-                else weights[model.lm_head_key]
+                else get_lm_head_weight(weights)
             ),
             reduction="sum",
             weight=mask,
@@ -139,9 +165,9 @@ def train_step(config: sws.FinalConfig, model: Model, batch, *, rngs):
     inv_token_count = (1 / token_count).astype(config.forward_dtype)
     grad = jtu.tree_map(lambda g: g * inv_token_count, grad)
 
-    updates, nst = model.tx.update(grad, model.opt_state, model.weights)
+    updates, nst = model.tx.update(grad, model.opt_state, model.model)
 
-    nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
+    nweights = tree_util.apply_updates(model.model, updates, config.forward_dtype)
     next_model = dataclasses.replace(model, weights=nweights, opt_state=nst)
     callback_state = model.callback_state
     if model.callback_state is not None:
@@ -174,9 +200,9 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def train(
     config,
-    model: Model,
+    model: TrainState,
     train_ds: Iterable,
-    evaluators: list[Callable[[Model]]] | None = None,
+    evaluators: list[Callable[[TrainState]]] | None = None,
     logger: None = None,
     ckptr: CheckpointerWithInfo | None = None,
     *,
@@ -214,7 +240,7 @@ def train(
             batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
-                with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
+                with jax.named_scope("compile train step"), train_state_context(model):
 
                     @print_timing
                     def compile_train_step():
@@ -242,7 +268,7 @@ def train(
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                    jax.set_mesh(model.mesh),
+                    train_state_context(model),
                 ):
                     model, aux = train_step_fn(model, batch, rngs=step_rngs)
 
@@ -315,14 +341,30 @@ def main(config: sws.FinalConfig):
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
+        model_kwargs = config.model.to_dict()
+        parallel_dims = model_kwargs.pop("parallel_dims")
+        devices = model_kwargs.pop("devices") if "devices" in model_kwargs else None
+        multihost = (
+            model_kwargs.pop("multihost") if "multihost" in model_kwargs else False
+        )
+        rule = make_logical_axis_rules(
+            parallel_dims,
+            sequence_parallelism=model_kwargs["additional_config"][
+                "sequence_parallelism"
+            ],
+        )
+        mesh = make_mesh(parallel_dims, devices=devices, multihost=multihost)
+        if model_rngs is not None and model_accepts_kwarg(config.model_name, "rngs"):
+            model_kwargs["rngs"] = model_rngs
         model = make_model(
             config.model_name,
-            config.init_model,
-            config.model.to_dict(),
-            rngs=model_rngs,
+            mesh=mesh,
+            rule=rule,
+            **model_kwargs,
         )
+        model = TrainState(model, mesh, rule=rule)
 
-        with jax.set_mesh(model.mesh):
+        with train_state_context(model):
             scheduler_config = (
                 config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
             )
@@ -338,7 +380,11 @@ def main(config: sws.FinalConfig):
                 )
             model = dataclasses.replace(
                 model,
-                weights=model.prepare_weights(model.weights),
+                weights=(
+                    model.model.stack()
+                    if config.model.additional_config.weights_impl == "stack"
+                    else model.model
+                ),
             )
             model = make_optimizer(
                 config.optimizer_name,

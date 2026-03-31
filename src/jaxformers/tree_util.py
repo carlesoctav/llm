@@ -43,15 +43,15 @@ def combine(*val, is_leaf=None):
     return jtu.tree_map(_combine, *val, is_leaf=_is_leaf)
 
 
-def apply_updates(weights, updates, dtype):
-    def _f(w, u):
+def apply_updates(model, updates):
+    def _f(m, u):
         if u is None:
-            return w
+            return m
         else:
-            return (w + u).astype(dtype)
+            return (m + u).astype(jnp.asarray(m).dtype)
 
     is_none = lambda x: x is None
-    return jtu.tree_map(_f, weights, updates, is_leaf=is_none)
+    return jtu.tree_map(_f, model, updates, is_leaf=is_none)
 
 
 def _optimizer_entrystr(key: KeyEntry) -> str:

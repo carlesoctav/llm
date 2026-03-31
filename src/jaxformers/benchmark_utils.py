@@ -58,7 +58,7 @@ def print_timing(wrapped, name: str | None = None):
     return wrapper
 
 
-def print_train_state_size(model):
+def print_train_state_size(train_state):
     def dtype_multiplier(dtype):
         if dtype in (jnp.float32, jnp.int32):
             return 4
@@ -79,12 +79,12 @@ def print_train_state_size(model):
         print(f"tree {name} use {p / 1e9} GB")
         return p
 
-    train_weights, freeze_weights= jaxformers.tree_util.partition(
-        model.weights, model.train_mask
+    train_model, freeze_model= jaxformers.tree_util.partition(
+        train_state.model, train_state.train_mask
     )
 
     p = 0
-    p += sum("train_weights", train_weights)
-    p += sum("freeze_weights", freeze_weights)
-    p += sum("opt_state", model.opt_state)
+    p += sum("train_model", train_model)
+    p += sum("freeze_model", freeze_model)
+    p += sum("opt_state", train_state.opt_state)
     print(f"Total Model use {p / 1e9} GB")

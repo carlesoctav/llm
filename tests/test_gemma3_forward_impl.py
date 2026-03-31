@@ -41,7 +41,7 @@ def test_gemma3_forward_impls_match_on_small_config():
     attention_mask = jnp.ones_like(input_ids)
 
     loop_hidden = model.forward(
-        model.weights,
+        model.model,
         input_ids=input_ids,
         attention_mask=attention_mask,
         dtype=jnp.float32,
@@ -55,7 +55,7 @@ def test_gemma3_forward_impls_match_on_small_config():
         }
         impl_weights = gemma3.prepare_weights(
             impl_config,
-            model.weights,
+            model.model,
         )
         impl_hidden = gemma3.forward(
             impl_config,
@@ -153,7 +153,7 @@ def test_init_accepts_model_id_without_explicit_config(monkeypatch):
 
     assert called_with == ["google/gemma-3-1b-it"]
     assert model.config is config
-    assert model.weights["model.embed_tokens.weight"].shape == (
+    assert model.model["model.embed_tokens.weight"].shape == (
         config.vocab_size,
         config.hidden_size,
     )

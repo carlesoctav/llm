@@ -7,7 +7,7 @@ import orbax.checkpoint.experimental.v1 as ocp
 from etils import epath
 
 from jaxformers import tree_util
-from jaxformers.modeling_utils import Model
+from jaxformers.modeling_utils import TrainState, get_model_config
 from jaxformers.print_utils import tree_pformat, tree_pprint
 
 
@@ -46,7 +46,7 @@ class CheckpointerWithInfo:
     def close(self):
         self.ckptr.close()
 
-    def load_checkpoint(self, model: Model) -> Model:
+    def load_checkpoint(self, model: TrainState) -> TrainState:
         if self.ckptr.latest is None:
             print("This is a new checkpoint; nothing will be loaded.")
             return model
@@ -54,7 +54,7 @@ class CheckpointerWithInfo:
         abstract = {}
         checkpoint = None
         # target = self.ckptr.checkpointables_metadata().metadata.keys()
-        target = ["weights", "opt_state"]
+        target = ["model", "opt_state"]
         info = self.ckptr.root_metadata().custom_metadata
         if info.get("save_only_trainable"):
             print("Checkpoint metadata indicates 'save_only_trainable=True'.")
@@ -80,7 +80,12 @@ class CheckpointerWithInfo:
 
         return dataclasses.replace(model, **checkpoint, step=self.ckptr.latest.step)
 
-    def save_checkpoint(self, step: int, model: Model, data: Iterator | None = None):
+    def save_checkpoint(
+        self,
+        step: int,
+        train_state: TrainState,
+        data: Iterator | None = None,
+    ):
         if step in [c.step for c in self.ckptr.checkpoints]:
             print(
                 f"Step {step} already exists; this is expected when resuming from a checkpoint (with config.checkpoint). Skipping save for step {step}."
@@ -89,24 +94,24 @@ class CheckpointerWithInfo:
 
         if step == 0:
             checkpointables = {
-                "weights": model.weights,
-                "opt_state": model.opt_state,
-                "train_mask": model.train_mask,
+                "model": train_state.model,
+                "opt_state": train_state.opt_state,
+                "train_mask": train_state.train_mask,
             }
 
         else:
-            trainable, _ = tree_util.partition(model.weights, model.train_mask)
+            trainable, _ = tree_util.partition(train_state.model, train_state.train_mask)
             checkpointables = {
-                "weights": trainable,
-                "opt_state": model.opt_state,
-                "train_mask": model.train_mask,
+                "model": trainable,
+                "opt_state": train_state.opt_state,
+                "train_mask": train_state.train_mask,
             }
 
         return self.ckptr.save_checkpointables_async(step, checkpointables)
 
 
 def make_checkpointer(
-    model: Model,
+    train_state: TrainState,
     path: str,
     save_interval_steps: int,
     max_to_keep: int | None = None,
@@ -131,9 +136,9 @@ def make_checkpointer(
                 )
         for item in things_to_check_pytree:
             existing, existing_treedef = jax.tree.flatten(old_ocp.load_checkpointables(
-                    0, {item: tree_util.to_abstract(getattr(model, item))}
+                    0, {item: tree_util.to_abstract(getattr(train_state, item))}
                 )[item])
-            requested, requested_treedef= jax.tree.flatten(getattr(model, item))
+            requested, requested_treedef= jax.tree.flatten(getattr(train_state, item))
             if requested_treedef != existing_treedef:
                 raise ValueError(
                     f"Structure mismatch for checkpoint item '{item}' in the existing checkpoint at {path}."
@@ -147,15 +152,15 @@ def make_checkpointer(
                     f"which does not match the requested {item} leaves={tree_pformat(requested)}. "
                     "Please use a matching configuration or remove the existing checkpoint."
                 )
-    if model.train_mask is None and save_only_trainable:
+    if train_state.train_mask is None and save_only_trainable:
         raise ValueError(
             "save_only_trainable=True was requested but the model has no train_mask. "
             "Provide a valid model.train_mask indicating which parameters are trainable, "
             "or set save_only_trainable=False."
         )
 
-    if model.train_mask is not None and save_only_trainable:
-        leave = jax.tree.leaves(model.train_mask)
+    if train_state.train_mask is not None and save_only_trainable:
+        leave = jax.tree.leaves(train_state.train_mask)
         trainable_size = sum(leave)
         print(f"save only {trainable_size} / {len(leave)} params")
         if max_to_keep:
@@ -170,7 +175,7 @@ def make_checkpointer(
         "save_internal_steps": save_interval_steps,
         "max_to_keep": max_to_keep,
         "save_only_trainable": save_only_trainable,
-        "config": model.config.to_diff_dict(),
+        "config": get_model_config(train_state.model).to_diff_dict(),
     }
 
     ckptr = ocp.training.Checkpointer(
@@ -194,11 +199,11 @@ def is_used_checkpoint(path):
 
 
 def load_checkpoint_from_path(
-    model: Model,
+    train_state: TrainState,
     path: str,
-    target: list[str] = ["weights", "opt_state"],
+    target: list[str] = ["model", "opt_state"],
     step: int | None = None,
-) -> Model:
+) -> TrainState:
     abstract = {}
     ckptr = ocp.training.Checkpointer(path)
     info = ckptr.root_metadata().custom_metadata
@@ -208,10 +213,10 @@ def load_checkpoint_from_path(
             f"Loading static (non-trainable) weights from step 0 and trainable weights from step {step if step is not None else ckptr.latest.step} from the checkpoint at {path}."
         )
         for t in target:
-            abstract[t] = tree_util.to_abstract(getattr(model, t))
+            abstract[t] = tree_util.to_abstract(getattr(train_state, t))
         checkpoint_0 = ckptr.load_checkpointables(0, abstract)
         for t in target:
-            abstract[t] = tree_util.to_abstract(getattr(model, t))
+            abstract[t] = tree_util.to_abstract(getattr(train_state, t))
 
         checkpoint_N = ckptr.load_checkpointables(step, abstract)
         checkpoint = tree_util.combine(checkpoint_N, checkpoint_0)
@@ -220,11 +225,11 @@ def load_checkpoint_from_path(
             f"Loading {target} from step {step if step is not None else ckptr.latest.step} at {path}"
         )
         for t in target:
-            abstract[t] = tree_util.to_abstract(getattr(model, t))
+            abstract[t] = tree_util.to_abstract(getattr(train_state, t))
         checkpoint = ckptr.load_checkpointables(step, abstract)
 
     print(
         f"Replacing attributes {target} on the model with values loaded from the checkpoint."
     )
-    model = dataclasses.replace(model, **checkpoint, step = 300)
-    return model
+    train_state = dataclasses.replace(train_state, **checkpoint)
+    return train_state

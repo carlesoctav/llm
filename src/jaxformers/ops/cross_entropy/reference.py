@@ -30,11 +30,11 @@ def cross_entropy_reference(
         w,
         precision=precision,
         preferred_element_type=jnp.float32,
+        out_sharding=from_logical_rules(("batch", None))
     )
     if logit_soft_cap is not None:
         logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap
 
-    logits = reshard(logits, from_logical_rules("batch", None))
     loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
     lse = jax.nn.logsumexp(logits, axis=-1)
 

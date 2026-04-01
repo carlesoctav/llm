@@ -18,7 +18,7 @@ def get_config():
     config.grad_accum = 4
     config.weights_impl = "stack"
 
-    config.parallel.sequence_paralellism = True
+    config.parallel.sequence_paralellism = False
     config.parallel.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.parallel.devices = lambda: jax.devices()
     config.parallel.multihost = False

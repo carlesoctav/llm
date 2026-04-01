@@ -112,6 +112,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
         batch_size = batch["labels"].shape[0]
         aux = {"loss": (loss, count), "token": count, "batch": batch_size}
         return loss, aux
+
     if config.grad_accum > 1:
         microbatch_size = batch["labels"].shape[0] // config.grad_accum
         grad_fn = microbatch(

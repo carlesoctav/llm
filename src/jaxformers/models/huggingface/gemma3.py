@@ -498,9 +498,11 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
                 self.layers.unstack()
                 if isinstance(self.layers, StackModule)
                 else self.layers
-            )
+        )
+            fwd = jax.remat(Gemma3Layer.__call__) if layers[0].remat else Gemma3Layer.__call__
             for layer, attention_type in zip(layers, self.config.layer_types):
-                x = layer(
+                x = fwd(
+                    layer,
                     x,
                     rope_theta=self.config.rope_parameters[attention_type][
                         "rope_theta"

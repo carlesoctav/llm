@@ -7,6 +7,9 @@ import tokamax
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
 
 from jaxformers.ops.attention import chunked_manual_dot_product_attention
+from jaxformers.ops.attention.xla_chunked import (
+    TokamaxRematXlaChunkedDotProductAttention,
+)
 from jaxformers.utils import GeneralInterface
 
 
@@ -17,6 +20,7 @@ class AttentionImpl(Protocol):
         value: Float[Array, "B S K H"],
         bias: Array | None = None,
         mask: Bool[Array, " B #N T S"] | None = None,
+        *,
         q_sharding: jax.NamedSharding | None = None,
         **kwargs,
     ): ...
@@ -101,7 +105,7 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
         # Historically, "xla_chunked" referred to Tokamax's chunked XLA attention.
         # In this codebase we instead map it to the manual chunked implementation,
         # because Tokamax's xla_chunked backward can have very large temp memory.
-        "xla_chunked": chunked_manual_dot_product_attention,
+        "xla_chunked": partial(tokamax.dot_product_attention, implementation = TokamaxRematXlaChunkedDotProductAttention(chunk_size=(1024, 2048))),
         "chunked_manual": chunked_manual_dot_product_attention,
     }
 

@@ -32,7 +32,9 @@ def get_config():
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
 
-    config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
+    config.callback.log_grad_norm = {}
+    config.callback.log_learning_rate = {}
+    config.callback.profiler.path = "/mnt/carles/llm/trace/debug-remat-attention/no-remat-scan-bug"
     config.callback.log_performance.real_step_threshold = 0
     config.callback.log_performance.denom_keys = ["token"]
 

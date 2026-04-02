@@ -8,25 +8,19 @@ from .base import callback_chain
 
 @print_timing
 def make_callbacks(
-    callback_names: str | list[str],
-    callback_config: dict,
+    callback_configs: dict,
 ):
     callbacks = []
-    if isinstance(callback_names, list):
-        for single_callback_name in callback_names:
+    for name, callback_kwargs in callback_configs.items():
+        if callback_kwargs:
             callback_module = importlib.import_module(
-                f"jaxformers.callbacks.{single_callback_name}"
+                f"jaxformers.callbacks.{name}"
             )
-            callback_kwargs = callback_config.get(single_callback_name, {})
             callbacks.append(callback_module.make(**callback_kwargs))
-        return callback_chain(*callbacks)
-    elif isinstance(callback_names, str):
-        single_callback_name = callback_names
-        callback_module = importlib.import_module(
-            f"jaxformers.callbacks.{single_callback_name}"
-        )
-        callback_kwargs = (
-            callback_config.get(single_callback_name, {}) or callback_config
-        )
-        callback = callback_module.make(**callback_kwargs)
-        return callback
+        else:
+            print(
+                f"Callback '{name}' is present in config.callback but its value is None, "
+                f"so it will be ignored. To enable this callback with the default configuration, "
+                f"set config.callback.{name} = {{}}."
+            )
+    return callback_chain(*callbacks)

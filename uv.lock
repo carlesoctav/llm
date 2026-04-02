@@ -1433,6 +1433,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "wandb" },
+    { name = "xprof" },
 ]
 
 [package.dev-dependencies]
@@ -1462,6 +1463,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=5.0.0" },
     { name = "wandb", specifier = ">=0.25.0" },
+    { name = "xprof", specifier = ">=2.22.0" },
 ]
 
 [package.metadata.requires-dev]

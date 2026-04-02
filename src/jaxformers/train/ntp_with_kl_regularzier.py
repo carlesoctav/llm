@@ -5,7 +5,7 @@ import sys
 import time
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -34,16 +34,14 @@ from jaxformers.checkpoint_utils import (
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
 from jaxformers.distributed.parallel import (
+    from_logical_rules,
     make_logical_axis_rules,
     make_mesh,
     with_logical_axis,
 )
+from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
-from jaxformers.modeling_utils import (
-    TrainState,
-    get_model_config,
-    logical_to_physical,
-)
+from jaxformers.modeling_utils import TrainState
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
@@ -81,12 +79,18 @@ def train_state_context(train_state: TrainState):
         yield
 
 
-def get_lm_head_weight(weights):
-    config = get_model_config(weights)
-    if config.tie_word_embeddings:
-        return weights.model.embed_tokens.weight
-    return weights.lm_head.weight
+def predict_fn(train_state: TrainState, batch):
+    with train_state_context(train_state):
+        hidden = train_state.model(**batch["inputs"])
+        return train_state.model.unembed(hidden)
 
+
+def loss_fn(model, batch, rngs=None):
+    del rngs
+    logits = predict_fn(model, batch)
+    return {
+        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
+    }
 
 def _preparse_absl_flags() -> None:
     """Avoid absl.flags crashing on this script's CLI args.
@@ -185,14 +189,11 @@ def train_step(
                 # vocab weights; avoid forcing replication for the reference
                 # implementation to match Tunix's fsdp-sharded embed/lm_head.
                 jax.reshard(
-                    get_lm_head_weight(weights),
-                    logical_to_physical(
-                        ("none", "none"),
-                        get_model_config(weights).sharding_rules,
-                    ),
+                    weights.lm_head_w,
+                    from_logical_rules(("none", "none")),
                 )
                 if (config.loss_impl or None) != "reference"
-                else get_lm_head_weight(weights)
+                else weights.lm_head_w
             ),
             reduction="sum",
             mask=mask,
@@ -269,10 +270,6 @@ def train_step(
     return dataclasses.replace(next_model, callback_state=callback_state), aux
 
 
-def eval(model, eval_ds):
-    raise NotImplementedError
-
-
 def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
     def to_py(value: Any) -> Any:
         value = jax.device_get(value)
@@ -290,8 +287,8 @@ def train(
     model: TrainState,
     base_model: TrainState | None,
     train_ds: Iterable,
-    eval_ds,
-    logger,
+    evaluators: dict[str, Callable[[TrainState], Any]] | None = None,
+    logger=None,
     ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
@@ -299,7 +296,7 @@ def train(
     train_iterator = iter(train_ds)
     step = model.step or 0
     global_aux = dict(DEFAULT_AUX)
-    skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
+    skip_eval = config.eval_every is None or evaluators is None
     first_step = True
 
     to_log_later = {}
@@ -321,7 +318,9 @@ def train(
             if ckptr is not None:
                 ckptr.save_checkpoint(step, model, train_iterator)
             if not skip_eval and (step % config.eval_every) == 0:
-                eval_aux = eval(model, eval_ds)
+                eval_process = {}
+                for name, evaluator in evaluators.items():
+                    eval_process[name] = evaluator(model)
 
             batch = next(train_iterator)
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
@@ -418,10 +417,11 @@ def train(
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    do_callback = getattr(config, "callback_name", None)
+    do_callback = getattr(config, "callback", None)
     do_load_state = getattr(config, "load_state", None)
     do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
+    do_eval = getattr(config, "eval", None)
 
     logger = None
     if jax.process_index() == 0:
@@ -487,9 +487,7 @@ def main(config: sws.FinalConfig):
                 base_model = tree_util.copy(base_model)
 
             if do_callback:
-                callbacks = make_callbacks(
-                    config.callback_name, config.callback.to_dict()
-                )
+                callbacks = make_callbacks(config.callback.to_dict())
                 model = dataclasses.replace(
                     model,
                     callback_state=callbacks.init(model),
@@ -504,22 +502,29 @@ def main(config: sws.FinalConfig):
                     )
                 model = load_checkpoint_from_path(model, **config.load_state.to_dict())
 
-        ckptr = None
-        if do_checkpoint:
-            ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
-            model = ckptr.load_checkpoint(model)
+            ckptr = None
+            if do_checkpoint:
+                ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
+                model = ckptr.load_checkpoint(model)
 
-        train_ds = make_data(
-            config.data.to_dict(),
-            mesh=model.mesh,
-        )
-        eval_ds = None
+            train_ds = make_data(
+                config.data.to_dict(),
+                mesh=model.mesh,
+            )
+
+            evaluators = None
+            if do_eval:
+                evaluators = make_eval(
+                    config.eval.to_dict(),
+                    {"predict": predict_fn, "loss": loss_fn},
+                )
+
         _, metrics = train(
             config,
             model,
             base_model,
             train_ds,
-            eval_ds,
+            evaluators,
             logger,
             ckptr,
             rngs=train_rngs,

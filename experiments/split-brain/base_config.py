@@ -21,8 +21,6 @@ DEFAULT_LORA_PATHS = [
 def get_config():
     config = sws.Config()
 
-    config.skip_eval = True
-
     config.exp_name = "gemma3-1b-it-lora-kl"
     config.project_name = "split-brain"
     config.dir = "gs://carles-git-good"
@@ -42,8 +40,6 @@ def get_config():
     config.logger_name = "noop"
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
-
-    config.callback_name = []
 
     config.checkpoint.save_interval_steps = 100
     config.checkpoint.max_to_keep = 1
@@ -68,20 +64,23 @@ def get_config():
     config.lora.alpha = 512
     config.lora.weights_path = list(DEFAULT_LORA_PATHS)
 
+    ds_name = "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages"
+    chat_template_path = str(ROOT / "temp/think.jinja")
+
     config.data.loader.combine = "zip"
     config.data.loader.shard = False
     config.data.loader.seed = 42
 
     config.data.sft.source.load_kwargs = [
         {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
+            "path": ds_name,
             "split": "train",
         }
     ]
     config.data.sft.source.streaming = False
     config.data.kl.source.load_kwargs = [
         {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
+            "path": ds_name,
             "split": "train",
         }
     ]
@@ -95,7 +94,7 @@ def get_config():
     )
     config.data.sft.transforms.data_type = "chat"
     config.data.sft.transforms.assistant_loss = True
-    config.data.sft.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.sft.transforms.chat_template_path = chat_template_path
     config.data.sft.transforms.packing = False
     config.data.sft.transforms.packing_bins = 64
 
@@ -107,7 +106,7 @@ def get_config():
     )
     config.data.kl.transforms.data_type = "chat"
     config.data.kl.transforms.assistant_loss = True
-    config.data.kl.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.kl.transforms.chat_template_path = chat_template_path
     config.data.kl.transforms.packing = False
     config.data.kl.transforms.packing_bins = 64
 

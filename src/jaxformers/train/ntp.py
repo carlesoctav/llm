@@ -105,7 +105,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
             hidden_states,
             labels,
             model.lm_head_w,
-            mask = mask,
+            mask=mask,
             implementation=config.loss_impl,
         )
 
@@ -213,9 +213,8 @@ def train(
                         return lower.compile()
 
                     train_step_fn = compile_train_step()
-                    memory_stats = print_compiled_memory_stats(
-                        train_step_fn.memory_analysis()
-                    )
+                    compiled_memory_stats = train_step_fn.memory_analysis()
+                    memory_stats = print_compiled_memory_stats(compiled_memory_stats)
                     cost = print_flops(train_step_fn.cost_analysis())
 
                     to_log_later.update(memory_stats)
@@ -291,7 +290,7 @@ def train(
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    do_callback = getattr(config, "callback_name", None)
+    do_callback = getattr(config, "callback", None)
     do_load_state = getattr(config, "load_state", None)
     do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
@@ -351,9 +350,7 @@ def main(config: sws.FinalConfig):
             print_train_state_size(train_state)
 
             if do_callback:
-                callbacks = make_callbacks(
-                    config.callback_name, config.callback.to_dict()
-                )
+                callbacks = make_callbacks(config.callback.to_dict())
                 train_state = dataclasses.replace(
                     train_state,
                     callback_state=callbacks.init(train_state),

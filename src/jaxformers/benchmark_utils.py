@@ -21,11 +21,12 @@ def print_compiled_memory_stats(compiled_stats):
     argument_gb = bytes_to_gb(compiled_stats.argument_size_in_bytes)
     alias_gb = bytes_to_gb(compiled_stats.alias_size_in_bytes)
     host_temp_gb = bytes_to_gb(compiled_stats.host_temp_size_in_bytes)
+    peak_gb = bytes_to_gb(compiled_stats.peak_memory_in_bytes)
     total_gb = output_gb + temp_gb + argument_gb - alias_gb
 
     print(
         f"Total memory size: {total_gb:.1f} GB, Output size: {output_gb:.1f} GB, Temp size: {temp_gb:.1f} GB, "
-        f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB.",
+        f"Argument size: {argument_gb:.1f} GB, Host temp size: {host_temp_gb:.1f} GB, Peak size: {peak_gb:.1f} GB.",
         f"Alias size: {alias_gb:.1f} GB",
     )
 
@@ -36,6 +37,7 @@ def print_compiled_memory_stats(compiled_stats):
         "argument_gb": round(argument_gb, 1),
         "host_temp_gb": round(host_temp_gb, 1),
         "alias_gb": round(alias_gb, 1),
+        "peak_gb": round(peak_gb, 1),
     }
 
 

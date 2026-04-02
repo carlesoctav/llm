@@ -33,12 +33,6 @@ from jaxformers.checkpoint_utils import (
 )
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
-from jaxformers.distributed.parallel import (
-    from_logical_rules,
-    make_logical_axis_rules,
-    make_mesh,
-    with_logical_axis,
-)
 from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import TrainState
@@ -46,6 +40,12 @@ from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
+from jaxformers.sharding_utils import (
+    from_logical_rules,
+    make_logical_axis_rules,
+    make_mesh,
+    with_logical_axis,
+)
 from jaxformers.sws_utils import run as sws_run
 
 

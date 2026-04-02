@@ -14,8 +14,8 @@ from safetensors import safe_open
 from transformers import AutoConfig, PreTrainedConfig
 
 from jaxformers import tree_util
-from jaxformers.distributed.parallel import get_logical_axis_rules
 from jaxformers.scan_utils import make_scan_fwd
+from jaxformers.sharding_utils import get_logical_axis_rules
 
 
 M = TypeVar("M", bound=eqx.Module)

@@ -7,13 +7,13 @@ from tabulate import tabulate
 
 from jaxformers.attention_utils import ATTENTION_INTERFACE
 from jaxformers.benchmark_utils import print_compiled_memory_stats
-from jaxformers.distributed.parallel import (
+from jaxformers.masking_utils import make_causal_mask
+from jaxformers.sharding_utils import (
     from_logical_rules,
     make_logical_axis_rules,
     make_mesh,
     with_logical_axis,
 )
-from jaxformers.masking_utils import make_causal_mask
 
 
 @jax.custom_vjp

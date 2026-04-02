@@ -1,14 +1,13 @@
-from jaxformers.distributed.parallel import from_logical_rules
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 import optax
-from jax import P, reshard
 from jaxtyping import Array, Float, Int
 
 from jaxformers.dispatch import einsum
 from jaxformers.ops.cross_entropy.config import BlockSizes
+from jaxformers.sharding_utils import from_logical_rules
 
 
 @partial(jax.jit, static_argnames=["block_sizes", "dtype", "precision"])

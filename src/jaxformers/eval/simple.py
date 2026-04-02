@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from jaxformers import metric_utils
 from jaxformers.data import make_eval_data
-from jaxformers.distributed.parallel import with_logical_axis
+from jaxformers.sharding_utils import with_logical_axis
 
 
 def _check_shape(shape, tree):

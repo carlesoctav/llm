@@ -14,7 +14,7 @@ from jax.sharding import Mesh, PartitionSpec
 
 from jaxformers.data.loader._group import prepare_group
 from jaxformers.data.transforms.base import TransformFn
-from jaxformers.distributed.parallel import BATCH
+from jaxformers.sharding_utils import BATCH
 
 
 Batch = tp.Any

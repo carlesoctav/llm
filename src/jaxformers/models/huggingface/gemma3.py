@@ -10,7 +10,6 @@ from transformers import Gemma3Config
 
 from jaxformers.attention_utils import ATTENTION_INTERFACE
 from jaxformers.dispatch.einsum import einsum
-from jaxformers.distributed import from_logical_rules
 from jaxformers.masking_utils import (
     ATTENTION_MASK_INTERFACE,
     make_causal_mask,
@@ -24,6 +23,7 @@ from jaxformers.module_utils import (
     StackModule,
 )
 from jaxformers.nn import Embedding, Linear
+from jaxformers.sharding_utils import from_logical_rules
 
 
 def get_layer_metadata(config: Gemma3Config) -> tuple[jax.Array, jax.Array]:

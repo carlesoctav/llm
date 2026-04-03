@@ -1,3 +1,5 @@
+from jaxformers.tree_util import get_by_path
+from jaxformers.print_utils import tree_pprint
 import abc
 import dataclasses
 from contextlib import ExitStack
@@ -10,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 from huggingface_hub import snapshot_download
+from jaxtyping import PRNGKeyArray
 from safetensors import safe_open
 from transformers import AutoConfig, PreTrainedConfig
 
@@ -18,14 +21,23 @@ from jaxformers.scan_utils import make_scan_fwd
 from jaxformers.sharding_utils import get_logical_axis_rules
 
 
+default_init = jax.nn.initializers.variance_scaling(
+    1 / 3.0, "fan_in", "uniform", in_axis=-1, out_axis=-2, batch_axis=()
+)
+
+
 M = TypeVar("M", bound=eqx.Module)
+
+
 class ForwardImpl(StrEnum):
     LOOP = auto()
     SCAN_LAYER = auto()
 
+
 class StackImpl(StrEnum):
     STACK = auto()
     FREE = auto()
+
 
 class AdditionalConfig(TypedDict):
     remat_layer: bool
@@ -225,10 +237,9 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
         additional_config: AdditionalConfig | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
-        rngs=None,
+        rngs,
     ):
-        if rngs is None:
-            rngs = jax.random.key(0)
+        model_rngs, missing_rngs = jax.random.split(rngs)
         additional_config = {
             **DEFAULT_ADDITIONAL_CONFIG,
             **(additional_config or {}),
@@ -254,7 +265,7 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
                 lambda: cls(
                     config,
                     additional_config,
-                    rngs=rngs,
+                    rngs=model_rngs,
                     param_dtype=param_dtype,
                 )
             )
@@ -279,6 +290,7 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
                 "left as default-initialized:",
                 *sorted(missing_key),
             )
+            model = init_missing_module(model, missing_key, rngs=missing_rngs)
 
         if not_used_key := safetensor_key - used_key:
             print(
@@ -287,4 +299,18 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
                 "(for example, one with an added classification head). Please review whether this is an expected outcome:",
                 *not_used_key,
             )
+
         return model
+
+
+def init_missing_module(model, missing_key, *, rngs: PRNGKeyArray):
+    counter = 0
+    def f(path, leaf):
+        nonlocal counter
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+            array = default_init(jax.random.fold_in(rngs, counter), leaf.shape, out_sharding = leaf.sharding.spec, dtype = leaf.dtype)
+            counter+=1
+            return array
+        else:
+            return leaf
+    return jax.tree.map_with_path(f, model)

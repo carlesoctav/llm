@@ -30,8 +30,8 @@ class Linear(eqx.Module):
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
         use_bias: bool,
-        out_sharding: P | None,
-        w_sharding: P | None,
+        out_sharding: P | None = None,
+        w_sharding: P | None = None,
     ):
         self.in_features = in_features
         self.out_features = out_features

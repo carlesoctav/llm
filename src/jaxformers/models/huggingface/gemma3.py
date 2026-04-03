@@ -613,3 +613,43 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
             out_sharding=from_logical_rules(("batch", "context", "model")),
             preferred_element_type=jnp.float32,
         )
+
+class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
+    config: Gemma3Config = eqx.field(static = True)
+    model: Gemma3Model
+    score: Linear
+    num_labels: int = eqx.field(static = True)
+
+    def __init__(
+        self,
+        config: Gemma3Config,
+        additional_config: AdditionalConfig,
+        *,
+        rngs: PRNGKeyArray,
+        param_dtype: jnp.dtype,
+        store_config: bool = True,
+    ):
+        self.config = config
+        model_rngs, score_rngs = jax.random.split(rngs)
+        self.num_labels = config.num_labels or additional_config.num_labels
+        self.model = Gemma3Model(
+            config,
+            additional_config,
+            rngs=model_rngs,
+            param_dtype=param_dtype,
+            store_config=store_config,
+        )
+        self.score = Linear(config.hidden_size, self.num_labels, use_bias=False, param_dtype = param_dtype, rngs = score_rngs)
+
+    def __call__(
+        self,
+        input_ids: Int[Array, "B T"],
+        pos: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        *,
+        rngs: PRNGKeyArray | None = None,
+        **inputs,
+    ):
+        hidden_states = self.model( input_ids, pos, dtype, rngs = rngs, **inputs )
+        output = self.score(hidden_states)
+        return output

@@ -301,10 +301,8 @@ def main(config: sws.FinalConfig):
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
-        rngs = jax.random.key(config.seed) if config.seed else None
-        model_rngs, lora_rngs, train_rngs = (
-            jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
-        )
+        rngs = jax.random.key(config.seed)
+        model_rngs, lora_rngs, train_rngs = jax.random.split(rngs, 3)
         rule = make_logical_axis_rules(**config.parallel.to_dict())
         mesh = make_mesh(**config.parallel.to_dict())
         with jax.set_mesh(mesh), with_logical_axis(rule):

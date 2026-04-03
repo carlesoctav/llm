@@ -1,34 +1,51 @@
-import dataclasses
 import importlib
-from enum import auto, StrEnum
-
-from jaxtyping import PRNGKeyArray
+import inspect
+import os
+from collections.abc import Callable
+from typing import Any
 
 from jaxformers.benchmark_utils import print_timing
 
 
-class InitMethod(StrEnum):
-    PRETRAINED = auto()
-    RANDOM = auto()
-    PYTREE = auto()
+MODEL_DIR = os.environ.get("MODEL_DIR", "jaxformers.models")
+
+
+def resolve_model_target(model_name: str | Callable[..., Any]) -> Callable[..., Any]:
+    if callable(model_name):
+        return model_name
+
+    parts = model_name.split(".")
+    for i in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:i])
+        module_name = f"{MODEL_DIR}.{module_name}"
+        try:
+            target = importlib.import_module(module_name)
+            break
+        except ModuleNotFoundError:
+            continue
+    else:
+        raise ValueError(f"Could not resolve model target {model_name!r}")
+
+    for attr in parts[i:]:
+        target = getattr(target, attr)
+
+    if not callable(target):
+        raise TypeError(f"Model target {model_name!r} is not callable")
+
+    return target
+
+
+def model_accepts_kwarg(model_name: str | Callable[..., Any], kwarg_name: str) -> bool:
+    signature = inspect.signature(resolve_model_target(model_name))
+
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+
+    return kwarg_name in signature.parameters
 
 
 @print_timing
-def make_model(
-    model_name: str,
-    init_method: str | None,
-    model_config: dict,
-    *,
-    rngs: PRNGKeyArray | None = None,
-):
-    model_module = importlib.import_module(f"jaxformers.models.{model_name}")
-
-    if init_method is None or init_method == InitMethod.PRETRAINED:
-        model = model_module.load(**model_config)
-    elif init_method == InitMethod.RANDOM:
-        model = model_module.init(**model_config, rngs=rngs)
-    elif init_method == InitMethod.PYTREE:
-        model = model_module.load_pytree(**model_config)
-    else:
-        raise ValueError(f"Unsupported model init method: {init_method!r}")
-    return model
+def make_model(model_name: str | Callable[..., Any], *model_args, **model_kwargs):
+    model_factory = resolve_model_target(model_name)
+    return model_factory(*model_args, **model_kwargs)

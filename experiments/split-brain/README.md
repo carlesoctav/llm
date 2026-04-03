@@ -1,6 +1,6 @@
 # split-brain
 
-Goal: run SFT with KL regularization via `src/jaxformers/train/ntp_with_kl_regularzier.py`.
+Goal: run the split-brain setup with `src/jaxformers/train/ntp_with_kl_regularzier.py`.
 
 Status: config scaffolded; no runs recorded yet.
 

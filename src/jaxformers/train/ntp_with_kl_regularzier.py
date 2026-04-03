@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import dataclasses
 import sys
 import time
+from contextlib import contextmanager
 from functools import partial
-from typing import Any
+from typing import Any, Callable, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -22,15 +25,27 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.checkpointing import make_checkpointer, save_checkpoint
+from jaxformers.checkpoint_utils import (
+    CheckpointerWithInfo,
+    is_used_checkpoint,
+    load_checkpoint_from_path,
+    make_checkpointer,
+)
 from jaxformers.data import make_data
 from jaxformers.dispatch.lora import make_lora
+from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
-from jaxformers.modeling_utils import logical_to_physical, Model
+from jaxformers.modeling_utils import TrainState
 from jaxformers.models import make_model
 from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
+from jaxformers.sharding_utils import (
+    from_logical_rules,
+    make_logical_axis_rules,
+    make_mesh,
+    with_logical_axis,
+)
 from jaxformers.sws_utils import run as sws_run
 
 
@@ -57,6 +72,25 @@ DEFAULT_AUX = {
     "kl.batch": 0,
 }
 
+
+@contextmanager
+def train_state_context(train_state: TrainState):
+    with jax.set_mesh(train_state.mesh), with_logical_axis(train_state.rule):
+        yield
+
+
+def predict_fn(train_state: TrainState, batch):
+    with train_state_context(train_state):
+        hidden = train_state.model(**batch["inputs"])
+        return train_state.model.unembed(hidden)
+
+
+def loss_fn(model, batch, rngs=None):
+    del rngs
+    logits = predict_fn(model, batch)
+    return {
+        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
+    }
 
 def _preparse_absl_flags() -> None:
     """Avoid absl.flags crashing on this script's CLI args.
@@ -87,7 +121,12 @@ def _preparse_absl_flags() -> None:
 
 
 def train_step(
-    config: sws.FinalConfig, model: Model, base_model: Model | None, batch, *, rngs
+    config: sws.FinalConfig,
+    model: TrainState,
+    base_model: TrainState | None,
+    batch,
+    *,
+    rngs,
 ):
     sft_batch, kl_batch = batch
 
@@ -97,29 +136,28 @@ def train_step(
         count = jnp.sum(kl_batch["loss_mask"])
         mask = kl_batch["loss_mask"]
 
-        hidden_states = model.forward(
-            weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
-        )
-        log_probs = jax.nn.log_softmax(model.unembed(weights, hidden_states), axis=-1)
+        hidden_states = weights(**kl_batch["inputs"], rngs=rngs, dtype=forward_dtype)
+        log_probs = jax.nn.log_softmax(weights.unembed(hidden_states), axis=-1)
 
         if model.is_lora:
             base_weights = model.base_params
-            kl_hidden_states = model.forward(
-                base_weights, **kl_batch["inputs"], rngs=rngs, dtype=forward_dtype
-            )
-            kl_log_probs = jax.nn.log_softmax(
-                model.unembed(base_weights, kl_hidden_states),
-                axis=-1,
-            )
-        else:
-            kl_hidden_states = base_model.forward(
-                base_model.weights,
+            kl_hidden_states = base_weights(
                 **kl_batch["inputs"],
                 rngs=rngs,
                 dtype=forward_dtype,
             )
             kl_log_probs = jax.nn.log_softmax(
-                base_model.unembed(base_model.weights, kl_hidden_states),
+                base_weights.unembed(kl_hidden_states),
+                axis=-1,
+            )
+        else:
+            kl_hidden_states = base_model.model(
+                **kl_batch["inputs"],
+                rngs=rngs,
+                dtype=forward_dtype,
+            )
+            kl_log_probs = jax.nn.log_softmax(
+                base_model.model.unembed(kl_hidden_states),
                 axis=-1,
             )
 
@@ -137,9 +175,7 @@ def train_step(
         weights = tree_util.combine(train_weights, frozen_weights)
         forward_dtype = config.forward_dtype
 
-        hidden_states = model.forward(
-            weights, **sft_batch["inputs"], rngs=rngs, dtype=forward_dtype
-        )
+        hidden_states = weights(**sft_batch["inputs"], rngs=rngs, dtype=forward_dtype)
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = sft_batch["labels"].reshape(-1)
@@ -153,22 +189,22 @@ def train_step(
                 # vocab weights; avoid forcing replication for the reference
                 # implementation to match Tunix's fsdp-sharded embed/lm_head.
                 jax.reshard(
-                    weights[model.lm_head_key],
-                    logical_to_physical(("none", "none"), model.config.sharding_rules),
+                    weights.lm_head_w,
+                    from_logical_rules(("none", "none")),
                 )
-                if (config.loss_implementation or None) != "reference"
-                else weights[model.lm_head_key]
+                if (config.loss_impl or None) != "reference"
+                else weights.lm_head_w
             ),
             reduction="sum",
-            weight=mask,
-            implementation=config.loss_implementation or None,
+            mask=mask,
+            implementation=config.loss_impl or None,
         )
 
         batch_size = sft_batch["labels"].shape[0]
         aux = {"loss": (loss, count), "token": count, "batch": batch_size}
         return loss, aux
 
-    train_weights, frozen_weights = tree_util.partition(model.weights, model.train_mask)
+    train_weights, frozen_weights = tree_util.partition(model.model, model.train_mask)
 
     if config.grad_accum > 1:
         sft_microbatch_size = sft_batch["labels"].shape[0] // config.grad_accum
@@ -211,12 +247,16 @@ def train_step(
         kl_grad,
     )
 
-    updates, nst = model.tx.update(grad, model.opt_state, model.weights)
-    nweights = tree_util.apply_updates(model.weights, updates, config.forward_dtype)
-    total_aux = metric_utils.jittable_add_aux(sft_aux, kl_aux, reduce_method=DEFAULT_REDUCED)
+    updates, nst = model.tx.update(grad, model.opt_state, model.model)
+    nmodel = tree_util.apply_updates(model.model, updates)
+    total_aux = metric_utils.jittable_add_aux(
+        sft_aux,
+        kl_aux,
+        reduce_method=DEFAULT_REDUCED,
+    )
     aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
 
-    next_model = dataclasses.replace(model, weights=nweights, opt_state=nst)
+    next_model = dataclasses.replace(model, model=nmodel, opt_state=nst)
     callback_state = model.callback_state
     if model.callback_state is not None:
         next_model, callback_state = model.callbacks.update(
@@ -228,10 +268,6 @@ def train_step(
         )
 
     return dataclasses.replace(next_model, callback_state=callback_state), aux
-
-
-def eval(model, eval_ds):
-    raise NotImplementedError
 
 
 def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -248,27 +284,20 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def train(
     config,
-    model: Model,
-    base_model: Model | None,
-    train_ds,
-    eval_ds,
-    logger,
+    model: TrainState,
+    base_model: TrainState | None,
+    train_ds: Iterable,
+    evaluators: dict[str, Callable[[TrainState], Any]] | None = None,
+    logger=None,
+    ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
     step = model.step or 0
     global_aux = dict(DEFAULT_AUX)
-    skip_eval = config.skip_eval or config.eval_every is None or eval_ds is None
+    skip_eval = config.eval_every is None or evaluators is None
     first_step = True
-    ckpt_manager = make_checkpointer(
-        config.ckpt_path,
-        config.checkpoint.save_interval_steps,
-        config.checkpoint.max_to_keep,
-        config.checkpoint.save_only_trainable,
-        model,
-        config.to_json(),
-    )
 
     to_log_later = {}
     program_wall_t0 = None
@@ -286,25 +315,23 @@ def train(
 
     try:
         while step < config.max_train_step:
+            if ckptr is not None:
+                ckptr.save_checkpoint(step, model, train_iterator)
             if not skip_eval and (step % config.eval_every) == 0:
-                eval_aux = eval(model, eval_ds)
+                eval_process = {}
+                for name, evaluator in evaluators.items():
+                    eval_process[name] = evaluator(model)
 
-            try:
-                batch = next(train_iterator)
-            except StopIteration:
-                if jax.process_index() == 0:
-                    print("dataloader is exhausted")
-                break
-
+            batch = next(train_iterator)
             loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
-                with jax.named_scope("compile train step"), jax.set_mesh(model.mesh):
+                with jax.named_scope("compile train step"), train_state_context(model):
 
                     @print_timing
                     def compile_train_step():
                         train_step_jit = jax.jit(
                             partial(train_step, config),
-                            donate_argnums=(0,1),
+                            donate_argnums=(0, 1),
                         )
                         lower = train_step_jit.lower(
                             model,
@@ -331,11 +358,11 @@ def train(
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                    jax.set_mesh(model.mesh),
+                    train_state_context(model),
                 ):
                     model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
 
-            host_aux = metric_utils.to_host(aux, flatten = True)
+            host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
                 global_aux, host_aux, reduce_method=DEFAULT_REDUCED
             )
@@ -362,8 +389,6 @@ def train(
                         )
                     )
                     pbar.update(1)
-            if ckpt_manager is not None:
-                save_checkpoint(ckpt_manager, step, model)
             step += 1
 
     finally:
@@ -384,16 +409,19 @@ def train(
                 print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
-        if ckpt_manager is not None:
-            ckpt_manager.close()
+        if ckptr is not None:
+            ckptr.close()
 
     return model, to_log_later
 
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
-    do_callback = getattr(config, "callback_name", None)
+    do_callback = getattr(config, "callback", None)
+    do_load_state = getattr(config, "load_state", None)
+    do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
+    do_eval = getattr(config, "eval", None)
 
     logger = None
     if jax.process_index() == 0:
@@ -404,15 +432,18 @@ def main(config: sws.FinalConfig):
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
-        model = make_model(
-            config.model_name,
-            config.init_model,
-            config.model.to_dict(),
-            rngs=model_rngs,
-        )
+        rule = make_logical_axis_rules(**config.parallel.to_dict())
+        mesh = make_mesh(**config.parallel.to_dict())
+        with jax.set_mesh(mesh), with_logical_axis(rule):
+            model = make_model(
+                config.model_name,
+                **config.model.to_dict(),
+                rngs=model_rngs,
+            )
+        model = TrainState(model, mesh, rule=rule)
         base_model = dataclasses.replace(model)
 
-        with jax.set_mesh(model.mesh):
+        with train_state_context(model):
             scheduler_config = (
                 config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
             )
@@ -428,7 +459,11 @@ def main(config: sws.FinalConfig):
                 )
             model = dataclasses.replace(
                 model,
-                weights=model.prepare_weights(model.weights, config.store_weights),
+                model=(
+                    model.model.stack()
+                    if config.weights_impl == "stack"
+                    else model.model
+                ),
             )
             model = make_optimizer(
                 config.optimizer_name,
@@ -443,30 +478,56 @@ def main(config: sws.FinalConfig):
             else:
                 base_model = dataclasses.replace(
                     base_model,
-                    weights=base_model.prepare_weights(
-                        base_model.weights,
-                        config.store_weights,
+                    model=(
+                        base_model.model.stack()
+                        if config.weights_impl == "stack"
+                        else base_model.model
                     ),
                 )
                 base_model = tree_util.copy(base_model)
 
             if do_callback:
-                callbacks = make_callbacks(
-                    config.callback_name, config.callback.to_dict()
-                )
+                callbacks = make_callbacks(config.callback.to_dict())
                 model = dataclasses.replace(
                     model,
                     callback_state=callbacks.init(model),
                     callbacks=callbacks,
                 )
+            if do_load_state:
+                if do_checkpoint and is_used_checkpoint(config.checkpoint.path):
+                    raise ValueError(
+                        f"Both 'load_state' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
+                        f"To resume training from {config.checkpoint.path}, set load_state=None. "
+                        f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
+                    )
+                model = load_checkpoint_from_path(model, **config.load_state.to_dict())
 
-        train_ds = make_data(
-            config.data.to_dict(),
-            mesh=model.mesh,
-        )
-        eval_ds = None
+            ckptr = None
+            if do_checkpoint:
+                ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
+                model = ckptr.load_checkpoint(model)
+
+            train_ds = make_data(
+                config.data.to_dict(),
+                mesh=model.mesh,
+            )
+
+            evaluators = None
+            if do_eval:
+                evaluators = make_eval(
+                    config.eval.to_dict(),
+                    {"predict": predict_fn, "loss": loss_fn},
+                )
+
         _, metrics = train(
-            config, model, base_model, train_ds, eval_ds, logger, rngs=train_rngs
+            config,
+            model,
+            base_model,
+            train_ds,
+            evaluators,
+            logger,
+            ckptr,
+            rngs=train_rngs,
         )
         return metrics
     finally:

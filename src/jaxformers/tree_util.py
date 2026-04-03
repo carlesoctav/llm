@@ -43,15 +43,15 @@ def combine(*val, is_leaf=None):
     return jtu.tree_map(_combine, *val, is_leaf=_is_leaf)
 
 
-def apply_updates(weights, updates, dtype):
-    def _f(w, u):
+def apply_updates(model, updates):
+    def _f(m, u):
         if u is None:
-            return w
+            return m
         else:
-            return (w + u).astype(dtype)
+            return (m + u).astype(jnp.asarray(m).dtype)
 
     is_none = lambda x: x is None
-    return jtu.tree_map(_f, weights, updates, is_leaf=is_none)
+    return jtu.tree_map(_f, model, updates, is_leaf=is_none)
 
 
 def _optimizer_entrystr(key: KeyEntry) -> str:
@@ -101,36 +101,6 @@ def maybe_unstack(trees: list | dict):
         )
         for i in range(N)
     ]
-
-
-def split_layer_weights(
-    weights, num_hidden_layers: int, layer_pattern, stack: bool = False
-):
-    other_weights = {}
-    layers = [{} for _ in range(num_hidden_layers)]
-    inner_keys = set()
-
-    for key, value in weights.items():
-        match = layer_pattern.fullmatch(key)
-        if match is None:
-            other_weights[key] = value
-            continue
-
-        layer_idx = int(match.group(1))
-        inner_key = match.group(2)
-        layers[layer_idx][inner_key] = value
-        inner_keys.add(inner_key)
-
-    for layer_idx, layer_weight in enumerate(layers):
-        missing = sorted(inner_keys - layer_weight.keys())
-        if missing:
-            raise KeyError(f"Missing layer weights at index {layer_idx}: {missing!r}.")
-
-    if stack:
-        return other_weights, jax.tree.map(lambda *leaf: jnp.stack(leaf), *layers)
-
-    return other_weights, layers
-
 
 def flatten(tree, separator=".", is_leaf=None):
     res = {}
@@ -296,5 +266,17 @@ def to_abstract(tree):
 
     return jax.tree.map(_f, tree)
 
-
-none_map = partial(jax.tree.map, is_leaf=lambda x: x is None)
+def get_by_path(obj, path):
+    for key in path:
+        match key:
+            case jtu.GetAttrKey(name):
+                obj = getattr(obj, name)
+            case jtu.DictKey(name):
+                obj = obj[name]
+            case jtu.SequenceKey(idx):
+                obj = obj[idx]
+            case jtu.FlattenedIndexKey(idx):
+                obj = obj[idx]
+            case _:
+                raise TypeError(f"Unsupported key path element: {key!r}")
+    return obj

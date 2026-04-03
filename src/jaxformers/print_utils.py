@@ -23,6 +23,20 @@ def _false(_):
     return False
 
 
+def _without_static(pytree: Any):
+    from jaxformers import tree_util
+
+    flat = {}
+
+    def _collect(path, leaf):
+        flat[jtu.keystr(path, simple=True, separator=".")] = leaf
+
+    jax.tree.map_with_path(_collect, pytree)
+    if not flat:
+        return {}
+    return tree_util.unflatten(flat)
+
+
 @dataclasses.dataclass(slots=True)
 class TreeWLCustom:
     """Wadler-Lindig customisation for PyTree pretty-printing.
@@ -71,7 +85,8 @@ def tree_pformat(
     width: int = 80,
     indent: int = 2,
     short_arrays: bool = True,
-    struct_as_array: bool = False,
+    struct_as_array: bool = True,
+    static: bool = True,
     truncate_leaf: Callable[[Any], bool] = _false,
 ) -> str:
     """Pretty-formats a PyTree as a string, whilst abbreviating JAX arrays.
@@ -80,6 +95,9 @@ def tree_pformat(
 
     As [`equinox.tree_pprint`][], but returns the string instead of printing it.
     """
+    if not static:
+        pytree = _without_static(pytree)
+
     return wl.pformat(
         pytree,
         width=width,
@@ -100,6 +118,7 @@ def tree_pprint(
     indent: int = 2,
     short_arrays: bool = True,
     struct_as_array: bool = True,
+    static: bool = True,
     truncate_leaf: Callable[[Any], bool] = _false,
 ) -> None:
     """Pretty-prints a PyTree as a string, whilst abbreviating JAX arrays.
@@ -120,6 +139,7 @@ def tree_pprint(
     - `indent`: The amount of indentation each nesting level.
     - `short_arrays`: Toggles the abbreviation of JAX arrays.
     - `struct_as_array`: Whether to treat `jax.ShapeDtypeStruct`s as arrays.
+    - `static`: Whether to include static/meta fields from dataclass-like pytree nodes.
     - `truncate_leaf`: A function `Any -> bool`. Applied to all nodes in the PyTree;
         all truthy nodes will be truncated to just `f"{type(node).__name__}(...)"`.
 
@@ -134,6 +154,7 @@ def tree_pprint(
             indent=indent,
             short_arrays=short_arrays,
             struct_as_array=struct_as_array,
+            static=static,
             truncate_leaf=truncate_leaf,
         )
     )

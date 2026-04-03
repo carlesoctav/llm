@@ -10,4 +10,3 @@ opt_state = tx.init(w)
 
 fn = log_learning_rate()
 callback_state = fn.init(w, opt_state)
-print("DEBUGPRINT {callback_state}:", callback_state)

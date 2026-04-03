@@ -21,17 +21,17 @@ DEFAULT_LORA_PATHS = [
 def get_config():
     config = sws.Config()
 
-    config.skip_eval = True
-
     config.exp_name = "gemma3-1b-it-lora-kl"
     config.project_name = "split-brain"
     config.dir = "gs://carles-git-good"
-    config.ckpt_path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.path = lambda: (
+        f"{config.dir}/{config.project_name}/{config.exp_name}"
+    )
     config.seed = 42
     config.eval_every = None
     config.max_train_step = 1000
     config.forward_dtype = lambda: jnp.bfloat16
-    config.loss_implementation = "reference"
+    config.loss_impl = "reference"
     config.grad_accum = 4
 
     config.loss_ratio.sft_loss = 1.0
@@ -41,28 +41,31 @@ def get_config():
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
 
-    config.callback_name = []
-
     config.checkpoint.save_interval_steps = 100
     config.checkpoint.max_to_keep = 1
     config.checkpoint.save_only_trainable = False
 
-    config.init_model = "pretrained"
     config.init_lora = "random"
-    config.store_weights = "stack"
-    config.model_name = "huggingface.gemma3"
-    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.weights_impl = "stack"
+    config.model_name = (
+        "{MODEL_DIR}.huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
+    )
+    config.parallel.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.parallel.devices = lambda: jax.devices()
+    config.parallel.multihost = False
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True
-    config.model.additional_config.attn_implementation = "sdpa"
+    config.model.additional_config.attn_impl = "sdpa"
     config.model.additional_config.sequence_parallelism = True
     config.model.additional_config.forward_impl = "scan_layer"
-    config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.lora.rank = 256
     config.lora.alpha = 512
     config.lora.weights_path = list(DEFAULT_LORA_PATHS)
+
+    ds_name = "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages"
+    chat_template_path = str(ROOT / "temp/think.jinja")
 
     config.data.loader.combine = "zip"
     config.data.loader.shard = False
@@ -70,14 +73,14 @@ def get_config():
 
     config.data.sft.source.load_kwargs = [
         {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
+            "path": ds_name,
             "split": "train",
         }
     ]
     config.data.sft.source.streaming = False
     config.data.kl.source.load_kwargs = [
         {
-            "path": "carlesoctav/4b-generated-Dolci-Instruct-SFT-No-Tools-messages",
+            "path": ds_name,
             "split": "train",
         }
     ]
@@ -91,7 +94,7 @@ def get_config():
     )
     config.data.sft.transforms.data_type = "chat"
     config.data.sft.transforms.assistant_loss = True
-    config.data.sft.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.sft.transforms.chat_template_path = chat_template_path
     config.data.sft.transforms.packing = False
     config.data.sft.transforms.packing_bins = 64
 
@@ -103,7 +106,7 @@ def get_config():
     )
     config.data.kl.transforms.data_type = "chat"
     config.data.kl.transforms.assistant_loss = True
-    config.data.kl.transforms.chat_template_path = str(ROOT / "temp/think.jinja")
+    config.data.kl.transforms.chat_template_path = chat_template_path
     config.data.kl.transforms.packing = False
     config.data.kl.transforms.packing_bins = 64
 

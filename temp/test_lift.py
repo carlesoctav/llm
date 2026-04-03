@@ -33,6 +33,4 @@ def lift(func):
 
 
 make_lift = lift(make_huggingface_datasets)
-print("DEBUGPRINT {make_lift}:", make_lift)
 a = make_lift(lift_data)
-print("DEBUGPRINT {a}:", a)

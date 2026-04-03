@@ -9,7 +9,7 @@ from jaxformers.optimizer_utils import mask_trainable_lora
 
 
 @print_timing
-def make_optimizer(optimizer_name: str, model, scheduler, optimizer_config: dict):
+def make_optimizer(optimizer_name: str, train_state, scheduler, optimizer_config: dict):
     optimizer_module = importlib.import_module(
         f"jaxformers.optimizers.{optimizer_name}"
     )
@@ -19,11 +19,11 @@ def make_optimizer(optimizer_name: str, model, scheduler, optimizer_config: dict
         )
 
     train_mask = None
-    if model.is_lora:
-        train_mask = mask_trainable_lora(model.weights)
-        model = dataclasses.replace(model, train_mask=train_mask)
+    if train_state.is_lora:
+        train_mask = mask_trainable_lora(train_state.model)
+        train_state = dataclasses.replace(train_state, train_mask=train_mask)
 
-    train_weights, _ = tree_util.partition(model.weights, train_mask)
-    tx = optimizer_module.make(scheduler, model, **optimizer_config)
+    train_weights, _ = tree_util.partition(train_state.model, train_mask)
+    tx = optimizer_module.make(scheduler, train_state, **optimizer_config)
     opt_state = tx.init(train_weights)
-    return dataclasses.replace(model, opt_state=opt_state, tx=tx, train_mask=train_mask)
+    return dataclasses.replace(train_state, opt_state=opt_state, tx=tx, train_mask=train_mask)

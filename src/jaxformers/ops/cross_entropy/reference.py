@@ -7,6 +7,7 @@ from jaxtyping import Array, Float, Int
 
 from jaxformers.dispatch import einsum
 from jaxformers.ops.cross_entropy.config import BlockSizes
+from jaxformers.sharding_utils import from_logical_rules
 
 
 @partial(jax.jit, static_argnames=["block_sizes", "dtype", "precision"])
@@ -28,6 +29,7 @@ def cross_entropy_reference(
         w,
         precision=precision,
         preferred_element_type=jnp.float32,
+        out_sharding=from_logical_rules(("batch", None))
     )
     if logit_soft_cap is not None:
         logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap

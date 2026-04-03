@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from jaxformers import metric_utils
 from jaxformers.data import make_eval_data
+from jaxformers.sharding_utils import with_logical_axis
 
 
 def _check_shape(shape, tree):
@@ -42,7 +43,7 @@ def make(
         # make this infinte stream or cacheable so we dont recreate laoder/stream again and again
         data = make_eval_data(data_config, mesh=mesh)
         list_aux = []
-        with jax.set_mesh(model.mesh):
+        with jax.set_mesh(model.mesh), with_logical_axis(model.rule):
             for batch in tqdm(data, desc=f"{name}_eval"):
                 batch_aux = _eval_step(fn, model, batch)
                 list_aux.append(batch_aux)

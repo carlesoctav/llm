@@ -16,4 +16,3 @@ def add(*all):
 
 
 b = tree_map(add, *list_of)
-print("DEBUGPRINT {b}:", b)

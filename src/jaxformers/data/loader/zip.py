@@ -13,7 +13,7 @@ from jax.sharding import Mesh
 from jaxformers.data.loader._group import prepare_group
 from jaxformers.data.loader.simple import ProcessShardedIterDataset
 from jaxformers.data.transforms.base import TransformFn
-from jaxformers.distributed.parallel import BATCH
+from jaxformers.sharding_utils import BATCH
 
 
 _T = tp.TypeVar("_T")

@@ -1,6 +1,5 @@
-from jaxformers.print_utils import tree_pprint
-from contextlib import contextmanager, nullcontext
 import dataclasses
+from contextlib import contextmanager, nullcontext
 
 import jax
 from transformers import Gemma3TextConfig
@@ -9,6 +8,7 @@ from jaxformers.modeling_utils import StoreWeights
 from jaxformers.models.huggingface import gemma3
 from jaxformers.optimizers import make_optimizer
 from jaxformers.optimizers.scheduler import make_scheduler
+from jaxformers.print_utils import tree_pprint
 
 
 @contextmanager

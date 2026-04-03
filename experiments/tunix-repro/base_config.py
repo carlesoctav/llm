@@ -14,12 +14,16 @@ def get_config():
     config.eval_every = 100
     config.max_train_step = 10_000
     config.forward_dtype = lambda: jnp.bfloat16
-    config.loss_implementation = "reference"
+    config.loss_impl = "reference"
     config.grad_accum = 4
+    config.weights_impl = "stack"
+
+    config.parallel.sequence_paralellism = False
+    config.parallel.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.parallel.devices = lambda: jax.devices()
+    config.parallel.multihost = False
 
     config.logger_name = "wandb"
-
-    config.enable_checkpoint = True
     config.checkpoint.path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
     config.checkpoint.save_interval_steps = lambda: config.eval_every
     config.checkpoint.max_to_keep = None
@@ -28,27 +32,24 @@ def get_config():
     config.logger.project = lambda: config.project_name
     config.logger.name = lambda: config.exp_name
 
-    config.callback_name = ["log_grad_norm", "log_learning_rate", "log_performance"]
+    config.callback.log_grad_norm = {}
+    config.callback.log_learning_rate = {}
+    config.callback.profiler.path = "/mnt/carles/llm/trace/debug-remat-attention/no-remat-scan-bug"
     config.callback.log_performance.real_step_threshold = 0
     config.callback.log_performance.denom_keys = ["token"]
 
+    # config.load_state.path =
+    # config.load_state.target =
+    # config.load_state.step =
 
-    config.init_model = "pretrained"
-    # config.load_model.path =
-    # config.load_model.target =
-    # config.load_model.step =
     config.init_lora = None
-    config.store_weights = "stack"
-
-    config.model_name = "huggingface.gemma3"
-    config.model.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
+    config.model_name = (
+        "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
+    )
     config.model.model_id = "google/gemma-3-1b-it"
-    config.model.additional_config.remat_layer = False
-    config.model.additional_config.attn_implementation = "sdpa"
-    config.model.additional_config.sequence_parallelism = True
+    config.model.additional_config.remat_layer = True
+    config.model.additional_config.attn_impl = "sdpa"
     config.model.additional_config.forward_impl = "scan_layer"
-
-    config.model.devices = lambda: jax.devices()
     config.model.param_dtype = lambda: jnp.bfloat16
 
     def ds_config(ds_name, split, streaming):

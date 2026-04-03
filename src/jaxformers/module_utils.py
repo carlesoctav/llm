@@ -1,5 +1,3 @@
-from jaxformers.tree_util import get_by_path
-from jaxformers.print_utils import tree_pprint
 import abc
 import dataclasses
 from contextlib import ExitStack
@@ -305,12 +303,19 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
 
 def init_missing_module(model, missing_key, *, rngs: PRNGKeyArray):
     counter = 0
+
     def f(path, leaf):
         nonlocal counter
         if isinstance(leaf, jax.ShapeDtypeStruct):
-            array = default_init(jax.random.fold_in(rngs, counter), leaf.shape, out_sharding = leaf.sharding.spec, dtype = leaf.dtype)
-            counter+=1
+            array = default_init(
+                jax.random.fold_in(rngs, counter),
+                leaf.shape,
+                out_sharding=leaf.sharding.spec,
+                dtype=leaf.dtype,
+            )
+            counter += 1
             return array
         else:
             return leaf
+
     return jax.tree.map_with_path(f, model)

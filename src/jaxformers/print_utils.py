@@ -148,6 +148,30 @@ def tree_pprint(
     Nothing. (The result is printed to stdout instead.)
     """
     print(
+        tree_pformat( pytree,
+            width=width,
+            indent=indent,
+            short_arrays=short_arrays,
+            struct_as_array=struct_as_array,
+            static=static,
+            truncate_leaf=truncate_leaf,
+        )
+    )
+
+
+def debugtree(
+    name: str,
+    pytree: Any,
+    *,
+    width: int = 80,
+    indent: int = 2,
+    short_arrays: bool = True,
+    struct_as_array: bool = True,
+    static: bool = True,
+    truncate_leaf: Callable[[Any], bool] = _false,
+):
+    print(
+        name,
         tree_pformat(
             pytree,
             width=width,
@@ -156,5 +180,5 @@ def tree_pprint(
             struct_as_array=struct_as_array,
             static=static,
             truncate_leaf=truncate_leaf,
-        )
+        ),
     )

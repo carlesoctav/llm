@@ -3,7 +3,7 @@ import dataclasses
 from contextlib import ExitStack
 from enum import auto, StrEnum
 from pathlib import Path
-from typing import Any, Generic, TypedDict, TypeVar
+from typing import Any, Generic, Self, TypedDict, TypeVar
 
 import equinox as eqx
 import jax
@@ -50,8 +50,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
     "attn_impl": "sdpa",
     "sequence_parallelism": True,
-    "weights_impl": "stack",
-    "forward_impl": "loop",
+    "forward_impl": "scan_layer",
 }
 
 
@@ -195,14 +194,14 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
 
     @classmethod
     def init(
-        cls,
+        cls: type[Self],
         config: PreTrainedConfig | None = None,
         model_id: str | None = None,
         additional_config: AdditionalConfig | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
         rngs,
-    ):
+    ) -> Self:
         if (config is None) == (model_id is None):
             raise ValueError(
                 f"Exactly one of `config` or `model_id` must be provided to {cls.__name__}.init()."
@@ -229,14 +228,14 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
 
     @classmethod
     def from_pretrained(
-        cls,
+        cls: type[Self],
         model_id: str,
         local_dir: str | None = None,
         additional_config: AdditionalConfig | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         *,
         rngs,
-    ):
+    ) -> Self:
         model_rngs, missing_rngs = jax.random.split(rngs)
         additional_config = {
             **DEFAULT_ADDITIONAL_CONFIG,

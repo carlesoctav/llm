@@ -1,7 +1,10 @@
+from jaxformers.print_utils import debugtree
 from typing import Sequence
 
 import jax
 import jax.numpy as jnp
+
+from jaxformers import tree_util
 
 
 def _as_tuple(value: int | str | Sequence[int] | Sequence[str]):
@@ -21,6 +24,12 @@ def _get_scan_lengths(values, axes):
 
 def _move_scan_axis(tree, axis: int):
     return jax.tree.map(lambda leaf: jnp.moveaxis(leaf, axis, 0), tree)
+
+
+def _stack_if_list(items):
+    if isinstance(items, list):
+        return tree_util.stack(*items)
+    return items
 
 
 def make_scan_fwd(
@@ -62,28 +71,38 @@ def make_scan_fwd(
                 f"Missing scanned keyword arguments: {missing_argnames!r}."
             )
 
-        scan_values = [fwd_args[idx] for idx in argnums] + [
-            kwargs[name] for name in argnames
-        ]
-        lengths = _get_scan_lengths(scan_values, in_axes)
-        if len(set(lengths)) != 1 or lengths[0] != length:
-            raise ValueError(
-                f"Expected scanned inputs to have length {length}, got {lengths!r}."
-            )
+        # scan_values = [fwd_args[idx] for idx in argnums] + [
+        #     kwargs[name] for name in argnames
+        # ]
+        # lengths = _get_scan_lengths(scan_values, in_axes)
+        # if len(set(lengths)) != 1 or lengths[0] != length:
+        #     raise ValueError(
+        #         f"Expected scanned inputs to have length {length}, got {lengths!r}."
+        #     )
 
         base_args = list(fwd_args)
         scan_args = tuple(
-            _move_scan_axis(fwd_args[idx], axis)
+            _stack_if_list(fwd_args[idx])
             for idx, axis in zip(argnums, in_axes[: len(argnums)])
         )
         scan_kwargs = {
-            name: _move_scan_axis(kwargs[name], axis)
+            name: _stack_if_list(kwargs[name])
+            for name, axis in zip(argnames, in_axes[len(argnums) :])
+        }
+
+        scan_args = tuple(
+            _move_scan_axis(scan_arg, axis)
+            for scan_arg, axis in zip(scan_args, in_axes[: len(argnums)])
+        )
+        scan_kwargs = {
+            name: _move_scan_axis(scan_kwargs[name], axis)
             for name, axis in zip(argnames, in_axes[len(argnums) :])
         }
         nonscan_kwargs = {
             name: value for name, value in kwargs.items() if name not in argnames
         }
 
+        debugtree("scan args_kwagrs", (scan_args, scan_kwargs))
         def scan_body(carry, xs):
             step_args, step_kwargs = xs
             call_args = list(base_args)
@@ -92,14 +111,14 @@ def make_scan_fwd(
 
             call_kwargs = dict(nonscan_kwargs)
             call_kwargs.update(step_kwargs)
-            return fwd(carry, *call_args, **call_kwargs), None
+            hidden_states, ys = fwd(carry, *call_args, **call_kwargs)
+            return hidden_states, ys
 
-        carry, _ = jax.lax.scan(
+        carry, ys = jax.lax.scan(
             scan_body,
             init=carry,
             xs=(scan_args, scan_kwargs),
             length=length,
         )
-        return carry
-
+        return carry, ys
     return scan_fwd

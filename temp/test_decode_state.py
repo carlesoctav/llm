@@ -1,5 +1,3 @@
-from jaxformers.module_utils import DEFAULT_ADDITIONAL_CONFIG
-from jax.extend.mlir.dialects.stablehlo import add
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -37,10 +35,12 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 with jax.set_mesh(mesh), with_logical_axis(rules):
     model = Gemma3ForCausalLM.from_pretrained(model_id, rngs=jax.random.key(0), param_dtype = jnp.bfloat16)
 
+    model = Gemma3ForCausalLM.from_pretrained(
+        model_id, rngs=jax.random.key(0), param_dtype=jnp.bfloat16
+    )
+
     inputs = tokenizer("hallo saya makan nasi goreng", return_tensors="np").data
     none_array = np.asarray([None, None, None])
-    print("DEBUGPRINT {none_array}:", none_array)
-    print("DEBUGPRINT {none_array}:", none_array.shape)
     print(type(inputs))
     tree_pprint(inputs)
     model = model.stack()
@@ -54,8 +54,6 @@ with jax.set_mesh(mesh), with_logical_axis(rules):
 
     @jax.jit
     def fwd(model, inputs, decode_states):
-        output, extra_outputs = model(**inputs, dtype = jnp.bfloat16)
-        return output, extra_outputs
-
+        output, extra_outputs = model(**inputs, dtype=jnp.bfloat16)
     outputs, extra_outputs = fwd(model, inputs, decode_states)
     tree_pprint(extra_outputs)

@@ -500,6 +500,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         *,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
+        forward_impl:ForwardImpl = "scan_layer",
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)

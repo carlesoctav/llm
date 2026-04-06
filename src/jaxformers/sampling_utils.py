@@ -54,5 +54,4 @@ def generate(
 
     @jax.jit
     def prefill(model):
-        logits, extra_output
         pass

@@ -79,18 +79,33 @@ def train_state_context(train_state: TrainState):
         yield
 
 
-def predict_fn(train_state: TrainState, batch):
+def predict_fn(train_state: TrainState, batch, *, forward_dtype):
     with train_state_context(train_state):
-        hidden = train_state.model(**batch["inputs"])
-        return train_state.model.unembed(hidden)
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        return train_state.model.unembed(hidden_states)
 
 
-def loss_fn(train_state: TrainState, batch, rngs=None):
+def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_impl):
     del rngs
-    logits = predict_fn(train_state, batch)
-    return {
-        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
-    }
+    with train_state_context(train_state):
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        batch_shape = batch["labels"].shape
+        loss = cross_entropy_loss(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            batch["labels"].reshape(-1),
+            train_state.model.lm_head_w,
+            reduction=None,
+            implementation=loss_impl,
+        )
+        return {"loss": loss.reshape(batch_shape)}
 
 
 def _preparse_absl_flags() -> None:
@@ -462,7 +477,7 @@ def main(config: sws.FinalConfig):
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
-        rngs = jax.random.key(config.seed) if config.seed else None
+        rngs = jax.random.key(config.seed) if config.seed is not None else None
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
@@ -559,7 +574,17 @@ def main(config: sws.FinalConfig):
             if do_eval:
                 evaluators = make_eval(
                     config.eval.to_dict(),
-                    {"predict": predict_fn, "loss": loss_fn},
+                    {
+                        "predict": partial(
+                            predict_fn,
+                            forward_dtype=config.forward_dtype,
+                        ),
+                        "loss": partial(
+                            loss_fn,
+                            forward_dtype=config.forward_dtype,
+                            loss_impl=config.loss_impl,
+                        ),
+                    },
                 )
 
         _, metrics = train(

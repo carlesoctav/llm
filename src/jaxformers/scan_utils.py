@@ -1,4 +1,3 @@
-from jaxformers.print_utils import debugtree
 from typing import Sequence
 
 import jax
@@ -102,7 +101,6 @@ def make_scan_fwd(
             name: value for name, value in kwargs.items() if name not in argnames
         }
 
-        debugtree("scan args_kwagrs", (scan_args, scan_kwargs))
         def scan_body(carry, xs):
             step_args, step_kwargs = xs
             call_args = list(base_args)
@@ -121,4 +119,5 @@ def make_scan_fwd(
             length=length,
         )
         return carry, ys
+
     return scan_fwd

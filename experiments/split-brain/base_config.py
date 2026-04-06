@@ -57,7 +57,6 @@ def get_config():
     config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_impl = "sdpa"
     config.model.additional_config.sequence_parallelism = True
-    config.model.additional_config.forward_impl = "scan_layer"
     config.model.param_dtype = lambda: jnp.bfloat16
 
     config.lora.rank = 256

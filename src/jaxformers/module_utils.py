@@ -29,7 +29,7 @@ M = TypeVar("M", bound=eqx.Module)
 
 class ForwardImpl(StrEnum):
     LOOP = auto()
-    SCAN_LAYER = auto()
+    SCAN = auto()
 
 
 class StackImpl(StrEnum):
@@ -50,7 +50,7 @@ DEFAULT_ADDITIONAL_CONFIG = {
     "remat_layer": False,
     "attn_impl": "sdpa",
     "sequence_parallelism": True,
-    "forward_impl": "scan_layer",
+    "forward_impl": "scan",
 }
 
 

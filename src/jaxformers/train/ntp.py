@@ -92,10 +92,11 @@ def loss_fn(model, batch, rngs=None):
 def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs):
     def loss_fn(train_model, freeze_model, batch, rngs):
         model = tree_util.combine(train_model, freeze_model)
-        hidden_states = model(
+        hidden_states, _ = model(
             **batch["inputs"],
             rngs=rngs,
             dtype=config.forward_dtype,
+            return_hidden_states = True,
         )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)

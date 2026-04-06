@@ -23,7 +23,6 @@ from jaxformers.module_utils import (
     StackModule,
 )
 from jaxformers.nn import Embedding, Linear
-from jaxformers.print_utils import tree_pprint, debugtree
 from jaxformers.sampling_utils import make_kv_from_cache
 from jaxformers.sharding_utils import from_logical_rules
 
@@ -500,7 +499,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         *,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
-        forward_impl:ForwardImpl = "scan_layer",
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)
@@ -511,9 +510,8 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
             if decode_states is None
             else decode_states
         )
-        debugtree("decode_states: ", decode_states)
         extra_output_list = []
-        forward_impl = self.config.additional_config["forward_impl"]
+        forward_impl = forward_impl or self.config.additional_config["forward_impl"]
 
         if forward_impl not in tuple(ForwardImpl):
             raise ValueError(
@@ -546,7 +544,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                     decode_state=decode_state,
                 )
                 extra_output_list.append(extra_output)
-        elif forward_impl == ForwardImpl.SCAN_LAYER:
+        elif forward_impl == ForwardImpl.SCAN:
             rope_theta, is_sliding = get_layer_metadata(self.config)
             layers = self.layers
             if isinstance(layers, list):
@@ -626,6 +624,8 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
         *,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
+        return_hidden_states=False,
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
         hidden_states, extra_outputs = self.model(
@@ -634,8 +634,13 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
             dtype,
             rngs=rngs,
             decode_states=decode_states,
+            forward_impl=forward_impl,
             **inputs,
         )
+
+        if return_hidden_states:
+            return hidden_states, extra_outputs
+
         out_weights = (
             self.lm_head.weight if self.lm_head else self.model.embed_tokens.weight
         )
@@ -713,8 +718,16 @@ class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
         dtype: jnp.dtype = jnp.float32,
         *,
         rngs: PRNGKeyArray | None = None,
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
-        hidden_states = self.model(input_ids, pos, dtype, rngs=rngs, **inputs)
+        hidden_states = self.model(
+            input_ids,
+            pos,
+            dtype,
+            rngs=rngs,
+            forward_impl=forward_impl,
+            **inputs,
+        )
         output = self.score(hidden_states)
         return output

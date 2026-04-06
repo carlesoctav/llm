@@ -13,7 +13,7 @@ import jax.tree_util as jtu
 import numpy as np
 import optax
 import sws
-from jax.experimental.rnn import PRNGKeyArray
+from jaxtyping import PRNGKeyArray
 from optax import microbatch
 from tqdm.auto import tqdm
 
@@ -79,30 +79,36 @@ def train_state_context(train_state: TrainState):
         yield
 
 
-def predict_fn(train_state: TrainState, batch):
+def predict_fn(train_state: TrainState, batch, *, forward_dtype):
     with train_state_context(train_state):
-        hidden = train_state.model(**batch["inputs"])
-        return train_state.model.unembed(hidden)
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        return train_state.model.unembed(hidden_states)
 
 
-def loss_fn(model, batch, rngs=None):
+def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_impl):
     del rngs
-    logits = predict_fn(model, batch)
-    return {
-        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
-    }
+    with train_state_context(train_state):
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        batch_shape = batch["labels"].shape
+        loss = cross_entropy_loss(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            batch["labels"].reshape(-1),
+            train_state.model.lm_head_w,
+            reduction=None,
+            implementation=loss_impl,
+        )
+        return {"loss": loss.reshape(batch_shape)}
+
 
 def _preparse_absl_flags() -> None:
-    """Avoid absl.flags crashing on this script's CLI args.
-
-    Some dependencies (e.g. `tokamax`) lazily call `absl.flags.FLAGS(sys.argv)`,
-    which raises `UnrecognizedFlagError` when our program is launched with
-    non-absl flags like `--config` (used by `sws`).
-
-    We pre-parse once with `known_only=True` so absl marks flags as parsed while
-    ignoring unknown args.
-    """
-
     try:
         from absl import flags
     except Exception:
@@ -111,7 +117,6 @@ def _preparse_absl_flags() -> None:
     if flags.FLAGS.is_parsed():
         return
 
-    # Ensure tokamax' absl flags are registered before parsing, if available.
     try:
         import tokamax._src.config as _tokamax_config  # noqa: F401
     except Exception:
@@ -122,42 +127,50 @@ def _preparse_absl_flags() -> None:
 
 def train_step(
     config: sws.FinalConfig,
-    model: TrainState,
-    base_model: TrainState | None,
+    train_state: TrainState,
+    base_train_state: TrainState | None,
     batch,
     *,
     rngs,
 ):
     sft_batch, kl_batch = batch
 
-    def kl_loss_fn(train_weights, frozen_weights, kl_batch, rngs):
-        weights = tree_util.combine(train_weights, frozen_weights)
+    def kl_loss_fn(train_model, freeze_model, kl_batch, rngs):
+        model = tree_util.combine(train_model, freeze_model)
         forward_dtype = config.forward_dtype
         count = jnp.sum(kl_batch["loss_mask"])
         mask = kl_batch["loss_mask"]
 
-        hidden_states = weights(**kl_batch["inputs"], rngs=rngs, dtype=forward_dtype)
-        log_probs = jax.nn.log_softmax(weights.unembed(hidden_states), axis=-1)
+        hidden_states, _ = model(
+            **kl_batch["inputs"],
+            rngs=rngs,
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        log_probs = jax.nn.log_softmax(model.unembed(hidden_states), axis=-1)
 
-        if model.is_lora:
-            base_weights = model.base_params
-            kl_hidden_states = base_weights(
+        if train_state.is_lora:
+            base_model = train_state.base_params
+            base_hidden_states, _ = base_model(
                 **kl_batch["inputs"],
                 rngs=rngs,
                 dtype=forward_dtype,
+                return_hidden_states=True,
             )
             kl_log_probs = jax.nn.log_softmax(
-                base_weights.unembed(kl_hidden_states),
+                base_model.unembed(base_hidden_states),
                 axis=-1,
             )
         else:
-            kl_hidden_states = base_model.model(
+            base_model = base_train_state.model
+            base_hidden_states, _ = base_model(
                 **kl_batch["inputs"],
                 rngs=rngs,
                 dtype=forward_dtype,
+                return_hidden_states=True,
             )
             kl_log_probs = jax.nn.log_softmax(
-                base_model.model.unembed(kl_hidden_states),
+                base_model.unembed(base_hidden_states),
                 axis=-1,
             )
 
@@ -171,11 +184,16 @@ def train_step(
             "batch": kl_batch["inputs"]["input_ids"].shape[0],
         }
 
-    def sft_loss_fn(train_weights, frozen_weights, sft_batch, rngs):
-        weights = tree_util.combine(train_weights, frozen_weights)
+    def sft_loss_fn(train_model, freeze_model, sft_batch, rngs):
+        model = tree_util.combine(train_model, freeze_model)
         forward_dtype = config.forward_dtype
 
-        hidden_states = weights(**sft_batch["inputs"], rngs=rngs, dtype=forward_dtype)
+        hidden_states, _ = model(
+            **sft_batch["inputs"],
+            rngs=rngs,
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
 
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = sft_batch["labels"].reshape(-1)
@@ -189,11 +207,11 @@ def train_step(
                 # vocab weights; avoid forcing replication for the reference
                 # implementation to match Tunix's fsdp-sharded embed/lm_head.
                 jax.reshard(
-                    weights.lm_head_w,
+                    model.lm_head_w,
                     from_logical_rules(("none", "none")),
                 )
                 if (config.loss_impl or None) != "reference"
-                else weights.lm_head_w
+                else model.lm_head_w
             ),
             reduction="sum",
             mask=mask,
@@ -204,7 +222,10 @@ def train_step(
         aux = {"loss": (loss, count), "token": count, "batch": batch_size}
         return loss, aux
 
-    train_weights, frozen_weights = tree_util.partition(model.model, model.train_mask)
+    train_model, freeze_model = tree_util.partition(
+        train_state.model,
+        train_state.train_mask,
+    )
 
     if config.grad_accum > 1:
         sft_microbatch_size = sft_batch["labels"].shape[0] // config.grad_accum
@@ -226,11 +247,17 @@ def train_step(
         sft_grad_fn = jax.value_and_grad(sft_loss_fn, has_aux=True)
         kl_grad_fn = jax.value_and_grad(kl_loss_fn, has_aux=True)
 
-    (sft_loss, sft_aux), sft_grad = sft_grad_fn(
-        train_weights, frozen_weights, sft_batch, rngs
+    (_, sft_aux), sft_grad = sft_grad_fn(
+        train_model,
+        freeze_model,
+        sft_batch,
+        rngs,
     )
-    (kl_loss, kl_aux), kl_grad = kl_grad_fn(
-        train_weights, frozen_weights, kl_batch, rngs
+    (_, kl_aux), kl_grad = kl_grad_fn(
+        train_model,
+        freeze_model,
+        kl_batch,
+        rngs,
     )
 
     sft_token_count = sft_aux["token"]
@@ -247,8 +274,12 @@ def train_step(
         kl_grad,
     )
 
-    updates, nst = model.tx.update(grad, model.opt_state, model.model)
-    nmodel = tree_util.apply_updates(model.model, updates)
+    updates, nst = train_state.tx.update(
+        grad,
+        train_state.opt_state,
+        train_state.model,
+    )
+    nmodel = tree_util.apply_updates(train_state.model, updates)
     total_aux = metric_utils.jittable_add_aux(
         sft_aux,
         kl_aux,
@@ -256,18 +287,18 @@ def train_step(
     )
     aux = {"sft": sft_aux, "kl": kl_aux, **total_aux}
 
-    next_model = dataclasses.replace(model, model=nmodel, opt_state=nst)
-    callback_state = model.callback_state
-    if model.callback_state is not None:
-        next_model, callback_state = model.callbacks.update(
-            next_model,
-            model.callback_state,
+    ntrain_state = dataclasses.replace(train_state, model=nmodel, opt_state=nst)
+    callback_state = train_state.callback_state
+    if train_state.callback_state is not None:
+        ntrain_state, callback_state = train_state.callbacks.update(
+            ntrain_state,
+            train_state.callback_state,
             grad,
             updates,
             aux,
         )
 
-    return dataclasses.replace(next_model, callback_state=callback_state), aux
+    return dataclasses.replace(ntrain_state, callback_state=callback_state), aux
 
 
 def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -284,8 +315,8 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def train(
     config,
-    model: TrainState,
-    base_model: TrainState | None,
+    train_state: TrainState,
+    base_train_state: TrainState | None,
     train_ds: Iterable,
     evaluators: dict[str, Callable[[TrainState], Any]] | None = None,
     logger=None,
@@ -294,7 +325,7 @@ def train(
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
-    step = model.step or 0
+    step = train_state.step or 0
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.eval_every is None or evaluators is None
     first_step = True
@@ -316,28 +347,31 @@ def train(
     try:
         while step < config.max_train_step:
             if ckptr is not None:
-                ckptr.save_checkpoint(step, model, train_iterator)
+                ckptr.save_checkpoint(step, train_state, train_iterator)
             if not skip_eval and (step % config.eval_every) == 0:
                 eval_process = {}
                 for name, evaluator in evaluators.items():
-                    eval_process[name] = evaluator(model)
+                    eval_process[name] = evaluator(train_state)
 
             batch = next(train_iterator)
-            loop_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
+            step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
-                with jax.named_scope("compile train step"), train_state_context(model):
+                with (
+                    jax.named_scope("compile train step"),
+                    train_state_context(train_state),
+                ):
 
                     @print_timing
                     def compile_train_step():
                         train_step_jit = jax.jit(
                             partial(train_step, config),
-                            donate_argnums=(0, 1),
+                            donate_argnums=(0,),
                         )
                         lower = train_step_jit.lower(
-                            model,
-                            base_model,
+                            train_state,
+                            base_train_state,
                             batch,
-                            rngs=loop_rngs,
+                            rngs=step_rngs,
                         )
                         train_step_fn = lower.compile()
                         return train_step_fn
@@ -352,15 +386,25 @@ def train(
                     to_log_later.update(cost)
 
                     program_wall_t0 = time.monotonic()
-                    model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
+                    train_state, aux = train_step_fn(
+                        train_state,
+                        base_train_state,
+                        batch,
+                        rngs=step_rngs,
+                    )
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                    train_state_context(model),
+                    train_state_context(train_state),
                 ):
-                    model, aux = train_step_fn(model, base_model, batch, rngs=loop_rngs)
+                    train_state, aux = train_step_fn(
+                        train_state,
+                        base_train_state,
+                        batch,
+                        rngs=step_rngs,
+                    )
 
             host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
@@ -369,15 +413,20 @@ def train(
             processed_aux = metric_utils.process_aux(host_aux, "step")
             cum_processed_aux = metric_utils.process_aux(global_aux, "cum")
             callback_output = {}
-            if model.callback_state is not None:
+            if train_state.callback_state is not None:
                 callback_aux = {**processed_aux, **cum_processed_aux}
-                callback_output, model, callback_state = model.callbacks.process(
-                    {},
-                    model,
-                    model.callback_state,
-                    callback_aux,
+                callback_output, train_state, callback_state = (
+                    train_state.callbacks.process(
+                        {},
+                        train_state,
+                        train_state.callback_state,
+                        callback_aux,
+                    )
                 )
-                model = dataclasses.replace(model, callback_state=callback_state)
+                train_state = dataclasses.replace(
+                    train_state,
+                    callback_state=callback_state,
+                )
             if jax.process_index() == 0:
                 logger.log(processed_aux, step=step)
                 logger.log(cum_processed_aux, step=step)
@@ -412,7 +461,7 @@ def train(
         if ckptr is not None:
             ckptr.close()
 
-    return model, to_log_later
+    return train_state, to_log_later
 
 
 def main(config: sws.FinalConfig):
@@ -428,7 +477,7 @@ def main(config: sws.FinalConfig):
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
-        rngs = jax.random.key(config.seed) if config.seed else None
+        rngs = jax.random.key(config.seed) if config.seed is not None else None
         model_rngs, lora_rngs, train_rngs = (
             jax.random.split(rngs, 3) if rngs is not None else (None, None, None)
         )
@@ -440,10 +489,10 @@ def main(config: sws.FinalConfig):
                 **config.model.to_dict(),
                 rngs=model_rngs,
             )
-        model = TrainState(model, mesh, rule=rule)
-        base_model = dataclasses.replace(model)
+        train_state = TrainState(model, mesh, rule=rule)
+        base_train_state = dataclasses.replace(train_state)
 
-        with train_state_context(model):
+        with train_state_context(train_state):
             scheduler_config = (
                 config.lr_scheduler.to_dict() if "lr_scheduler" in config else {}
             )
@@ -454,43 +503,46 @@ def main(config: sws.FinalConfig):
                 scheduler_config=scheduler_config,
             )
             if do_lora:
-                model = make_lora(
-                    model, config.init_lora, config.lora.to_dict(), rngs=lora_rngs
+                train_state = make_lora(
+                    train_state,
+                    config.init_lora,
+                    config.lora.to_dict(),
+                    rngs=lora_rngs,
                 )
-            model = dataclasses.replace(
-                model,
+            train_state = dataclasses.replace(
+                train_state,
                 model=(
-                    model.model.stack()
+                    train_state.model.stack()
                     if config.weights_impl == "stack"
-                    else model.model
+                    else train_state.model
                 ),
             )
-            model = make_optimizer(
+            train_state = make_optimizer(
                 config.optimizer_name,
-                model,
+                train_state,
                 scheduler,
                 config.optimizer.to_dict(),
             )
-            print_train_state_size(model)
+            print_train_state_size(train_state)
 
             if do_lora:
-                base_model = None
+                base_train_state = None
             else:
-                base_model = dataclasses.replace(
-                    base_model,
+                base_train_state = dataclasses.replace(
+                    base_train_state,
                     model=(
-                        base_model.model.stack()
+                        base_train_state.model.stack()
                         if config.weights_impl == "stack"
-                        else base_model.model
+                        else base_train_state.model
                     ),
                 )
-                base_model = tree_util.copy(base_model)
+                base_train_state = tree_util.copy(base_train_state)
 
             if do_callback:
                 callbacks = make_callbacks(config.callback.to_dict())
-                model = dataclasses.replace(
-                    model,
-                    callback_state=callbacks.init(model),
+                train_state = dataclasses.replace(
+                    train_state,
+                    callback_state=callbacks.init(train_state),
                     callbacks=callbacks,
                 )
             if do_load_state:
@@ -500,29 +552,45 @@ def main(config: sws.FinalConfig):
                         f"To resume training from {config.checkpoint.path}, set load_state=None. "
                         f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
                     )
-                model = load_checkpoint_from_path(model, **config.load_state.to_dict())
+                train_state = load_checkpoint_from_path(
+                    train_state,
+                    **config.load_state.to_dict(),
+                )
 
             ckptr = None
             if do_checkpoint:
-                ckptr = make_checkpointer(model, **config.checkpoint.to_dict())
-                model = ckptr.load_checkpoint(model)
+                ckptr = make_checkpointer(
+                    train_state,
+                    **config.checkpoint.to_dict(),
+                )
+                train_state = ckptr.load_checkpoint(train_state)
 
             train_ds = make_data(
                 config.data.to_dict(),
-                mesh=model.mesh,
+                mesh=train_state.mesh,
             )
 
             evaluators = None
             if do_eval:
                 evaluators = make_eval(
                     config.eval.to_dict(),
-                    {"predict": predict_fn, "loss": loss_fn},
+                    {
+                        "predict": partial(
+                            predict_fn,
+                            forward_dtype=config.forward_dtype,
+                        ),
+                        "loss": partial(
+                            loss_fn,
+                            forward_dtype=config.forward_dtype,
+                            loss_impl=config.loss_impl,
+                        ),
+                    },
                 )
 
         _, metrics = train(
             config,
-            model,
-            base_model,
+            train_state,
+            base_train_state,
             train_ds,
             evaluators,
             logger,

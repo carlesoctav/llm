@@ -60,7 +60,7 @@ def test_gemma3_forward_impls_match_on_small_config():
             additional_config={
                 "attn_impl": "eager",
                 "sequence_parallelism": False,
-                "forward_impl": "scan_layer",
+                "forward_impl": "scan",
             },
             param_dtype=jnp.float32,
             rngs=jax.random.key(0),

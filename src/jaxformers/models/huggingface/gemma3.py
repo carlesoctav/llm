@@ -5,8 +5,8 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from jax.sharding import PartitionSpec as P, reshard
-from jaxtyping import Array, Float, Int, PRNGKeyArray
-from transformers import Gemma3Config
+from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+from transformers import Gemma3TextConfig
 
 from jaxformers.attention_utils import ATTENTION_INTERFACE
 from jaxformers.dispatch.einsum import einsum
@@ -23,10 +23,11 @@ from jaxformers.module_utils import (
     StackModule,
 )
 from jaxformers.nn import Embedding, Linear
+from jaxformers.sampling_utils import make_kv_from_cache
 from jaxformers.sharding_utils import from_logical_rules
 
 
-def get_layer_metadata(config: Gemma3Config) -> tuple[jax.Array, jax.Array]:
+def get_layer_metadata(config: Gemma3TextConfig) -> tuple[jax.Array, jax.Array]:
     layer_types = config.layer_types
     rope_theta = jnp.asarray(
         [
@@ -131,7 +132,7 @@ class Gemma3Attention(eqx.Module):
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         *,
         attn_impl: str,
         rngs: PRNGKeyArray,
@@ -210,21 +211,29 @@ class Gemma3Attention(eqx.Module):
         *,
         attention_mask,
         rope_theta: float,
-        pos: int,
+        pos: int = 0,
+        decode_state: PyTree | None = None,
     ):
+        do_decode = True if decode_state is not None else False
+        extra_output = {} if do_decode else None
         q_sharding = jax.NamedSharding(
             jax.sharding.get_abstract_mesh(),
             from_logical_rules(("batch", "context", "model", None)),
         )
-        attention_interface = ATTENTION_INTERFACE[self.attn_impl]
-
+        if do_decode and self.attn_impl != "sdpa":
+            print(
+                f"Decoding requested (decode_state provided), but attn_impl='{self.attn_impl}' is not 'sdpa'. Falling back to 'sdpa'."
+            )
+            attention_interface = ATTENTION_INTERFACE["sdpa"]
+        else:
+            attention_interface = ATTENTION_INTERFACE[self.attn_impl]
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
         q = rearrange(
             q,
-            "b t (n h) -> b t n h",
+            "b t (n h) -> b t n h",  # (b, 1 , n, h) when decode
             n=self.num_attention_heads,
             h=self.head_dim,
         )
@@ -256,12 +265,18 @@ class Gemma3Attention(eqx.Module):
             freq,
             precision=jax.lax.Precision.HIGHEST,
         )
+
+        # TODO: make this rope a layer
         sin = jnp.sin(inp).astype(q.dtype)[:, :, None, :]
         cos = jnp.cos(inp).astype(q.dtype)[:, :, None, :]
         q1, q2 = q[:, :, :, : head_dim // 2], q[:, :, :, head_dim // 2 :]
         k1, k2 = k[:, :, :, : head_dim // 2], k[:, :, :, head_dim // 2 :]
         q = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+
+        if do_decode:
+            k, v, new_decode_state = make_kv_from_cache(k, v, pos, decode_state)
+            extra_output["decode_state"] = new_decode_state
 
         attn_output = attention_interface(
             q,
@@ -271,7 +286,7 @@ class Gemma3Attention(eqx.Module):
             q_sharding=q_sharding,
         )
         attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output), extra_output
 
 
 class Gemma3MLP(eqx.Module):
@@ -282,7 +297,7 @@ class Gemma3MLP(eqx.Module):
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         *,
         act_fn: str,
         rngs: PRNGKeyArray,
@@ -335,7 +350,7 @@ class Gemma3Layer(eqx.Module, Stackable):
 
     argnums: tuple[int, ...] = eqx.field(static=True, default=0)
     argnames: tuple[str, ...] = eqx.field(
-        static=True, default=("rope_theta", "is_sliding")
+        static=True, default=("rope_theta", "is_sliding", "decode_state")
     )
     in_axes: int = eqx.field(static=True, default=0)
 
@@ -343,7 +358,7 @@ class Gemma3Layer(eqx.Module, Stackable):
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         *,
         additional_config: AdditionalConfig,
         rngs: PRNGKeyArray,
@@ -403,6 +418,7 @@ class Gemma3Layer(eqx.Module, Stackable):
         attention_mask,
         is_sliding,
         pos: int,
+        decode_state: PyTree | None = None,
     ):
         attention_mask = jax.lax.select(
             is_sliding,
@@ -413,11 +429,12 @@ class Gemma3Layer(eqx.Module, Stackable):
         residual = x
         x_norm = self.input_layernorm(x)
         x_norm = reshard(x_norm, from_logical_rules(("batch", "context", None)))
-        attn_output = self.self_attn(
+        attn_output, extra_output = self.self_attn(
             x_norm,
             attention_mask=attention_mask,
             rope_theta=rope_theta,
             pos=pos,
+            decode_state=decode_state,
         )
         attn_output = self.post_attention_layernorm(attn_output)
         x = residual + attn_output
@@ -427,18 +444,18 @@ class Gemma3Layer(eqx.Module, Stackable):
         x_norm = reshard(x_norm, from_logical_rules(("batch", "context", None)))
         ffw = self.mlp(x_norm)
         ffw = self.post_feedforward_layernorm(ffw)
-        return residual + ffw
+        return residual + ffw, extra_output
 
 
-class Gemma3Model(AbstractHuggingFacePreTrainedModel):
-    config: Gemma3Config = eqx.field(static=True)
+class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
+    config: Gemma3TextConfig = eqx.field(static=True)
     embed_tokens: Embedding
     layers: list[Gemma3Layer] | StackModule[Gemma3Layer]
     norm: Gemma3RMSNorm
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         additional_config: AdditionalConfig,
         *,
         rngs: PRNGKeyArray,
@@ -481,12 +498,20 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
         dtype: jnp.dtype = jnp.float32,
         *,
         rngs: PRNGKeyArray | None = None,
+        decode_states: PyTree | None = None,
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)
-        mask_mapping = make_mask(self.config, x, **inputs)
 
-        forward_impl = self.config.additional_config["forward_impl"]
+        mask_mapping = make_mask(self.config, x, **inputs)
+        decode_states = (
+            [None] * self.config.num_hidden_layers
+            if decode_states is None
+            else decode_states
+        )
+        extra_output_list = []
+        forward_impl = forward_impl or self.config.additional_config["forward_impl"]
 
         if forward_impl not in tuple(ForwardImpl):
             raise ValueError(
@@ -498,10 +523,16 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
                 self.layers.unstack()
                 if isinstance(self.layers, StackModule)
                 else self.layers
-        )
-            fwd = jax.remat(Gemma3Layer.__call__) if layers[0].remat else Gemma3Layer.__call__
-            for layer, attention_type in zip(layers, self.config.layer_types):
-                x = fwd(
+            )
+            fwd = (
+                jax.remat(Gemma3Layer.__call__)
+                if layers[0].remat
+                else Gemma3Layer.__call__
+            )
+            for layer, attention_type, decode_state in zip(
+                layers, self.config.layer_types, decode_states
+            ):
+                x, extra_output = fwd(
                     layer,
                     x,
                     rope_theta=self.config.rope_parameters[attention_type][
@@ -510,8 +541,10 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
                     attention_mask=mask_mapping,
                     is_sliding=attention_type == "sliding_attention",
                     pos=pos,
+                    decode_state=decode_state,
                 )
-        elif forward_impl == ForwardImpl.SCAN_LAYER:
+                extra_output_list.append(extra_output)
+        elif forward_impl == ForwardImpl.SCAN:
             rope_theta, is_sliding = get_layer_metadata(self.config)
             layers = self.layers
             if isinstance(layers, list):
@@ -519,19 +552,22 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
                     Gemma3Layer,
                     layers,
                     0,
-                    argnames=("rope_theta", "is_sliding"),
+                    argnames=("rope_theta", "is_sliding", "decode_state"),
                     remat=self.config.additional_config["remat_layer"],
                 )
-            x = layers(
+            x, extra_output_list = layers(
                 x,
                 rope_theta=rope_theta,
                 attention_mask=mask_mapping,
                 is_sliding=is_sliding,
                 pos=pos,
+                decode_state=decode_states,
             )
 
         x = self.norm(x)
-        return reshard(x, from_logical_rules(("batch", "context", None)))
+        return reshard(
+            x, from_logical_rules(("batch", "context", None))
+        ), extra_output_list
 
     def embed(
         self,
@@ -546,13 +582,13 @@ class Gemma3Model(AbstractHuggingFacePreTrainedModel):
 
 
 class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
-    config: Gemma3Config = eqx.field(static=True)
-    model: Gemma3Model
+    config: Gemma3TextConfig = eqx.field(static=True)
+    model: Gemma3TextModel
     lm_head: Linear | None
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         additional_config: AdditionalConfig,
         *,
         rngs: PRNGKeyArray,
@@ -561,7 +597,7 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
     ):
         self.config = config
         model_rngs, lm_head_rngs = jax.random.split(rngs)
-        self.model = Gemma3Model(
+        self.model = Gemma3TextModel(
             config,
             additional_config,
             rngs=model_rngs,
@@ -587,9 +623,36 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
         dtype: jnp.dtype = jnp.float32,
         *,
         rngs: PRNGKeyArray | None = None,
+        decode_states: PyTree | None = None,
+        return_hidden_states=False,
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
-        return self.model(input_ids, pos, dtype, rngs = rngs, **inputs)
+        hidden_states, extra_outputs = self.model(
+            input_ids,
+            pos,
+            dtype,
+            rngs=rngs,
+            decode_states=decode_states,
+            forward_impl=forward_impl,
+            **inputs,
+        )
+
+        if return_hidden_states:
+            return hidden_states, extra_outputs
+
+        out_weights = (
+            self.lm_head.weight if self.lm_head else self.model.embed_tokens.weight
+        )
+        logits = einsum(
+            "btd,vd->btv",
+            hidden_states,
+            out_weights,
+            out_sharding=from_logical_rules(("batch", "context", "model")),
+            preferred_element_type=jnp.float32,
+        )
+
+        return logits, extra_outputs
 
     @property
     def lm_head_w(self):
@@ -614,15 +677,16 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
             preferred_element_type=jnp.float32,
         )
 
+
 class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
-    config: Gemma3Config = eqx.field(static = True)
-    model: Gemma3Model
+    config: Gemma3TextConfig = eqx.field(static=True)
+    model: Gemma3TextModel
     score: Linear
-    num_labels: int = eqx.field(static = True)
+    num_labels: int = eqx.field(static=True)
 
     def __init__(
         self,
-        config: Gemma3Config,
+        config: Gemma3TextConfig,
         additional_config: AdditionalConfig,
         *,
         rngs: PRNGKeyArray,
@@ -632,14 +696,20 @@ class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
         self.config = config
         model_rngs, score_rngs = jax.random.split(rngs)
         self.num_labels = config.num_labels or additional_config.num_labels
-        self.model = Gemma3Model(
+        self.model = Gemma3TextModel(
             config,
             additional_config,
             rngs=model_rngs,
             param_dtype=param_dtype,
             store_config=store_config,
         )
-        self.score = Linear(config.hidden_size, self.num_labels, use_bias=False, param_dtype = param_dtype, rngs = score_rngs)
+        self.score = Linear(
+            config.hidden_size,
+            self.num_labels,
+            use_bias=False,
+            param_dtype=param_dtype,
+            rngs=score_rngs,
+        )
 
     def __call__(
         self,
@@ -648,8 +718,16 @@ class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
         dtype: jnp.dtype = jnp.float32,
         *,
         rngs: PRNGKeyArray | None = None,
+        forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
-        hidden_states = self.model( input_ids, pos, dtype, rngs = rngs, **inputs )
+        hidden_states = self.model(
+            input_ids,
+            pos,
+            dtype,
+            rngs=rngs,
+            forward_impl=forward_impl,
+            **inputs,
+        )
         output = self.score(hidden_states)
         return output

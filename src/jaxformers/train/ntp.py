@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-import optax
 import sws
 from jax.experimental.rnn import PRNGKeyArray
 from optax import microbatch
@@ -75,27 +74,43 @@ def train_state_context(train_state: TrainState):
         yield
 
 
-def predict_fn(train_state: TrainState, batch):
+def predict_fn(train_state: TrainState, batch, *, forward_dtype):
     with train_state_context(train_state):
-        hidden = train_state.model(**batch["inputs"])
-        return train_state.model.unembed(hidden)
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        return train_state.model.unembed(hidden_states)
 
 
-def loss_fn(model, batch, rngs=None):
+def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_impl):
     del rngs
-    logits = predict_fn(model, batch)
-    return {
-        "loss": optax.softmax_cross_entropy_with_integer_labels(logits, batch["labels"])
-    }
+    with train_state_context(train_state):
+        hidden_states, _ = train_state.model(
+            **batch["inputs"],
+            dtype=forward_dtype,
+            return_hidden_states=True,
+        )
+        batch_shape = batch["labels"].shape
+        loss = cross_entropy_loss(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            batch["labels"].reshape(-1),
+            train_state.model.lm_head_w,
+            reduction=None,
+            implementation=loss_impl,
+        )
+        return {"loss": loss.reshape(batch_shape)}
 
 
 def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs):
     def loss_fn(train_model, freeze_model, batch, rngs):
         model = tree_util.combine(train_model, freeze_model)
-        hidden_states = model(
+        hidden_states, _ = model(
             **batch["inputs"],
             rngs=rngs,
             dtype=config.forward_dtype,
+            return_hidden_states = True,
         )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
@@ -376,7 +391,18 @@ def main(config: sws.FinalConfig):
             evaluators = None
             if do_eval:
                 evaluators = make_eval(
-                    config.eval.to_dict(), {"predict": predict_fn, "loss": loss_fn}
+                    config.eval.to_dict(),
+                    {
+                        "predict": partial(
+                            predict_fn,
+                            forward_dtype=config.forward_dtype,
+                        ),
+                        "loss": partial(
+                            loss_fn,
+                            forward_dtype=config.forward_dtype,
+                            loss_impl=config.loss_impl,
+                        ),
+                    },
                 )
 
         _, metrics = train(

@@ -5,7 +5,6 @@ from functools import partial
 
 from jaxformers import tree_util
 from jaxformers.benchmark_utils import print_timing
-from jaxformers.optimizer_utils import mask_trainable_lora
 
 
 @print_timing
@@ -20,6 +19,8 @@ def make_optimizer(optimizer_name: str, train_state, scheduler, optimizer_config
 
     train_mask = None
     if train_state.is_lora:
+        from jaxformers.optimizer_utils import mask_trainable_lora
+
         train_mask = mask_trainable_lora(train_state.model)
         train_state = dataclasses.replace(train_state, train_mask=train_mask)
 

@@ -21,6 +21,10 @@ from jaxformers.module_utils import (
     ForwardImpl,
     Stackable,
     StackModule,
+    ToVllmMappingAbstract,
+    VllmMapping,
+    VllmWeightLeaf,
+    VllmWeightState,
 )
 from jaxformers.nn import Embedding, Linear
 from jaxformers.sampling_utils import make_kv_from_cache
@@ -581,7 +585,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         return self.embed_tokens(input_ids, dtype=dtype)
 
 
-class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
+class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract):
     config: Gemma3TextConfig = eqx.field(static=True)
     model: Gemma3TextModel
     lm_head: Linear | None
@@ -675,6 +679,92 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
             out_weights,
             out_sharding=from_logical_rules(("batch", "context", "model")),
             preferred_element_type=jnp.float32,
+        )
+
+    def to_vllm(self) -> VllmMapping:
+        leaves: list[tuple[tuple[str, ...], VllmWeightLeaf]] = []
+        mappings: dict[str, tuple[str, tuple[str, ...] | None]] = {}
+
+        def add(path: str, value: jax.Array):
+            key = tuple(path.split("."))
+            leaves.append((key, VllmWeightLeaf(value=value)))
+            mappings[path] = (path, None)
+
+        add("model.embed_tokens.weight", self.model.embed_tokens.weight)
+
+        layers = (
+            self.model.layers.unstack()
+            if isinstance(self.model.layers, StackModule)
+            else self.model.layers
+        )
+        for layer_idx, layer in enumerate(layers):
+            prefix = f"model.layers.{layer_idx}"
+            qkv_weight = jnp.concatenate(
+                (
+                    layer.self_attn.q_proj.weight,
+                    layer.self_attn.k_proj.weight,
+                    layer.self_attn.v_proj.weight,
+                ),
+                axis=0,
+            )
+            add(f"{prefix}.self_attn.qkv_proj.weight", qkv_weight)
+            if layer.self_attn.q_proj.bias is not None:
+                qkv_bias = jnp.concatenate(
+                    (
+                        layer.self_attn.q_proj.bias,
+                        layer.self_attn.k_proj.bias,
+                        layer.self_attn.v_proj.bias,
+                    ),
+                    axis=0,
+                )
+                add(f"{prefix}.self_attn.qkv_proj.bias", qkv_bias)
+            add(f"{prefix}.self_attn.o_proj.weight", layer.self_attn.o_proj.weight)
+            if layer.self_attn.o_proj.bias is not None:
+                add(f"{prefix}.self_attn.o_proj.bias", layer.self_attn.o_proj.bias)
+            add(f"{prefix}.self_attn.q_norm.weight", layer.self_attn.q_norm.weight)
+            add(f"{prefix}.self_attn.k_norm.weight", layer.self_attn.k_norm.weight)
+            add(f"{prefix}.input_layernorm.weight", layer.input_layernorm.weight)
+            add(
+                f"{prefix}.post_attention_layernorm.weight",
+                layer.post_attention_layernorm.weight,
+            )
+            add(
+                f"{prefix}.pre_feedforward_layernorm.weight",
+                layer.pre_feedforward_layernorm.weight,
+            )
+            add(
+                f"{prefix}.post_feedforward_layernorm.weight",
+                layer.post_feedforward_layernorm.weight,
+            )
+            gate_up_weight = jnp.concatenate(
+                (
+                    layer.mlp.gate_proj.weight,
+                    layer.mlp.up_proj.weight,
+                ),
+                axis=0,
+            )
+            add(f"{prefix}.mlp.gate_up_proj.weight", gate_up_weight)
+            if layer.mlp.gate_proj.bias is not None:
+                gate_up_bias = jnp.concatenate(
+                    (
+                        layer.mlp.gate_proj.bias,
+                        layer.mlp.up_proj.bias,
+                    ),
+                    axis=0,
+                )
+                add(f"{prefix}.mlp.gate_up_proj.bias", gate_up_bias)
+            add(f"{prefix}.mlp.down_proj.weight", layer.mlp.down_proj.weight)
+            if layer.mlp.down_proj.bias is not None:
+                add(f"{prefix}.mlp.down_proj.bias", layer.mlp.down_proj.bias)
+
+        add("model.norm.weight", self.model.norm.weight)
+        if self.lm_head is not None:
+            add("lm_head.weight", self.lm_head.weight)
+
+        return VllmMapping(
+            state=VllmWeightState(leaves=leaves),
+            mappings=mappings,
+            transpose_keys={},
         )
 
 

@@ -1,11 +1,14 @@
 import importlib
 
 from .huggingface import HuggingFaceSourceIterDataset, HuggingFaceSourceMapDataset
+from .verifiers import VerifiersDataset, VerifiersSourceIterDataset
 
 
 __all__ = [
     "HuggingFaceSourceIterDataset",
     "HuggingFaceSourceMapDataset",
+    "VerifiersDataset",
+    "VerifiersSourceIterDataset",
     "make_source",
 ]
 

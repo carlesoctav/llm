@@ -83,6 +83,16 @@ def dummy_mask_function(b, h, q, kv):
     return True
 
 
+def make_dummy_interface(
+    q_length: int,
+    kv_length: int,
+    mask_function: MaskFn,
+    padding_mask: Bool[Array, "B T"] | None = None,
+    batch_size: int | None = None,
+    nheads: int | None = None,
+):
+    return jnp.zeros((1,), dtype=jnp.bool_)
+
 def make_bool_interface(
     q_length: int,
     kv_length: int,
@@ -119,6 +129,7 @@ class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
         "sdpa": make_bool_interface,
         "xla_chunked": make_bool_interface,
         "chunked_manual": make_bool_interface,
+        "tpu_flash": make_dummy_interface,
     }
 
 

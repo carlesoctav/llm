@@ -73,6 +73,8 @@ Rules:
 
 - Prefer minimal code paths over defensive abstractions when the caller, config, or upstream library is trusted.
 
+- If an argument is part of the positional call shape, pass it positionally instead of spelling it as `name=name`. Reserve keyword passing for keyword-only args or when the API actually requires it.
+
 - Avoid redundant type casts like int(...), float(...), or bool(...) when the value type is already guaranteed by config, validation, or the caller. Only cast when converting genuinely untyped external data or when an API explicitly requires a different type.
 
 - If you're not really sure about a runtime behavior, inferred type, or library contract, check it in a REPL instead of guessing.

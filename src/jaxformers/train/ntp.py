@@ -345,13 +345,15 @@ def main(config: sws.FinalConfig):
                     config.lora.to_dict(),
                     rngs=lora_rngs,
                 )
+            if config.weights_impl == "stack":
+                model = train_state.model.stack()
+            elif config.weights_impl == "stack_block":
+                model = train_state.model.stack_block()
+            else:
+                model = train_state.model
             train_state = dataclasses.replace(
                 train_state,
-                model=(
-                    train_state.model.stack()
-                    if config.weights_impl == "stack"
-                    else train_state.model
-                ),
+                model=model,
             )
 
             train_state = make_optimizer(

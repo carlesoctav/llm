@@ -35,6 +35,7 @@ def profiler(path: str) -> Callback:
 
         elif host_state["active"]:
             jax.block_until_ready(train_state.model)
+            # jax.profiler.save_device_memory_profile(f"{path}/memory.prof")
             jax.profiler.stop_trace()
             host_state["active"] = False
             host_state["done"] = True

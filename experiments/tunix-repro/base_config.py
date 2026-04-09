@@ -34,9 +34,9 @@ def get_config():
 
     config.callback.log_grad_norm = {}
     config.callback.log_learning_rate = {}
-    config.callback.profiler.path = "/mnt/carles/llm/trace/debug-remat-attention/no-remat-scan-bug"
-    config.callback.log_performance.real_step_threshold = 0
-    config.callback.log_performance.denom_keys = ["token"]
+    config.callback.profiler.path = "/mnt/carles/llm/trace/gemma3/scan"
+    # config.callback.log_performance.real_step_threshold = 0
+    # config.callback.log_performance.denom_keys = ["token"]
 
     # config.load_state.path =
     # config.load_state.target =
@@ -104,7 +104,7 @@ def get_config():
     config.data.train.transforms = transforms_config()
 
     config.data.loader.shard = False
-    config.data.train.loader = loader_config(num_workers=8)
+    config.data.train.loader = loader_config(num_workers=1)
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

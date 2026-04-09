@@ -509,13 +509,15 @@ def main(config: sws.FinalConfig):
                     config.lora.to_dict(),
                     rngs=lora_rngs,
                 )
+            if config.weights_impl == "stack":
+                model = train_state.model.stack()
+            elif config.weights_impl == "stack_block":
+                model = train_state.model.stack_block()
+            else:
+                model = train_state.model
             train_state = dataclasses.replace(
                 train_state,
-                model=(
-                    train_state.model.stack()
-                    if config.weights_impl == "stack"
-                    else train_state.model
-                ),
+                model=model,
             )
             train_state = make_optimizer(
                 config.optimizer_name,
@@ -528,13 +530,15 @@ def main(config: sws.FinalConfig):
             if do_lora:
                 base_train_state = None
             else:
+                if config.weights_impl == "stack":
+                    base_model = base_train_state.model.stack()
+                elif config.weights_impl == "stack_block":
+                    base_model = base_train_state.model.stack_block()
+                else:
+                    base_model = base_train_state.model
                 base_train_state = dataclasses.replace(
                     base_train_state,
-                    model=(
-                        base_train_state.model.stack()
-                        if config.weights_impl == "stack"
-                        else base_train_state.model
-                    ),
+                    model=base_model,
                 )
                 base_train_state = tree_util.copy(base_train_state)
 

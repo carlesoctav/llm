@@ -36,7 +36,7 @@ from jaxformers.eval import make_eval
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import TrainState
 from jaxformers.models import make_model
-from jaxformers.ops.cross_entropy.api import cross_entropy_loss
+from jaxformers.ops.cross_entropy.maxtext import linear_cross_entropy_maxtext
 from jaxformers.optimizers import make_optimizer
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sharding_utils import (
@@ -85,7 +85,7 @@ def predict_fn(train_state: TrainState, batch, *, forward_dtype):
 
 
 def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_impl):
-    del rngs
+    del rngs, loss_impl
     with train_state_context(train_state):
         hidden_states, _ = train_state.model(
             **batch["inputs"],
@@ -93,12 +93,11 @@ def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_im
             return_hidden_states=True,
         )
         batch_shape = batch["labels"].shape
-        loss = cross_entropy_loss(
+        loss = linear_cross_entropy_maxtext(
             hidden_states.reshape(-1, hidden_states.shape[-1]),
             batch["labels"].reshape(-1),
             train_state.model.lm_head_w,
             reduction=None,
-            implementation=loss_impl,
         )
         return {"loss": loss.reshape(batch_shape)}
 
@@ -116,12 +115,11 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
         labels = batch["labels"].reshape(-1)
         count = jnp.sum(batch["loss_mask"])
         mask = batch["loss_mask"].reshape(-1)
-        loss = cross_entropy_loss(
+        loss = linear_cross_entropy_maxtext(
             hidden_states,
             labels,
             model.lm_head_w,
             mask=mask,
-            implementation=config.loss_impl,
         )
 
         batch_size = batch["labels"].shape[0]

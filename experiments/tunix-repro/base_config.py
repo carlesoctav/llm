@@ -49,7 +49,7 @@ def get_config():
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_impl = "sdpa"
-    config.model.param_dtype = lambda: jnp.bfloat16
+    config.model.param_dtype = lambda: jnp.float32
 
     def ds_config(ds_name, split, streaming):
         return {

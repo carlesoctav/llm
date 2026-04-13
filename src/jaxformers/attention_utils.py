@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import tokamax
 from jaxtyping import Array, Bool, Float, PRNGKeyArray
 
-from jaxformers.ops.attention import chunked_manual_dot_product_attention
 from jaxformers.ops.attention.xla_chunked import (
     TokamaxRematXlaChunkedDotProductAttention,
 )

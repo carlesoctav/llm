@@ -90,7 +90,7 @@ def make_bool_interface(
     padding_mask: Bool[Array, "B T"] | None = None,
     batch_size: int | None = None,
     nheads: int | None = None,
-) -> Bool[Array, "B T S"] | Bool[Array, "B N T S"] | Bool[Array, "T S"]:
+) -> Bool[Array, "B 1 T S"]:
     batch_arange = jnp.arange(batch_size, dtype=jnp.int32)
     q_arange = jnp.arange(q_length, dtype=jnp.int32)
     kv_arange = jnp.arange(kv_length, dtype=jnp.int32)
@@ -130,7 +130,7 @@ def make_causal_mask(
     input_embeds: Float[Array, "B T H"],
     attention_mask: Bool[Array, "B T"] | None = None,
     segment_ids: Int[Array, "B T"] | None = None,
-) -> Bool[Array, "B T T"] | BlockMask:
+) -> Bool[Array, " B 1 T T"]:
     """
     Generates a mask for causal attention.
     Right now, only support for training.
@@ -172,7 +172,6 @@ def make_causal_mask(
         padding_mask=padding_mask,
         nheads=None,
     )
-
     return causal_mask
 
 
@@ -222,7 +221,6 @@ def make_bidirectional_mask(
         padding_mask=padding_mask,
         nheads=None,
     )
-
     return full_mask
 
 
@@ -275,7 +273,6 @@ def slliding_window_full_mask(
         padding_mask=padding_mask,
         nheads=None,
     )
-
     return sliding_mask
 
 
@@ -314,5 +311,4 @@ def make_sliding_window_causal_mask(
         padding_mask=padding_mask,
         nheads=None,
     )
-
     return sliding_causal_mask

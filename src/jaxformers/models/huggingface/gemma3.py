@@ -42,14 +42,6 @@ def get_layer_metadata(config: Gemma3TextConfig) -> tuple[jax.Array, jax.Array]:
     )
     return rope_theta, is_sliding
 
-
-def gemma_rms_norm(x: jax.Array, weight: jax.Array, eps: float):
-    x_fp32 = x.astype(jnp.float32)
-    rms = jnp.sqrt(jnp.square(x_fp32).mean(-1, keepdims=True) + eps)
-    out = (x_fp32 / rms) * (1.0 + weight.astype(jnp.float32))
-    return out.astype(x.dtype)
-
-
 def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array]:
     if hidden_activation in ("gelu_pytorch_tanh", "gelu_new"):
         return lambda x: jax.nn.gelu(x, approximate=True)
@@ -84,8 +76,8 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
         )
 
     return {
-        "full_attention": full_mask,
-        "sliding_attention": sliding_mask,
+        "full_attention": reshard(full_mask, from_logical_rules(("batch", None, None, None))),
+        "sliding_attention": reshard(sliding_mask, from_logical_rules(("batch", None, None, None))),
     }
 
 
@@ -112,7 +104,11 @@ class Gemma3RMSNorm(eqx.Module):
         self.weight = jax.device_put(jnp.zeros((dim,), param_dtype), weight_sharding)
 
     def __call__(self, x):
-        return gemma_rms_norm(x, self.weight, self.eps)
+        x_fp32 = jnp.asarray(x, jnp.float32)
+        mean2 = jnp.mean(jax.lax.square(x_fp32), axis=-1, keepdims=True)
+        y = jnp.asarray(x_fp32 * jax.lax.rsqrt(mean2 + self.eps), x.dtype)
+        scale = jnp.asarray(1.0 + self.weight, dtype = x.dtype)
+        return jnp.einsum("i...k,...k->i...k", y, scale, preferred_element_type= x.dtype)
 
 
 class Gemma3Attention(eqx.Module):
@@ -202,7 +198,7 @@ class Gemma3Attention(eqx.Module):
         self.head_dim = head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.query_scale = (config.head_dim / config.query_pre_attn_scalar) ** 0.5
+        self.query_scale = ( 1 / config.query_pre_attn_scalar) ** 0.5
         self.attn_impl = attn_impl
 
     def __call__(
@@ -253,7 +249,7 @@ class Gemma3Attention(eqx.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = q * jnp.asarray(self.query_scale, dtype=q.dtype)
+
         bsz, seqlen, _nheads, head_dim = q.shape
         positions = pos + jnp.broadcast_to(jnp.arange(seqlen)[None, :], [bsz, seqlen])
         freq = 1.0 / (
@@ -274,6 +270,7 @@ class Gemma3Attention(eqx.Module):
         q = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
+
         if do_decode:
             k, v, new_decode_state = make_kv_from_cache(k, v, pos, decode_state)
             extra_output["decode_state"] = new_decode_state
@@ -283,6 +280,7 @@ class Gemma3Attention(eqx.Module):
             k,
             v,
             mask=attention_mask,
+            scale = self.query_scale,
             q_sharding=q_sharding,
         )
         attn_output = rearrange(attn_output, "b t n h -> b t (n h)")

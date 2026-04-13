@@ -9,7 +9,7 @@ from typing import Callable
 import grain
 import jax
 from grain import DatasetIterator, IterDataset, MapDataset
-from jax import P
+from jax import NamedSharding, P
 from jax.sharding import Mesh, PartitionSpec
 
 from jaxformers.data.loader._group import prepare_group
@@ -144,7 +144,10 @@ def make_simple_loader(
     # think more about local data -> global data
     if shard:
         return ProcessShardedIterDataset(mixed, P(BATCH), mesh)
-    return mixed
+    return grain.experimental.device_put(
+        mixed,
+        NamedSharding(mesh, P(None)),
+    )
 
 
 def make(

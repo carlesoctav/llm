@@ -4,8 +4,6 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from jaxformers.utils import GeneralInterface
-
 
 BlockMask = Array
 MaskImpl = tp.Callable
@@ -113,18 +111,6 @@ def make_bool_interface(
         return mask_output.astype(jnp.bool)[:, None, :, :]
 
 
-class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
-    _global_mapping = {
-        "eager": make_bool_interface,
-        "sdpa": make_bool_interface,
-        "xla_chunked": make_bool_interface,
-        "chunked_manual": make_bool_interface,
-    }
-
-
-ATTENTION_MASK_INTERFACE = AttentionMaskInterface()
-
-
 def make_causal_mask(
     mask_impl: str,
     input_embeds: Float[Array, "B T H"],
@@ -153,7 +139,7 @@ def make_causal_mask(
     # Need to think more about maskign for inference but whatever
     B, T, H = input_embeds.shape
 
-    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
+    del mask_impl
     mask_factory_function = causal_mask_function
 
     padding_mask = None
@@ -164,7 +150,7 @@ def make_causal_mask(
     elif attention_mask is not None:
         padding_mask = attention_mask
 
-    causal_mask = mask_interface(
+    causal_mask = make_bool_interface(
         batch_size=B,
         q_length=T,
         kv_length=T,
@@ -202,7 +188,7 @@ def make_bidirectional_mask(
 
     B, T, H = input_embeds.shape
 
-    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
+    del mask_impl
     mask_factory_function = dummy_mask_function
 
     padding_mask = None
@@ -213,7 +199,7 @@ def make_bidirectional_mask(
     elif attention_mask is not None:
         padding_mask = attention_mask
 
-    full_mask = mask_interface(
+    full_mask = make_bool_interface(
         batch_size=B,
         q_length=T,
         kv_length=T,
@@ -252,7 +238,7 @@ def slliding_window_full_mask(
     """
     B, T, H = input_embeds.shape
 
-    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
+    del mask_impl
     mask_factory_function = and_masks(
         sliding_window_mask_overlay(window_size), dummy_mask_function
     )
@@ -265,7 +251,7 @@ def slliding_window_full_mask(
     elif attention_mask is not None:
         padding_mask = attention_mask
 
-    sliding_mask = mask_interface(
+    sliding_mask = make_bool_interface(
         batch_size=B,
         q_length=T,
         kv_length=T,
@@ -289,7 +275,7 @@ def make_sliding_window_causal_mask(
     """
 
     B, T, _H = input_embeds.shape
-    mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
+    del mask_impl
     mask_factory_function = and_masks(
         sliding_window_causal_overlay(window_size),
         causal_mask_function,
@@ -303,7 +289,7 @@ def make_sliding_window_causal_mask(
     elif attention_mask is not None:
         padding_mask = attention_mask
 
-    sliding_causal_mask = mask_interface(
+    sliding_causal_mask = make_bool_interface(
         batch_size=B,
         q_length=T,
         kv_length=T,

@@ -274,3 +274,5 @@ tests/           unit tests
 - If you use the provided experiment configs, update checkpoint and project paths before launching.
 - Keep `skip_eval = True` unless you also implement an evaluation path.
 - For local experimentation, start with `loss_impl = "reference"` if you want the simplest loss path, then switch to `"xla_chunked"` when tuning memory and scale.
+
+This Research is supported with Cloud TPUs from Google’s TPU Research Cloud (TRC)

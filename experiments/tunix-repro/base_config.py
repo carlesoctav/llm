@@ -77,7 +77,7 @@ def get_config():
         batch_size=32,
         shuffle=False,
         num_workers=0,
-        num_threads=8,
+        num_threads=1,
         prefetch_buffer_size=500,
         per_worker_buffer_size=1,
     ):
@@ -97,7 +97,7 @@ def get_config():
     config.eval.minival.transforms_name = "ntp"
     config.eval.minival.data = ds_config(ds_name, "train[:1%]", True)
     config.eval.minival.transforms = transforms_config()
-    config.eval.minival.loader = loader_config(num_workers=8)
+    config.eval.minival.loader = loader_config(num_workers=0)
 
     config.data.train.transforms_name = "ntp"
     config.data.train.source = ds_config(ds_name, "train", True)

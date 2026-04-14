@@ -117,7 +117,7 @@ def make_scan_fwd(
             init=carry,
             xs=(scan_args, scan_kwargs),
             length=length,
-            unroll=6,
+            unroll = False,
         )
         return carry, ys
 

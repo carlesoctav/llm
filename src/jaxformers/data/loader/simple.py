@@ -144,6 +144,7 @@ def make_simple_loader(
     # think more about local data -> global data
     if shard:
         return ProcessShardedIterDataset(mixed, P(BATCH), mesh)
+    # return mixed
     return grain.experimental.device_put(
         mixed,
         NamedSharding(mesh, P(None)),

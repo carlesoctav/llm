@@ -172,8 +172,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
 
 
 def sync_inference_weights(train_state: TrainState, llm_client) -> None:
-    with train_state_context(train_state):
-        llm_client.update_weights(train_state.model)
+    llm_client.update_weights(train_state.model)
 
 
 def train(
@@ -358,11 +357,29 @@ def main(config: sws.FinalConfig):
                     callbacks=callbacks,
                 )
 
+        vllm_config = config.vllm.to_dict()
+        if "additional_config" in vllm_config:
+            additional_config = dict(vllm_config["additional_config"])
+        else:
+            additional_config = {}
+        if "sharding" in additional_config:
+            sharding = dict(additional_config["sharding"])
+        else:
+            sharding = {}
+        if "sharding_strategy" in sharding:
+            sharding_strategy = dict(sharding["sharding_strategy"])
+        else:
+            sharding_strategy = {}
+        sharding_strategy["device_indexes"] = mesh.device_ids.flatten().tolist()
+        sharding["sharding_strategy"] = sharding_strategy
+        additional_config["sharding"] = sharding
+        vllm_config["additional_config"] = additional_config
+
         llm_client = make_llm_client(
             config.inference.mode,
             model=config.model.model_id,
             tokenizer=config.model.model_id,
-            vllm_config=config.vllm.to_dict(),
+            vllm_config=vllm_config,
         )
         sync_inference_weights(train_state, llm_client)
         train_ds = make_rl_data(config, llm_client)

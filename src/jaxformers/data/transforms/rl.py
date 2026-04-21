@@ -13,6 +13,7 @@ def _flatten_trajectory_tokens(trajectory: list[dict[str, Any]]):
     predicted_positions: list[tuple[int, float, int]] = []
     first_step = True
 
+
     for step in trajectory:
         tokens = step["tokens"]
         if tokens is None:

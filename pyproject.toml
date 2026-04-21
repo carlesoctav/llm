@@ -13,13 +13,15 @@ dependencies = [
     "optax==0.2.8",
     "orbax==0.1.9",
     "orbax-checkpoint==0.11.33",
-    "quax==0.2.1",
+    "quax==0.3.0",
     "sws-config==0.7.1",
     "tabulate==0.10.0",
     "tokamax==0.0.10",
+    "tpu-inference",
     "tpu-info==0.8.1",
     "tqdm==4.67.3",
     "transformers==5.3.0",
+    "vllm",
     "wandb==0.25.0",
     "xprof==2.22.0",
 ]
@@ -29,6 +31,7 @@ tpu = [
     "tpu-inference",
     "vllm",
     "torchvision==0.25.0",
+    "verifiers>=0.1.11",
 ]
 
 [build-system]
@@ -65,8 +68,13 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
-tpu-inference = { git = "https://github.com/vllm-project/tpu-inference", rev = "e6fa6ebd79cb7c034f91d635f3d97dc893ced949" }
-vllm = { git = "https://github.com/vllm-project/vllm", rev = "c5e3454e5adf063d5af75140c36a7f900a9e4c4c" }
+tpu-inference = { workspace = true, editable = true }
+vllm = { git = "https://github.com/vllm-project/vllm", rev = "08bfedc152f064d8e84f85c4f42b810e5a564229" }
+
+[tool.uv.workspace]
+members = [
+    "others/tpu-inference",
+]
 
 [dependency-groups]
 dev = [

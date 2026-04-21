@@ -75,7 +75,7 @@ def make_rl_data(config: sws.FinalConfig, llm_client):
     transforms = make_transforms("rl", {})
     dataset = transform_ds(source, *transforms)
     loader_config = config.data.loader.to_dict()
-    target_len = _round_up_multiple(config.vllm.max_num_batched_tokens, 128)
+    target_len = 2048
     dataset = dataset.batch(
         loader_config["batch_size"],
         batch_fn=partial(batch_rl_data, target_len=target_len),

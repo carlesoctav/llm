@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from einops import rearrange
 from jax.sharding import PartitionSpec as P, reshard
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
-from transformers import Gemma3TextConfig
+from transformers import Qwen3Config
 
 from jaxformers.attention_utils import ATTENTION_INTERFACE
 from jaxformers.dispatch.einsum import einsum
@@ -31,39 +31,32 @@ from jaxformers.sampling_utils import make_kv_from_cache
 from jaxformers.sharding_utils import from_logical_rules
 
 
-def get_layer_metadata(config: Gemma3TextConfig) -> tuple[jax.Array, jax.Array]:
-    layer_types = config.layer_types
-    rope_theta = jnp.asarray(
-        [
-            config.rope_parameters[attention_type]["rope_theta"]
-            for attention_type in layer_types
-        ],
-        dtype=jnp.float32,
-    )
-    is_sliding = jnp.asarray(
-        [attention_type == "sliding_attention" for attention_type in layer_types],
-        dtype=jnp.bool_,
-    )
-    return rope_theta, is_sliding
-
-
-def gemma_rms_norm(x: jax.Array, weight: jax.Array, eps: float):
+def qwen3_rms_norm(x: jax.Array, weight: jax.Array, eps: float):
     x_fp32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.square(x_fp32).mean(-1, keepdims=True) + eps)
-    out = (x_fp32 / rms) * (1.0 + weight.astype(jnp.float32))
+    out = (x_fp32 / rms) * weight.astype(jnp.float32)
     return out.astype(x.dtype)
 
 
-def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array]:
-    if hidden_activation in ("gelu_pytorch_tanh", "gelu_new"):
-        return lambda x: jax.nn.gelu(x, approximate=True)
-    if hidden_activation == "gelu":
-        return lambda x: jax.nn.gelu(x, approximate=False)
-    if hidden_activation == "silu":
+def get_activation_fn(hidden_act: str) -> Callable[[jax.Array], jax.Array]:
+    if hidden_act == "silu":
         return jax.nn.silu
-    if hidden_activation == "relu":
+    if hidden_act == "gelu":
+        return lambda x: jax.nn.gelu(x, approximate=False)
+    if hidden_act in ("gelu_new", "gelu_pytorch_tanh"):
+        return lambda x: jax.nn.gelu(x, approximate=True)
+    if hidden_act == "relu":
         return jax.nn.relu
-    raise ValueError(f"Unsupported hidden activation {hidden_activation!r}")
+    raise ValueError(f"Unsupported hidden activation {hidden_act!r}")
+
+
+def get_rope_theta(config: Qwen3Config) -> jax.Array:
+    rope_parameters = config.rope_parameters
+    if rope_parameters["rope_type"] != "default":
+        raise ValueError(
+            f"Unsupported Qwen3 rope_type {rope_parameters['rope_type']!r}"
+        )
+    return jnp.asarray(rope_parameters["rope_theta"], dtype=jnp.float32)
 
 
 def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
@@ -75,25 +68,28 @@ def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwa
         }
 
     full_mask = make_causal_mask(attn_impl, input_embeds, attention_mask, segment_ids)
-    window_size = config.sliding_window
-    if window_size is None:
+    if config.sliding_window is None:
         sliding_mask = full_mask
     else:
         sliding_mask = make_sliding_window_causal_mask(
             attn_impl,
             input_embeds,
-            window_size,
+            config.sliding_window,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
         )
 
     return {
-        "full_attention": full_mask,
-        "sliding_attention": sliding_mask,
+        "full_attention": reshard(
+            full_mask, from_logical_rules(("batch", None, None, None))
+        ),
+        "sliding_attention": reshard(
+            full_mask, from_logical_rules(("batch", None, None, None))
+        ),
     }
 
 
-class Gemma3RMSNorm(eqx.Module):
+class Qwen3RMSNorm(eqx.Module):
     weight: Array
 
     dim: int = eqx.field(static=True)
@@ -113,30 +109,30 @@ class Gemma3RMSNorm(eqx.Module):
         self.eps = eps
         self.w_sharding = w_sharding
         weight_sharding = P() if self.w_sharding is None else self.w_sharding
-        self.weight = jax.device_put(jnp.zeros((dim,), param_dtype), weight_sharding)
+        self.weight = jax.device_put(jnp.ones((dim,), param_dtype), weight_sharding)
 
     def __call__(self, x):
-        return gemma_rms_norm(x, self.weight, self.eps)
+        return qwen3_rms_norm(x, self.weight, self.eps)
 
 
-class Gemma3Attention(eqx.Module):
+class Qwen3Attention(eqx.Module):
     q_proj: Linear
     k_proj: Linear
     v_proj: Linear
     o_proj: Linear
 
-    q_norm: Gemma3RMSNorm
-    k_norm: Gemma3RMSNorm
+    q_norm: Qwen3RMSNorm
+    k_norm: Qwen3RMSNorm
 
     head_dim: int = eqx.field(static=True)
     num_attention_heads: int = eqx.field(static=True)
     num_key_value_heads: int = eqx.field(static=True)
-    query_scale: float = eqx.field(static=True)
+    scaling: float = eqx.field(static=True)
     attn_impl: str = eqx.field(static=True)
 
     def __init__(
         self,
-        config: Gemma3TextConfig,
+        config: Qwen3Config,
         *,
         attn_impl: str,
         rngs: PRNGKeyArray,
@@ -191,13 +187,13 @@ class Gemma3Attention(eqx.Module):
             out_sharding=from_logical_rules(("batch", "sequence", None)),
             w_sharding=from_logical_rules(("fsdp", "model")),
         )
-        self.q_norm = Gemma3RMSNorm(
+        self.q_norm = Qwen3RMSNorm(
             head_dim,
             rngs=q_norm_rngs,
             param_dtype=param_dtype,
             eps=config.rms_norm_eps,
         )
-        self.k_norm = Gemma3RMSNorm(
+        self.k_norm = Qwen3RMSNorm(
             head_dim,
             rngs=k_norm_rngs,
             param_dtype=param_dtype,
@@ -206,7 +202,7 @@ class Gemma3Attention(eqx.Module):
         self.head_dim = head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.query_scale = config.query_pre_attn_scalar**-0.5
+        self.scaling = head_dim**-0.5
         self.attn_impl = attn_impl
 
     def __call__(
@@ -214,11 +210,11 @@ class Gemma3Attention(eqx.Module):
         x: Float[Array, "B T D"],
         *,
         attention_mask,
-        rope_theta: float,
+        rope_theta: jax.Array,
         pos: int = 0,
         decode_state: PyTree | None = None,
     ):
-        do_decode = True if decode_state is not None else False
+        do_decode = decode_state is not None
         extra_output = {} if do_decode else None
         q_sharding = jax.NamedSharding(
             jax.sharding.get_abstract_mesh(),
@@ -231,13 +227,14 @@ class Gemma3Attention(eqx.Module):
             attention_interface = ATTENTION_INTERFACE["sdpa"]
         else:
             attention_interface = ATTENTION_INTERFACE[self.attn_impl]
+
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
         q = rearrange(
             q,
-            "b t (n h) -> b t n h",  # (b, 1 , n, h) when decode
+            "b t (n h) -> b t n h",
             n=self.num_attention_heads,
             h=self.head_dim,
         )
@@ -257,7 +254,6 @@ class Gemma3Attention(eqx.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = q * jnp.asarray(self.query_scale, dtype=q.dtype)
         bsz, seqlen, _nheads, head_dim = q.shape
         positions = pos + jnp.broadcast_to(jnp.arange(seqlen)[None, :], [bsz, seqlen])
         freq = 1.0 / (
@@ -269,14 +265,13 @@ class Gemma3Attention(eqx.Module):
             freq,
             precision=jax.lax.Precision.HIGHEST,
         )
-
-        # TODO: make this rope a layer
         sin = jnp.sin(inp).astype(q.dtype)[:, :, None, :]
         cos = jnp.cos(inp).astype(q.dtype)[:, :, None, :]
         q1, q2 = q[:, :, :, : head_dim // 2], q[:, :, :, head_dim // 2 :]
         k1, k2 = k[:, :, :, : head_dim // 2], k[:, :, :, head_dim // 2 :]
         q = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+        q = q * jnp.asarray(self.scaling, dtype=q.dtype)
 
         if do_decode:
             k, v, new_decode_state = make_kv_from_cache(k, v, pos, decode_state)
@@ -293,7 +288,7 @@ class Gemma3Attention(eqx.Module):
         return self.o_proj(attn_output), extra_output
 
 
-class Gemma3MLP(eqx.Module):
+class Qwen3MLP(eqx.Module):
     gate_proj: Linear
     up_proj: Linear
     down_proj: Linear
@@ -301,9 +296,8 @@ class Gemma3MLP(eqx.Module):
 
     def __init__(
         self,
-        config: Gemma3TextConfig,
+        config: Qwen3Config,
         *,
-        act_fn: str,
         rngs: PRNGKeyArray,
         param_dtype: jnp.dtype,
     ):
@@ -335,7 +329,7 @@ class Gemma3MLP(eqx.Module):
             out_sharding=from_logical_rules(("batch", "sequence", None)),
             w_sharding=from_logical_rules(("fsdp", "model")),
         )
-        self.act_fn = act_fn
+        self.act_fn = config.hidden_act
 
     def __call__(self, x):
         gate = get_activation_fn(self.act_fn)(self.gate_proj(x))
@@ -343,14 +337,12 @@ class Gemma3MLP(eqx.Module):
         return self.down_proj(gate * up)
 
 
-class Gemma3Layer(eqx.Module, Stackable):
-    self_attn: Gemma3Attention
-    mlp: Gemma3MLP
+class Qwen3DecoderLayer(eqx.Module, Stackable):
+    self_attn: Qwen3Attention
+    mlp: Qwen3MLP
 
-    input_layernorm: Gemma3RMSNorm
-    post_attention_layernorm: Gemma3RMSNorm
-    pre_feedforward_layernorm: Gemma3RMSNorm
-    post_feedforward_layernorm: Gemma3RMSNorm
+    input_layernorm: Qwen3RMSNorm
+    post_attention_layernorm: Qwen3RMSNorm
 
     argnums: tuple[int, ...] = eqx.field(static=True, default=0)
     argnames: tuple[str, ...] = eqx.field(
@@ -362,7 +354,7 @@ class Gemma3Layer(eqx.Module, Stackable):
 
     def __init__(
         self,
-        config: Gemma3TextConfig,
+        config: Qwen3Config,
         *,
         additional_config: AdditionalConfig,
         rngs: PRNGKeyArray,
@@ -373,42 +365,27 @@ class Gemma3Layer(eqx.Module, Stackable):
             mlp_rngs,
             input_layernorm_rngs,
             post_attention_layernorm_rngs,
-            pre_feedforward_layernorm_rngs,
-            post_feedforward_layernorm_rngs,
-        ) = jax.random.split(rngs, 6)
-        self.self_attn = Gemma3Attention(
+        ) = jax.random.split(rngs, 4)
+        self.self_attn = Qwen3Attention(
             config,
             attn_impl=additional_config["attn_impl"],
             rngs=self_attn_rngs,
             param_dtype=param_dtype,
         )
-        self.mlp = Gemma3MLP(
+        self.mlp = Qwen3MLP(
             config,
-            act_fn=config.hidden_activation,
             rngs=mlp_rngs,
             param_dtype=param_dtype,
         )
-        self.input_layernorm = Gemma3RMSNorm(
+        self.input_layernorm = Qwen3RMSNorm(
             config.hidden_size,
             rngs=input_layernorm_rngs,
             param_dtype=param_dtype,
             eps=config.rms_norm_eps,
         )
-        self.post_attention_layernorm = Gemma3RMSNorm(
+        self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size,
             rngs=post_attention_layernorm_rngs,
-            param_dtype=param_dtype,
-            eps=config.rms_norm_eps,
-        )
-        self.pre_feedforward_layernorm = Gemma3RMSNorm(
-            config.hidden_size,
-            rngs=pre_feedforward_layernorm_rngs,
-            param_dtype=param_dtype,
-            eps=config.rms_norm_eps,
-        )
-        self.post_feedforward_layernorm = Gemma3RMSNorm(
-            config.hidden_size,
-            rngs=post_feedforward_layernorm_rngs,
             param_dtype=param_dtype,
             eps=config.rms_norm_eps,
         )
@@ -440,26 +417,24 @@ class Gemma3Layer(eqx.Module, Stackable):
             pos=pos,
             decode_state=decode_state,
         )
-        attn_output = self.post_attention_layernorm(attn_output)
         x = residual + attn_output
 
         residual = x
-        x_norm = self.pre_feedforward_layernorm(x)
+        x_norm = self.post_attention_layernorm(x)
         x_norm = reshard(x_norm, from_logical_rules(("batch", "context", None)))
         ffw = self.mlp(x_norm)
-        ffw = self.post_feedforward_layernorm(ffw)
         return residual + ffw, extra_output
 
 
-class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
-    config: Gemma3TextConfig = eqx.field(static=True)
+class Qwen3Model(AbstractHuggingFacePreTrainedModel):
+    config: Qwen3Config = eqx.field(static=True)
     embed_tokens: Embedding
-    layers: list[Gemma3Layer] | StackModule[Gemma3Layer]
-    norm: Gemma3RMSNorm
+    layers: list[Qwen3DecoderLayer] | StackModule[Qwen3DecoderLayer]
+    norm: Qwen3RMSNorm
 
     def __init__(
         self,
-        config: Gemma3TextConfig,
+        config: Qwen3Config,
         additional_config: AdditionalConfig,
         *,
         rngs: PRNGKeyArray,
@@ -474,13 +449,13 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
             config.pad_token_id,
             rngs=embed_tokens_rngs,
             param_dtype=param_dtype,
-            embed_scale=config.hidden_size**0.5,
+            embed_scale=1.0,
             out_sharding=from_logical_rules(("batch", "sequence", None)),
             w_sharding=from_logical_rules(("model", "fsdp")),
         )
         layer_rngs = jax.random.split(layers_rngs, config.num_hidden_layers)
         self.layers = [
-            Gemma3Layer(
+            Qwen3DecoderLayer(
                 config,
                 additional_config=additional_config,
                 rngs=layer_rngs[layer_idx],
@@ -488,7 +463,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
             )
             for layer_idx in range(config.num_hidden_layers)
         ]
-        self.norm = Gemma3RMSNorm(
+        self.norm = Qwen3RMSNorm(
             config.hidden_size,
             rngs=norm_rngs,
             param_dtype=param_dtype,
@@ -507,7 +482,6 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)
-
         mask_mapping = make_mask(self.config, x, **inputs)
         decode_states = (
             [None] * self.config.num_hidden_layers
@@ -519,9 +493,10 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
 
         if forward_impl not in tuple(ForwardImpl):
             raise ValueError(
-                f"Unsupported Gemma-3 forward implementation: {forward_impl!r}"
+                f"Unsupported Qwen3 forward implementation: {forward_impl!r}"
             )
 
+        rope_theta = get_rope_theta(self.config)
         if forward_impl == ForwardImpl.LOOP:
             layers = (
                 self.layers.unstack()
@@ -529,9 +504,9 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                 else self.layers
             )
             fwd = (
-                jax.remat(Gemma3Layer.__call__)
+                jax.remat(Qwen3DecoderLayer.__call__)
                 if layers[0].remat
-                else Gemma3Layer.__call__
+                else Qwen3DecoderLayer.__call__
             )
             for layer, attention_type, decode_state in zip(
                 layers, self.config.layer_types, decode_states
@@ -539,9 +514,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                 x, extra_output = fwd(
                     layer,
                     x,
-                    rope_theta=self.config.rope_parameters[attention_type][
-                        "rope_theta"
-                    ],
+                    rope_theta=rope_theta,
                     attention_mask=mask_mapping,
                     is_sliding=attention_type == "sliding_attention",
                     pos=pos,
@@ -549,16 +522,25 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                 )
                 extra_output_list.append(extra_output)
         elif forward_impl == ForwardImpl.SCAN:
-            rope_theta, is_sliding = get_layer_metadata(self.config)
+            is_sliding = jnp.asarray(
+                [
+                    attention_type == "sliding_attention"
+                    for attention_type in self.config.layer_types
+                ],
+                dtype=jnp.bool_,
+            )
             layers = self.layers
             if isinstance(layers, list):
                 layers = StackModule(
-                    Gemma3Layer,
+                    Qwen3DecoderLayer,
                     layers,
                     0,
                     argnames=("rope_theta", "is_sliding", "decode_state"),
                     remat=self.config.additional_config["remat_layer"],
                 )
+            rope_theta = jnp.full(
+                (self.config.num_hidden_layers,), rope_theta, dtype=jnp.float32
+            )
             x, extra_output_list = layers(
                 x,
                 rope_theta=rope_theta,
@@ -585,14 +567,14 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         return self.embed_tokens(input_ids, dtype=dtype)
 
 
-class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract):
-    config: Gemma3TextConfig = eqx.field(static=True)
-    model: Gemma3TextModel
+class Qwen3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract):
+    config: Qwen3Config = eqx.field(static=True)
+    model: Qwen3Model
     lm_head: Linear | None
 
     def __init__(
         self,
-        config: Gemma3TextConfig,
+        config: Qwen3Config,
         additional_config: AdditionalConfig,
         *,
         rngs: PRNGKeyArray,
@@ -601,7 +583,7 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
     ):
         self.config = config
         model_rngs, lm_head_rngs = jax.random.split(rngs)
-        self.model = Gemma3TextModel(
+        self.model = Qwen3Model(
             config,
             additional_config,
             rngs=model_rngs,
@@ -655,7 +637,6 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
             out_sharding=from_logical_rules(("batch", "context", "model")),
             preferred_element_type=jnp.float32,
         )
-
         return logits, extra_outputs
 
     @property
@@ -684,13 +665,22 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
     def to_vllm(self) -> VllmMapping:
         leaves: list[tuple[tuple[str, ...], VllmWeightLeaf]] = []
         mappings: dict[str, tuple[str, tuple[str, ...] | None]] = {}
+        transpose_keys: dict[str, tuple[int, ...]] = {}
 
-        def add(path: str, value: jax.Array):
+        def add(path: str, target_path: str, value: jax.Array):
             key = tuple(path.split("."))
             leaves.append((key, VllmWeightLeaf(value=value)))
-            mappings[path] = (path, None)
+            mappings[path] = (target_path, None)
 
-        add("model.embed_tokens.weight", self.model.embed_tokens.weight)
+        def add_transpose(path: str, axes: tuple[int, ...]):
+            transpose_keys[path] = axes
+            transpose_keys[path.split(".")[-1]] = axes
+
+        add(
+            "model.embed_tokens",
+            "model.embed_tokens.weight",
+            self.model.embed_tokens.weight,
+        )
 
         layers = (
             self.model.layers.unstack()
@@ -699,127 +689,154 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
         )
         for layer_idx, layer in enumerate(layers):
             prefix = f"model.layers.{layer_idx}"
-            qkv_weight = jnp.concatenate(
-                (
-                    layer.self_attn.q_proj.weight,
-                    layer.self_attn.k_proj.weight,
-                    layer.self_attn.v_proj.weight,
-                ),
-                axis=0,
-            )
-            add(f"{prefix}.self_attn.qkv_proj.weight", qkv_weight)
-            if layer.self_attn.q_proj.bias is not None:
-                qkv_bias = jnp.concatenate(
-                    (
-                        layer.self_attn.q_proj.bias,
-                        layer.self_attn.k_proj.bias,
-                        layer.self_attn.v_proj.bias,
-                    ),
-                    axis=0,
-                )
-                add(f"{prefix}.self_attn.qkv_proj.bias", qkv_bias)
-            add(f"{prefix}.self_attn.o_proj.weight", layer.self_attn.o_proj.weight)
-            if layer.self_attn.o_proj.bias is not None:
-                add(f"{prefix}.self_attn.o_proj.bias", layer.self_attn.o_proj.bias)
-            add(f"{prefix}.self_attn.q_norm.weight", layer.self_attn.q_norm.weight)
-            add(f"{prefix}.self_attn.k_norm.weight", layer.self_attn.k_norm.weight)
-            add(f"{prefix}.input_layernorm.weight", layer.input_layernorm.weight)
             add(
+                f"{prefix}.input_layernorm",
+                f"{prefix}.input_layernorm.weight",
+                layer.input_layernorm.weight,
+            )
+            add(
+                f"{prefix}.post_attention_layernorm",
                 f"{prefix}.post_attention_layernorm.weight",
                 layer.post_attention_layernorm.weight,
             )
-            add(
-                f"{prefix}.pre_feedforward_layernorm.weight",
-                layer.pre_feedforward_layernorm.weight,
-            )
-            add(
-                f"{prefix}.post_feedforward_layernorm.weight",
-                layer.post_feedforward_layernorm.weight,
-            )
-            gate_up_weight = jnp.concatenate(
-                (
-                    layer.mlp.gate_proj.weight,
-                    layer.mlp.up_proj.weight,
-                ),
-                axis=0,
-            )
-            add(f"{prefix}.mlp.gate_up_proj.weight", gate_up_weight)
-            if layer.mlp.gate_proj.bias is not None:
-                gate_up_bias = jnp.concatenate(
-                    (
-                        layer.mlp.gate_proj.bias,
-                        layer.mlp.up_proj.bias,
-                    ),
-                    axis=0,
-                )
-                add(f"{prefix}.mlp.gate_up_proj.bias", gate_up_bias)
-            add(f"{prefix}.mlp.down_proj.weight", layer.mlp.down_proj.weight)
-            if layer.mlp.down_proj.bias is not None:
-                add(f"{prefix}.mlp.down_proj.bias", layer.mlp.down_proj.bias)
 
-        add("model.norm.weight", self.model.norm.weight)
+            q_weight = rearrange(
+                layer.self_attn.q_proj.weight,
+                "(n h) d -> n h d",
+                n=self.config.num_attention_heads,
+                h=self.config.head_dim,
+            )
+            add(
+                f"{prefix}.self_attn.q_proj",
+                f"{prefix}.self_attn.q_proj.weight",
+                q_weight,
+            )
+            add_transpose(f"{prefix}.self_attn.q_proj", (2, 0, 1))
+
+            k_weight = rearrange(
+                layer.self_attn.k_proj.weight,
+                "(n h) d -> n h d",
+                n=self.config.num_key_value_heads,
+                h=self.config.head_dim,
+            )
+            add(
+                f"{prefix}.self_attn.k_proj",
+                f"{prefix}.self_attn.k_proj.weight",
+                k_weight,
+            )
+            add_transpose(f"{prefix}.self_attn.k_proj", (2, 0, 1))
+
+            v_weight = rearrange(
+                layer.self_attn.v_proj.weight,
+                "(n h) d -> n h d",
+                n=self.config.num_key_value_heads,
+                h=self.config.head_dim,
+            )
+            add(
+                f"{prefix}.self_attn.v_proj",
+                f"{prefix}.self_attn.v_proj.weight",
+                v_weight,
+            )
+            add_transpose(f"{prefix}.self_attn.v_proj", (2, 0, 1))
+
+            o_weight = rearrange(
+                layer.self_attn.o_proj.weight,
+                "d (n h) -> d n h",
+                n=self.config.num_attention_heads,
+                h=self.config.head_dim,
+            )
+            add(
+                f"{prefix}.self_attn.o_proj",
+                f"{prefix}.self_attn.o_proj.weight",
+                o_weight,
+            )
+            add_transpose(f"{prefix}.self_attn.o_proj", (1, 2, 0))
+
+            if layer.self_attn.q_proj.bias is not None:
+                add(
+                    f"{prefix}.self_attn.q_proj_bias",
+                    f"{prefix}.self_attn.q_proj.bias",
+                    rearrange(
+                        layer.self_attn.q_proj.bias,
+                        "(n h) -> n h",
+                        n=self.config.num_attention_heads,
+                        h=self.config.head_dim,
+                    ),
+                )
+            if layer.self_attn.k_proj.bias is not None:
+                add(
+                    f"{prefix}.self_attn.k_proj_bias",
+                    f"{prefix}.self_attn.k_proj.bias",
+                    rearrange(
+                        layer.self_attn.k_proj.bias,
+                        "(n h) -> n h",
+                        n=self.config.num_key_value_heads,
+                        h=self.config.head_dim,
+                    ),
+                )
+            if layer.self_attn.v_proj.bias is not None:
+                add(
+                    f"{prefix}.self_attn.v_proj_bias",
+                    f"{prefix}.self_attn.v_proj.bias",
+                    rearrange(
+                        layer.self_attn.v_proj.bias,
+                        "(n h) -> n h",
+                        n=self.config.num_key_value_heads,
+                        h=self.config.head_dim,
+                    ),
+                )
+            if layer.self_attn.o_proj.bias is not None:
+                add(
+                    f"{prefix}.self_attn.o_proj_bias",
+                    f"{prefix}.self_attn.o_proj.bias",
+                    layer.self_attn.o_proj.bias,
+                )
+
+            add(
+                f"{prefix}.self_attn.q_norm",
+                f"{prefix}.self_attn.q_norm.weight",
+                layer.self_attn.q_norm.weight,
+            )
+            add(
+                f"{prefix}.self_attn.k_norm",
+                f"{prefix}.self_attn.k_norm.weight",
+                layer.self_attn.k_norm.weight,
+            )
+
+            add(
+                f"{prefix}.mlp.gate_proj",
+                f"{prefix}.mlp.gate_proj.weight",
+                layer.mlp.gate_proj.weight,
+            )
+            add_transpose(f"{prefix}.mlp.gate_proj", (1, 0))
+            add(
+                f"{prefix}.mlp.up_proj",
+                f"{prefix}.mlp.up_proj.weight",
+                layer.mlp.up_proj.weight,
+            )
+            add_transpose(f"{prefix}.mlp.up_proj", (1, 0))
+            add(
+                f"{prefix}.mlp.down_proj",
+                f"{prefix}.mlp.down_proj.weight",
+                layer.mlp.down_proj.weight,
+            )
+            add_transpose(f"{prefix}.mlp.down_proj", (1, 0))
+
+        add(
+            "model.norm",
+            "model.norm.weight",
+            self.model.norm.weight,
+        )
         if self.lm_head is not None:
-            add("lm_head.weight", self.lm_head.weight)
-        else:
-            add("lm_head.weight", self.model.embed_tokens.weight)
+            add(
+                "lm_head",
+                "lm_head.weight",
+                self.lm_head.weight,
+            )
+            add_transpose("lm_head", (1, 0))
 
         return VllmMapping(
             state=VllmWeightState(leaves=leaves),
             mappings=mappings,
-            transpose_keys={},
+            transpose_keys=transpose_keys,
         )
-
-
-class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
-    config: Gemma3TextConfig = eqx.field(static=True)
-    model: Gemma3TextModel
-    score: Linear
-    num_labels: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        config: Gemma3TextConfig,
-        additional_config: AdditionalConfig,
-        *,
-        rngs: PRNGKeyArray,
-        param_dtype: jnp.dtype,
-        store_config: bool = True,
-    ):
-        self.config = config
-        model_rngs, score_rngs = jax.random.split(rngs)
-        self.num_labels = config.num_labels or additional_config.num_labels
-        self.model = Gemma3TextModel(
-            config,
-            additional_config,
-            rngs=model_rngs,
-            param_dtype=param_dtype,
-            store_config=store_config,
-        )
-        self.score = Linear(
-            config.hidden_size,
-            self.num_labels,
-            use_bias=False,
-            param_dtype=param_dtype,
-            rngs=score_rngs,
-        )
-
-    def __call__(
-        self,
-        input_ids: Int[Array, "B T"],
-        pos: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        *,
-        rngs: PRNGKeyArray | None = None,
-        forward_impl: ForwardImpl | None = None,
-        **inputs,
-    ):
-        hidden_states = self.model(
-            input_ids,
-            pos,
-            dtype,
-            rngs=rngs,
-            forward_impl=forward_impl,
-            **inputs,
-        )
-        output = self.score(hidden_states)
-        return output

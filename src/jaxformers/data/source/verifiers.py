@@ -127,6 +127,7 @@ class VerifiersIterator(grain.DatasetIterator):
                     "stop_condition": state.get("stop_condition"),
                 }
             )
+        # print("outputs",outputs)
         return outputs
 
     def __next__(self):

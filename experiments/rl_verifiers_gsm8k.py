@@ -12,17 +12,17 @@ def get_config():
     config.seed = 42
     config.max_train_step = 100
     config.forward_dtype = lambda: jnp.bfloat16
-    config.grad_accum = 1
+    config.grad_accum = 8
     config.clip_epsilon = 0.2
-    config.weights_impl = "stack"
+    config.weights_impl = "free"
 
-    config.logger_name = "noop"
-    config.logger.project = None
+    config.logger_name = "wandb"
+    config.logger.project = "grpo-test-again"
     config.logger.name = lambda: config.exp_name
 
     config.parallel.parallel_dims = {
         "dp_replicate": 1,
-        "dp_shard": 1,
+        "dp_shard": 4,
         "cp": 1,
         "tp": 1,
     }
@@ -30,10 +30,11 @@ def get_config():
     config.parallel.multihost = False
     config.parallel.sequence_parallelism = True
 
-    config.model_name = "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
-    config.model.model_id = "google/gemma-3-1b-it"
-    config.model.additional_config.remat_layer = False
-    config.model.additional_config.attn_impl = "sdpa"
+    # config.model_name = "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
+    config.model_name = "huggingface.qwen3.Qwen3ForCausalLM.from_pretrained"
+    config.model.model_id = "Qwen/Qwen3-0.6B"
+    config.model.additional_config.remat_layer = True
+    config.model.additional_config.attn_impl = "eager"
     config.model.additional_config.forward_impl = "loop"
     config.model.additional_config.sequence_parallelism = True
     config.model.param_dtype = lambda: jnp.bfloat16
@@ -42,7 +43,7 @@ def get_config():
     config.data.source.envs = lambda: [
         vf.load_environment(
             env_id="gsm8k",
-            num_train_examples=64,
+            # num_train_examples=64,
         )
     ]
     config.data.source.env_names = ["gsm8k"]
@@ -50,20 +51,20 @@ def get_config():
     config.data.source.sampling_args = {
         "temperature": 1.0,
         "top_p": 1.0,
-        "max_tokens": 64,
+        "max_tokens": 1024,
     }
     config.data.source.max_retries = 1
 
-    config.data.loader.batch_size = 4
+    config.data.loader.batch_size = 64
     config.data.loader.prefetch_buffer_size = 2
 
     config.inference.mode = "same_process"
-    config.vllm.tensor_parallel_size = 1
-    config.vllm.gpu_memory_utilization = 0.4
-    config.vllm.enable_prefix_caching = False
-    config.vllm.max_num_seqs = 1
-    config.vllm.max_model_len = 512
-    config.vllm.max_num_batched_tokens = 256
+    config.vllm.tensor_parallel_size = 4
+    config.vllm.gpu_memory_utilization = 0.2
+    config.vllm.enable_prefix_caching = True
+    config.vllm.max_num_seqs = 128
+    config.vllm.max_model_len = 2048
+    # config.vllm.max_num_batched_tokens = 2048
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

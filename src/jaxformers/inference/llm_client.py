@@ -8,13 +8,14 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from typing import Any, TypeAlias, cast
+from typing import Any, cast, TypeAlias
 
 import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from jaxformers.module_utils import ToVllmMappingAbstract, VllmMapping
+
 
 try:
     from verifiers.clients.client import Client as VerifiersClient
@@ -73,10 +74,7 @@ def _extract_logprobs(token_ids: list[int], sample_logprobs) -> list[float]:
 
 
 def _flatten_vllm_mapping(mapping: VllmMapping) -> dict[str, jax.Array]:
-    return {
-        ".".join(path): leaf.value
-        for path, leaf in mapping.state.flat_state()
-    }
+    return {".".join(path): leaf.value for path, leaf in mapping.state.flat_state()}
 
 
 def _coerce_prompt_ids(prompt_ids) -> list[int]:
@@ -132,6 +130,8 @@ def _mute_stdio():
             os.close(stderr_fd)
 
 
+_mute_stdio = contextlib.nullcontext
+
 class SameProcessTPUInferenceClient(VerifiersClient):
     def __init__(
         self,
@@ -139,21 +139,19 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         *,
         tokenizer: PreTrainedTokenizerBase | str | None = None,
         vllm_config: dict[str, Any],
+        dummy = True
     ) -> None:
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        os.environ["TPU_BACKEND_TYPE"] = "torchax"
+        os.environ["MODEL_IMPL_TYPE"] = "flax_nnx"
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-        os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
-        os.environ.setdefault("GLOG_minloglevel", "2")
-        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        # os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+        # os.environ.setdefault("GLOG_minloglevel", "2")
+        # os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
         llm_config = dict(vllm_config)
         llm_config["model"] = model
         if "tokenizer" not in llm_config and isinstance(tokenizer, str):
             llm_config["tokenizer"] = tokenizer
-        if "load_format" not in llm_config:
-            llm_config["load_format"] = "dummy"
-            os.environ["JAX_RANDOM_WEIGHTS"] = "1"
 
         self.model_name = model
         with _mute_stdio():
@@ -245,6 +243,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
             tools=tools,
             tokenize=True,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
         return _coerce_prompt_ids(prompt_ids)
 
@@ -348,24 +347,21 @@ class SameProcessTPUInferenceClient(VerifiersClient):
     def _sync_weights(self, mapping: VllmMapping) -> None:
         with self._runtime_lock:
             with _mute_stdio():
-                self.llm.reset_prefix_cache()
-                self.llm.collective_rpc("delete_kv_cache")
+                # self.llm.reset_prefix_cache()
+                # self.llm.collective_rpc("delete_kv_cache")
                 model_runner = (
                     self.llm.llm_engine.model_executor.driver_worker.model_runner
                 )
-                if isinstance(model_runner.state, dict):
-                    model_runner.state = _sync_dict_state(model_runner.state, mapping)
-                else:
-                    self.llm.collective_rpc(
-                        "sync_weights",
-                        args=(
-                            mapping.state,
-                            mapping.mappings,
-                            mapping.transpose_keys,
-                            None,
-                        ),
-                    )
-                self.llm.collective_rpc("reinitialize_kv_cache")
+                self.llm.collective_rpc(
+                    "sync_weights",
+                    args=(
+                        mapping.state,
+                        mapping.mappings,
+                        mapping.transpose_keys,
+                        None,
+                    ),
+                )
+                # self.llm.collective_rpc("reinitialize_kv_cache")
 
 
 def make(

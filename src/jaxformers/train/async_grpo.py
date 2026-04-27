@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import sys
 import time
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 import jax
 import jax.numpy as jnp
@@ -24,20 +25,12 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
-from jaxformers.checkpoint_utils import (
-    CheckpointerWithInfo,
-    is_used_checkpoint,
-    load_checkpoint_from_path,
-    make_checkpointer,
-)
-from jaxformers.data import make_data
-from jaxformers.dispatch.lora import make_lora
-from jaxformers.eval import make_eval
+from jaxformers.inference import make as make_llm_client
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import TrainState
 from jaxformers.models import make_model
-from jaxformers.ops.cross_entropy.api import cross_entropy_loss
 from jaxformers.optimizers import make_optimizer
+from jaxformers.rl import make_rl_data
 from jaxformers.scheduler import make_scheduler
 from jaxformers.sharding_utils import (
     make_logical_axis_rules,
@@ -47,8 +40,22 @@ from jaxformers.sharding_utils import (
 from jaxformers.sws_utils import run as sws_run
 
 
-DEFAULT_REDUCED = {"loss": "mean", "token": "sum", "batch": "sum"}
-DEFAULT_AUX = {"loss": (0.0, 0), "token": 0, "batch": 0}
+DEFAULT_REDUCED = {
+    "loss": "mean",
+    "token": "sum",
+    "batch": "sum",
+    "reward": "mean",
+    "clipfrac": "mean",
+    "approx_kl": "mean",
+}
+DEFAULT_AUX = {
+    "loss": (0.0, 0),
+    "token": 0,
+    "batch": 0,
+    "reward": (0.0, 0),
+    "clipfrac": (0.0, 0),
+    "approx_kl": (0.0, 0),
+}
 
 
 def _preparse_absl_flags() -> None:
@@ -74,33 +81,16 @@ def train_state_context(train_state: TrainState):
         yield
 
 
-def predict_fn(train_state: TrainState, batch, *, forward_dtype):
-    with train_state_context(train_state):
-        hidden_states, _ = train_state.model(
-            **batch["inputs"],
-            dtype=forward_dtype,
-            return_hidden_states=True,
-        )
-        return train_state.model.unembed(hidden_states)
+def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
+    def to_py(value: Any) -> Any:
+        value = jax.device_get(value)
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return value.item()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
 
-
-def loss_fn(train_state: TrainState, batch, rngs=None, *, forward_dtype, loss_impl):
-    del rngs
-    with train_state_context(train_state):
-        hidden_states, _ = train_state.model(
-            **batch["inputs"],
-            dtype=forward_dtype,
-            return_hidden_states=True,
-        )
-        batch_shape = batch["labels"].shape
-        loss = cross_entropy_loss(
-            hidden_states.reshape(-1, hidden_states.shape[-1]),
-            batch["labels"].reshape(-1),
-            train_state.model.lm_head_w,
-            reduction=None,
-            implementation=loss_impl,
-        )
-        return {"loss": loss.reshape(batch_shape)}
+    return {k: to_py(v) for k, v in metrics.items()}
 
 
 def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs):
@@ -112,20 +102,40 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
             dtype=config.forward_dtype,
             return_hidden_states=True,
         )
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        labels = batch["labels"].reshape(-1)
-        count = jnp.sum(batch["loss_mask"])
-        mask = batch["loss_mask"].reshape(-1)
-        loss = cross_entropy_loss(
-            hidden_states,
-            labels,
-            model.lm_head_w,
-            mask=mask,
-            implementation=config.loss_impl,
-        )
+        logits = model.unembed(hidden_states)
+        logprobs = jax.nn.log_softmax(logits, axis=-1)
+        selected_logprobs = jnp.take_along_axis(
+            logprobs,
+            batch["labels"][..., None],
+            axis=-1,
+        ).squeeze(-1)
 
+        loss_mask = batch["loss_mask"]
+        behavior_logprobs = batch["behavior_logprobs"]
+        advantages = batch["advantages"]
+
+        log_ratio = selected_logprobs - behavior_logprobs
+        ratio = jnp.exp(log_ratio)
+        clipped_ratio = jnp.clip(
+            ratio,
+            1.0 - config.clip_epsilon,
+            1.0 + config.clip_epsilon,
+        )
+        objective = jnp.minimum(ratio * advantages, clipped_ratio * advantages)
+        loss = -(objective * loss_mask).sum()
+
+        count = jnp.sum(loss_mask)
         batch_size = batch["labels"].shape[0]
-        aux = {"loss": (loss, count), "token": count, "batch": batch_size}
+        approx_kl = (jnp.square(log_ratio) * loss_mask).sum()
+        clipfrac = ((ratio != clipped_ratio).astype(jnp.float32) * loss_mask).sum()
+        aux = {
+            "loss": (loss, count),
+            "token": count,
+            "batch": batch_size,
+            "reward": (batch["reward"].sum(), batch_size),
+            "clipfrac": (clipfrac, count),
+            "approx_kl": (approx_kl, count),
+        }
         return loss, aux
 
     if config.grad_accum > 1:
@@ -139,6 +149,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
     (loss, aux), grad = grad_fn(*train_state.trainable_params, batch, rngs)
+    del loss
 
     token_count = aux["token"]
     inv_token_count = (1 / token_count).astype(config.forward_dtype)
@@ -160,34 +171,23 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
     return dataclasses.replace(ntrain_state, callback_state=callback_state), aux
 
 
-def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
-    def to_py(value: Any) -> Any:
-        value = jax.device_get(value)
-        if isinstance(value, np.ndarray) and value.shape == ():
-            return value.item()
-        if isinstance(value, np.generic):
-            return value.item()
-        return value
-
-    return {k: to_py(v) for k, v in metrics.items()}
+def sync_inference_weights(train_state: TrainState, llm_client) -> None:
+    llm_client.update_weights(train_state.model)
 
 
 def train(
     config,
     train_state: TrainState,
     train_ds: Iterable,
-    evaluators: list[Callable[[TrainState]]] | None = None,
-    logger: None = None,
-    ckptr: CheckpointerWithInfo | None = None,
+    logger,
+    llm_client,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
     train_iterator = iter(train_ds)
     step = train_state.step or 0
     global_aux = dict(DEFAULT_AUX)
-    skip_eval = config.eval_every is None or evaluators is None
     first_step = True
-
     to_log_later = {}
     program_wall_t0 = None
 
@@ -203,19 +203,13 @@ def train(
 
     try:
         while step < config.max_train_step:
-            if ckptr is not None:
-                ckptr.save_checkpoint(step, train_state, train_iterator)
-            if not skip_eval and (step % config.eval_every) == 0:
-                eval_process = {}
-                for name, evaluator in evaluators.items():
-                    eval_process[name] = evaluator(train_state)
-
             batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with (
                     jax.named_scope("compile train step"),
                     train_state_context(train_state),
+                    llm_client.runtime_lock(),
                 ):
 
                     @print_timing
@@ -237,14 +231,17 @@ def train(
 
                     program_wall_t0 = time.monotonic()
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
+                    # sync_inference_weights(train_state, llm_client)
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                     train_state_context(train_state),
+                    llm_client.runtime_lock(),
                 ):
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
+                    # sync_inference_weights(train_state, llm_client)
 
             host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
@@ -285,39 +282,33 @@ def train(
         to_log_later.update(metric_utils.process_aux(global_aux, "cum"))
         token_count = to_log_later.get("cum/token")
         program_time = to_log_later.get("program_time")
-
         if token_count is not None and program_time not in (None, 0):
             to_log_later["systems/tok_s"] = token_count / program_time
 
         if jax.process_index() == 0:
             logger.config.update(to_log_later)
-            if "program_time" in to_log_later:
-                print(f"program_time: {to_log_later['program_time']:.3f}s")
-            if "systems/tok_s" in to_log_later:
-                print(f"tok/s: {to_log_later['systems/tok_s']:.2f}")
         if pbar is not None:
             pbar.close()
-        if ckptr is not None:
-            ckptr.close()
 
     return train_state, to_log_later
 
 
 def main(config: sws.FinalConfig):
     _preparse_absl_flags()
+    if jax.process_count() != 1:
+        raise ValueError("train/grpo.py currently supports only single-process runs.")
+
     do_callback = getattr(config, "callback", None)
-    do_load_state = getattr(config, "load_state", None)
-    do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
-    do_eval = getattr(config, "eval", None)
 
     logger = None
+    llm_client = None
     if jax.process_index() == 0:
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
     try:
         rngs = jax.random.key(config.seed)
-        model_rngs, lora_rngs, train_rngs = jax.random.split(rngs, 3)
+        model_rngs, train_rngs = jax.random.split(rngs)
         rule = make_logical_axis_rules(**config.parallel.to_dict())
         mesh = make_mesh(**config.parallel.to_dict())
         with jax.set_mesh(mesh), with_logical_axis(rule):
@@ -339,11 +330,8 @@ def main(config: sws.FinalConfig):
                 scheduler_config=scheduler_config,
             )
             if do_lora:
-                train_state = make_lora(
-                    train_state,
-                    config.init_lora,
-                    config.lora.to_dict(),
-                    rngs=lora_rngs,
+                raise NotImplementedError(
+                    "train/grpo.py same-process TPU sync does not support LoRA."
                 )
             train_state = dataclasses.replace(
                 train_state,
@@ -353,7 +341,6 @@ def main(config: sws.FinalConfig):
                     else train_state.model
                 ),
             )
-
             train_state = make_optimizer(
                 config.optimizer_name,
                 train_state,
@@ -369,56 +356,48 @@ def main(config: sws.FinalConfig):
                     callback_state=callbacks.init(train_state),
                     callbacks=callbacks,
                 )
-            if do_load_state:
-                if do_checkpoint and is_used_checkpoint(config.checkpoint.path):
-                    raise ValueError(
-                        f"Both 'load_state' and 'checkpoint' are active, but {config.checkpoint.path} is a non-empty checkpoint. "
-                        f"To resume training from {config.checkpoint.path}, set load_state=None. "
-                        f"To start a new run while loading the weights and opt_state from the old checkpoint, make sure the new checkpoint.path points to an empty (fresh) checkpoint folder."
-                    )
-                train_state = load_checkpoint_from_path(
-                    train_state,
-                    **config.load_state.to_dict(),
-                )
 
-            ckptr = None
-            if do_checkpoint:
-                ckptr = make_checkpointer(train_state, **config.checkpoint.to_dict())
-                train_state = ckptr.load_checkpoint(train_state)
+        vllm_config = config.vllm.to_dict()
+        if "additional_config" in vllm_config:
+            additional_config = dict(vllm_config["additional_config"])
+        else:
+            additional_config = {}
+        if "sharding" in additional_config:
+            sharding = dict(additional_config["sharding"])
+        else:
+            sharding = {}
+        if "sharding_strategy" in sharding:
+            sharding_strategy = dict(sharding["sharding_strategy"])
+        else:
+            sharding_strategy = {}
+        sharding_strategy["device_indexes"] = mesh.device_ids.flatten().tolist()
+        sharding["sharding_strategy"] = sharding_strategy
+        additional_config["sharding"] = sharding
+        vllm_config["additional_config"] = additional_config
 
-            train_ds = make_data(config.data.to_dict(), mesh=train_state.mesh)
-
-            evaluators = None
-            if do_eval:
-                evaluators = make_eval(
-                    config.eval.to_dict(),
-                    {
-                        "predict": partial(
-                            predict_fn,
-                            forward_dtype=config.forward_dtype,
-                        ),
-                        "loss": partial(
-                            loss_fn,
-                            forward_dtype=config.forward_dtype,
-                            loss_impl=config.loss_impl,
-                        ),
-                    },
-                )
-
+        llm_client = make_llm_client(
+            config.inference.mode,
+            model=config.model.model_id,
+            tokenizer=config.model.model_id,
+            vllm_config=vllm_config,
+        )
+        # sync_inference_weights(train_state, llm_client)
+        train_ds = make_rl_data(config, llm_client)
         _, metrics = train(
             config,
             train_state,
             train_ds,
-            evaluators,
             logger,
-            ckptr,
+            llm_client,
             rngs=train_rngs,
         )
         return metrics
     finally:
+        if llm_client is not None:
+            asyncio.run(llm_client.close())
         if logger is not None:
             logger.finish()
 
-
 if __name__ == "__main__":
+
     sws_run(main)

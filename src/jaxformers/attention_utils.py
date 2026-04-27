@@ -105,7 +105,12 @@ class AttentionInterface(GeneralInterface[str, AttentionImpl]):
         # Historically, "xla_chunked" referred to Tokamax's chunked XLA attention.
         # In this codebase we instead map it to the manual chunked implementation,
         # because Tokamax's xla_chunked backward can have very large temp memory.
-        "xla_chunked": partial(tokamax.dot_product_attention, implementation = TokamaxRematXlaChunkedDotProductAttention(chunk_size=(1024, 2048))),
+        "xla_chunked": partial(
+            tokamax.dot_product_attention,
+            implementation=TokamaxRematXlaChunkedDotProductAttention(
+                chunk_size=(1024, 2048)
+            ),
+        ),
         "chunked_manual": chunked_manual_dot_product_attention,
     }
 

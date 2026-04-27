@@ -23,7 +23,7 @@ def get_config():
     config.parallel.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.num_devices = 4
     config.impls = list(ATTENTION_INTERFACE.keys())
-    config.devices = lambda: jax.devices()[:config.num_devices]
+    config.devices = lambda: jax.devices()[: config.num_devices]
     config.b = 4
     config.t = 8192
     config.n = 4
@@ -34,12 +34,13 @@ def get_config():
 
 def make_compiled_bwd(impl, b, t, n, h):
     fn = ATTENTION_INTERFACE[impl]
+
     def loss_fn(q, k, v):
         # random_out = jax.random.normal(jax.random.key(100), (b, t, n, h), dtype = jnp.bfloat16)
         q_sharding = jax.typeof(q).sharding
         mask = make_causal_mask(impl, q.reshape(b, t, -1))
-        out = fn(q, k, v, q_sharding = q_sharding, mask = mask)
-        return jnp.sum(out, dtype = jnp.float32)
+        out = fn(q, k, v, q_sharding=q_sharding, mask=mask)
+        return jnp.sum(out, dtype=jnp.float32)
 
     grad_fn = jax.jit(jax.grad(loss_fn, argnums=(0, 1, 2)))
     return grad_fn
@@ -64,19 +65,19 @@ def main(config: sws.FinalConfig):
                 key,
                 (config.b, config.t, config.n, config.h),
                 out_sharding=from_logical_rules(("batch", "sequence", "model", None)),
-                dtype = jnp.bfloat16
+                dtype=jnp.bfloat16,
             )
             k = jax.random.normal(
                 key,
                 (config.b, config.t, config.k, config.h),
                 out_sharding=from_logical_rules(("batch", "sequence", "model", None)),
-                dtype = jnp.bfloat16
+                dtype=jnp.bfloat16,
             )
             v = jax.random.normal(
                 key,
                 (config.b, config.t, config.k, config.h),
                 out_sharding=from_logical_rules(("batch", "sequence", "model", None)),
-                dtype = jnp.bfloat16
+                dtype=jnp.bfloat16,
             )
             q_sharding = jax.typeof(q).sharding
             print("DEBUGPRINT {q_sharding}:", q_sharding)

@@ -79,8 +79,8 @@ class Shared(Module):
     """
 
     pytree: PyTree
-    where: Callable = eqx.field(static = True)
-    get: Callable = eqx.field(static = True)
+    where: Callable = eqx.field(static=True)
+    get: Callable = eqx.field(static=True)
 
     def __init__(self, pytree: PyTree, where: Callable, get: Callable):
         """**Arguments:**

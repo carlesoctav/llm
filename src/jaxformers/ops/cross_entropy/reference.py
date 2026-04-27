@@ -29,7 +29,7 @@ def cross_entropy_reference(
         w,
         precision=precision,
         preferred_element_type=jnp.float32,
-        out_sharding=from_logical_rules(("batch", None))
+        out_sharding=from_logical_rules(("batch", None)),
     )
     if logit_soft_cap is not None:
         logits = jnp.tanh(logits / logit_soft_cap) * logit_soft_cap

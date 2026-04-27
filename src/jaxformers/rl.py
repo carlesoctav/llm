@@ -55,10 +55,7 @@ def batch_rl_data(values, target_len: int):
             [_pad_1d(value["advantages"], target_len, 0.0) for value in values]
         ),
         "behavior_logprobs": np.stack(
-            [
-                _pad_1d(value["behavior_logprobs"], target_len, 0.0)
-                for value in values
-            ]
+            [_pad_1d(value["behavior_logprobs"], target_len, 0.0) for value in values]
         ),
         "reward": np.asarray([value["reward"] for value in values], dtype=np.float32),
         "example_id": np.asarray(

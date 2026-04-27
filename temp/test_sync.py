@@ -88,6 +88,7 @@ def make_model():
         )
     return model, mesh
 
+
 def make_client(mesh: Mesh):
     rollout_device = make_parallel()["rollout_devices"]
     rollout_id = [rollout_d.id for rollout_d in rollout_device]

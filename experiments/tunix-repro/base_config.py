@@ -24,7 +24,9 @@ def get_config():
     config.parallel.multihost = False
 
     config.logger_name = "wandb"
-    config.checkpoint.path = lambda: f"{config.dir}/{config.project_name}/{config.exp_name}"
+    config.checkpoint.path = lambda: (
+        f"{config.dir}/{config.project_name}/{config.exp_name}"
+    )
     config.checkpoint.save_interval_steps = lambda: config.eval_every
     config.checkpoint.max_to_keep = None
     config.checkpoint.save_only_trainable = True
@@ -34,7 +36,9 @@ def get_config():
 
     config.callback.log_grad_norm = {}
     config.callback.log_learning_rate = {}
-    config.callback.profiler.path = "/mnt/carles/llm/trace/debug-remat-attention/no-remat-scan-bug"
+    config.callback.profiler.path = (
+        "/mnt/carles/llm/trace/debug-remat-attention/no-remat-scan-bug"
+    )
     config.callback.log_performance.real_step_threshold = 0
     config.callback.log_performance.denom_keys = ["token"]
 
@@ -43,9 +47,7 @@ def get_config():
     # config.load_state.step =
 
     config.init_lora = None
-    config.model_name = (
-        "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
-    )
+    config.model_name = "huggingface.gemma3.Gemma3ForCausalLM.from_pretrained"
     config.model.model_id = "google/gemma-3-1b-it"
     config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_impl = "sdpa"

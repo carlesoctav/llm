@@ -27,4 +27,6 @@ def make_optimizer(optimizer_name: str, train_state, scheduler, optimizer_config
     train_weights, _ = tree_util.partition(train_state.model, train_mask)
     tx = optimizer_module.make(scheduler, train_state, **optimizer_config)
     opt_state = tx.init(train_weights)
-    return dataclasses.replace(train_state, opt_state=opt_state, tx=tx, train_mask=train_mask)
+    return dataclasses.replace(
+        train_state, opt_state=opt_state, tx=tx, train_mask=train_mask
+    )

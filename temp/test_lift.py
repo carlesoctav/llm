@@ -19,17 +19,17 @@ lift_data = [
 
 def lift(func):
     is_leaf = lambda x: isinstance(x, (tuple, list, dict))
+
     def _lift(*args, **kwargs):
         if args and kwargs:
-            return jax.tree.map(func, args, kwargs, is_leaf = is_leaf)
+            return jax.tree.map(func, args, kwargs, is_leaf=is_leaf)
         elif args:
             print("DEBUGPRINT {args}:", args)
-            return jax.tree.map(func, args, is_leaf = is_leaf)
+            return jax.tree.map(func, args, is_leaf=is_leaf)
         elif kwargs:
-            return jax.tree.map(func, kwargs, is_leaf = is_leaf)
+            return jax.tree.map(func, kwargs, is_leaf=is_leaf)
 
     return _lift
-
 
 
 make_lift = lift(make_huggingface_datasets)

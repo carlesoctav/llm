@@ -73,6 +73,7 @@ class VerifiersIterator(grain.DatasetIterator):
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._buffer: list[dict[str, Any]] = []
         self._future = self._submit_next_group()
+        self._max_inflight_requests = 10
 
     def _submit_next_group(self) -> Future[list[dict[str, Any]]]:
         return self._executor.submit(self._fetch_next_group)

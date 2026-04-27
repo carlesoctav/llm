@@ -1,5 +1,4 @@
 from __future__ import annotations
-from jaxformers.inference.async_client import AsyncSameProcessTPUInferenceClient
 
 import asyncio
 import contextlib
@@ -14,6 +13,8 @@ from typing import Any, cast, TypeAlias
 import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from vllm import AsyncEngineArgs
+from vllm.v1.executor import Executor
 
 from jaxformers.module_utils import ToVllmMappingAbstract, VllmMapping
 
@@ -133,14 +134,15 @@ def _mute_stdio():
 
 _mute_stdio = contextlib.nullcontext
 
-class SameProcessTPUInferenceClient(VerifiersClient):
+
+class AsyncSameProcessTPUInferenceClient(VerifiersClient):
     def __init__(
         self,
         model: str,
         *,
         tokenizer: PreTrainedTokenizerBase | str | None = None,
         vllm_config: dict[str, Any],
-        dummy = True
+        dummy=True,
     ) -> None:
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         os.environ["MODEL_IMPL_TYPE"] = "flax_nnx"
@@ -151,22 +153,31 @@ class SameProcessTPUInferenceClient(VerifiersClient):
 
         llm_config = dict(vllm_config)
         llm_config["model"] = model
+        # llm_config["load_format"] = "dummy"
         if "tokenizer" not in llm_config and isinstance(tokenizer, str):
             llm_config["tokenizer"] = tokenizer
 
         self.model_name = model
         with _mute_stdio():
-            from vllm import LLM
+            from vllm.v1.engine.async_llm import AsyncLLM
+
+            engine_args = AsyncEngineArgs(**llm_config)
+            vllm_config = engine_args.create_engine_config()
+            executor_class = Executor.get_class(vllm_config)
 
             logging.getLogger("absl").setLevel(logging.ERROR)
             logging.getLogger("tpu_inference").setLevel(logging.ERROR)
             logging.getLogger("vllm").setLevel(logging.ERROR)
+
             self.tokenizer = (
                 tokenizer
                 if isinstance(tokenizer, PreTrainedTokenizerBase)
                 else AutoTokenizer.from_pretrained(tokenizer or model)
             )
-            self.llm = LLM(**llm_config)
+            self.llm = AsyncLLM(
+                vllm_config, executor_class=executor_class, log_stats=True
+            )
+
         self._client = self.llm
         self._config = None
         self._runtime_lock = threading.RLock()
@@ -246,6 +257,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        print(prompt_ids)
         return _coerce_prompt_ids(prompt_ids)
 
     def _make_sampling_params(self, sampling_args: SamplingArgs):
@@ -254,13 +266,14 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         params = dict(sampling_args)
         if "n" in params and params["n"] != 1:
             raise ValueError("SameProcessTPUInferenceClient supports only n=1.")
+
         params["logprobs"] = params["logprobs"] if "logprobs" in params else 1
         params["prompt_logprobs"] = None
         params["detokenize"] = True
         params["skip_special_tokens"] = False
         return SamplingParams(**params)
 
-    def _generate(
+    async def _generate(
         self,
         prompt: list[dict[str, Any]],
         sampling_args: SamplingArgs,
@@ -270,14 +283,13 @@ class SameProcessTPUInferenceClient(VerifiersClient):
 
         prompt_ids = self._render_prompt_ids(prompt, tools)
         sampling_params = self._make_sampling_params(sampling_args)
-        with self._runtime_lock:
-            with _mute_stdio():
-                outputs = self.llm.generate(
+        final_output = None
+        async for output in self.llm.generate(
                     prompts=[TokensPrompt(prompt_token_ids=prompt_ids)],
                     sampling_params=sampling_params,
-                    use_tqdm=False,
-                )
-        return outputs[0]
+                ):
+                    final_output = output
+        return final_output
 
     async def get_native_response(
         self,
@@ -288,7 +300,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         **kwargs,
     ):
         del model, kwargs
-        return await asyncio.to_thread(self._generate, prompt, sampling_args, tools)
+        return await self._generate(prompt, sampling_args, tools)
 
     async def raise_from_native_response(self, response) -> None:
         if not response.outputs:
@@ -338,6 +350,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         )
 
     def update_weights(self, model: ToVllmMappingAbstract) -> None:
+        raise NotImplementedError
         if not isinstance(model, ToVllmMappingAbstract):
             raise TypeError(
                 "update_weights expects a model implementing ToVllmMappingAbstract."
@@ -346,6 +359,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         self._sync_weights(mapping)
 
     def _sync_weights(self, mapping: VllmMapping) -> None:
+        raise NotImplementedError
         with self._runtime_lock:
             with _mute_stdio():
                 # self.llm.reset_prefix_cache()
@@ -372,18 +386,10 @@ def make(
     tokenizer: PreTrainedTokenizerBase | str | None = None,
     vllm_config: dict[str, Any],
 ):
-    if mode == "same_process":
-        return SameProcessTPUInferenceClient(
-            model=model,
-            tokenizer=tokenizer,
-            vllm_config=vllm_config,
-        )
-    elif mode == "async_same_process":
-        print("DEBUGPRINT {async gang}:")
-        AsyncSameProcessTPUInferenceClient(
-            model = model,
-            tokenizer = tokenizer,
-            vllm_config = vllm_config
-        )
-    else:
-        raise NotImplementedError
+    if mode != "same_process":
+        raise ValueError(f"Unsupported inference.mode {mode!r}")
+    return AsyncSameProcessTPUInferenceClient(
+        model=model,
+        tokenizer=tokenizer,
+        vllm_config=vllm_config,
+    )

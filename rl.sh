@@ -7,7 +7,7 @@ cd /mnt/carles/llm
 # export TPU_PROCESS_BOUNDS=1,1,1
 # export TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1
 # export HF_HUB_DISABLE_PROGRESS_BARS=1
-export JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache
+# export JAX_COMPILATION_CACHE_DIR=/tmp/jax_cache
 # export PYTHONUNBUFFERED=1
 export HF_HOME=/mnt/carles/.cache
 

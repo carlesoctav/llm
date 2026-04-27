@@ -55,6 +55,7 @@ def jittable_add_aux(*aux, reduce_method: dict | None):
 
     return jtu.tree_map_with_path(f, *aux, is_leaf=is_tuple)
 
+
 def host_add_aux(*aux, reduce_method: dict | None = None):
     is_tuple = lambda x: isinstance(x, tuple)
     use_predefine_method = True if reduce_method else False
@@ -97,12 +98,14 @@ def to_host(tree, flatten=False, unpack=False):
     )
 
     if unpack:
+
         def _item(value):
             if isinstance(value, np.ndarray) and value.shape == ():
                 return value.item()
             if isinstance(value, np.generic):
                 return value.item()
             return value
+
         return jax.tree.map(_item, tree)
 
     return tree

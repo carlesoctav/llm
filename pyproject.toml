@@ -17,19 +17,17 @@ dependencies = [
     "sws-config==0.7.1",
     "tabulate==0.10.0",
     "tokamax==0.0.10",
-    "tpu-inference",
-    "tpu-info==0.8.1",
+    "tpu-inference[tpu]",
+    "tpu-info==0.12",
     "tqdm==4.67.3",
     "transformers==5.3.0",
-    "vllm",
+    "vllm[tpu]",
     "wandb==0.25.0",
     "xprof==2.22.0",
 ]
 
 [project.optional-dependencies]
 tpu = [
-    "tpu-inference",
-    "vllm",
     "torchvision==0.25.0",
     "verifiers>=0.1.11",
 ]
@@ -41,8 +39,8 @@ build-backend = "setuptools.build_meta"
 [tool.uv]
 find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
 override-dependencies = [
-  "tpu-inference",
   "transformers",
+  "tpu-inference",
   "tpu-info",
   "jax",
   "optax",
@@ -68,13 +66,9 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
-tpu-inference = { workspace = true, editable = true }
-vllm = { git = "https://github.com/vllm-project/vllm", rev = "08bfedc152f064d8e84f85c4f42b810e5a564229" }
+vllm = { git = "https://github.com/carlesoctav/vllm", branch = "match-verison" }
+tpu-inference = { git = "https://github.com/vllm-project/tpu-inference" }
 
-[tool.uv.workspace]
-members = [
-    "others/tpu-inference",
-]
 
 [dependency-groups]
 dev = [

@@ -77,6 +77,8 @@ class VerifiersIterator(grain.DatasetIterator):
         self._executor = AsyncLoopThread()
         self._futures: set[ConFuture] = set()
 
+        self._rollout_counter = 0
+
     def fill_inlfight_queue(self):
         diff = max(self._max_inflight_requests - len(self._futures), 0)
         for _ in range(diff):
@@ -134,6 +136,8 @@ class VerifiersIterator(grain.DatasetIterator):
             self._futures = pending
             for fut in done:
                 self._buffer.extend(fut.result())
+
+        self._rollout_counter+=1
         return self._buffer.popleft()
 
     def get_state(self):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import os
@@ -175,12 +174,17 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
                 else AutoTokenizer.from_pretrained(tokenizer or model)
             )
             self.llm = AsyncLLM(
-                vllm_config, executor_class=executor_class, log_stats=True
+                vllm_config,
+                executor_class=executor_class,
+                log_stats=True,
+                use_uniproc_engine_core=True,
             )
 
         self._client = self.llm
         self._config = None
         self._runtime_lock = threading.RLock()
+        self._count = 0
+        self._update_w_counter = 0
 
     @contextlib.contextmanager
     def runtime_lock(self):
@@ -257,7 +261,6 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        print(prompt_ids)
         return _coerce_prompt_ids(prompt_ids)
 
     def _make_sampling_params(self, sampling_args: SamplingArgs):
@@ -279,16 +282,17 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
         sampling_args: SamplingArgs,
         tools: list[dict[str, Any]] | None,
     ):
-        from vllm.inputs import TokensPrompt
-
         prompt_ids = self._render_prompt_ids(prompt, tools)
         sampling_params = self._make_sampling_params(sampling_args)
+        request_id = str(self._count)
+        self._count += 1
         final_output = None
         async for output in self.llm.generate(
-                    prompts=[TokensPrompt(prompt_token_ids=prompt_ids)],
-                    sampling_params=sampling_params,
-                ):
-                    final_output = output
+            prompt=prompt_ids,
+            sampling_params=sampling_params,
+            request_id=request_id,
+        ):
+            final_output = output
         return final_output
 
     async def get_native_response(
@@ -349,35 +353,24 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
             message=message,
         )
 
-    def update_weights(self, model: ToVllmMappingAbstract) -> None:
-        raise NotImplementedError
+    async def sync_weights(self, model: ToVllmMappingAbstract) -> None:
         if not isinstance(model, ToVllmMappingAbstract):
             raise TypeError(
                 "update_weights expects a model implementing ToVllmMappingAbstract."
             )
-        mapping = model.to_vllm()
-        self._sync_weights(mapping)
-
-    def _sync_weights(self, mapping: VllmMapping) -> None:
-        raise NotImplementedError
-        with self._runtime_lock:
-            with _mute_stdio():
-                # self.llm.reset_prefix_cache()
-                # self.llm.collective_rpc("delete_kv_cache")
-                model_runner = (
-                    self.llm.llm_engine.model_executor.driver_worker.model_runner
-                )
-                self.llm.collective_rpc(
-                    "sync_weights",
-                    args=(
-                        mapping.state,
-                        mapping.mappings,
-                        mapping.transpose_keys,
-                        None,
-                    ),
-                )
-                # self.llm.collective_rpc("reinitialize_kv_cache")
-
+            mapping = model.to_vllm()
+            await self.llm.pause_generation(mode = "wait")
+            await self.llm.collective_rpc(
+                "sync_weights",
+                args=(
+                    mapping.state,
+                    mapping.mappings,
+                    mapping.transpose_keys,
+                    None,
+                ),
+            )
+            self._update_w_counter+=1
+            # self.llm.collective_rpc("reinitialize_kv_cache")
 
 def make(
     mode: str,

@@ -190,7 +190,7 @@ def train(
     first_step = True
     to_log_later = {}
     program_wall_t0 = None
-
+    update_weights_step = 5
     pbar = None
     if jax.process_index() == 0:
         pbar = tqdm(
@@ -203,6 +203,8 @@ def train(
 
     try:
         while step < config.max_train_step:
+            if (step % update_weights_step) == 0:
+                llm_client.sync_weights(train_state.model)
             batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
@@ -231,7 +233,7 @@ def train(
 
                     program_wall_t0 = time.monotonic()
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
-                    # sync_inference_weights(train_state, llm_client)
+                    if step % update_weights_step == 0:
                     first_step = False
             else:
                 with (
@@ -381,7 +383,7 @@ def main(config: sws.FinalConfig):
             tokenizer=config.model.model_id,
             vllm_config=vllm_config,
         )
-        # sync_inference_weights(train_state, llm_client)
+        llm_client.sync_weights(train_state.model)
         train_ds = make_rl_data(config, llm_client)
         _, metrics = train(
             config,

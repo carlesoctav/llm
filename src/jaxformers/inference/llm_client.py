@@ -1,5 +1,4 @@
 from __future__ import annotations
-from jaxformers.inference.async_client import AsyncSameProcessTPUInferenceClient
 
 import asyncio
 import contextlib
@@ -15,6 +14,7 @@ import jax
 import jax.numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from jaxformers.inference.async_client import AsyncSameProcessTPUInferenceClient
 from jaxformers.module_utils import ToVllmMappingAbstract, VllmMapping
 
 
@@ -133,6 +133,7 @@ def _mute_stdio():
 
 _mute_stdio = contextlib.nullcontext
 
+
 class SameProcessTPUInferenceClient(VerifiersClient):
     def __init__(
         self,
@@ -140,7 +141,7 @@ class SameProcessTPUInferenceClient(VerifiersClient):
         *,
         tokenizer: PreTrainedTokenizerBase | str | None = None,
         vllm_config: dict[str, Any],
-        dummy = True
+        dummy=True,
     ) -> None:
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
         os.environ["MODEL_IMPL_TYPE"] = "flax_nnx"
@@ -350,9 +351,6 @@ class SameProcessTPUInferenceClient(VerifiersClient):
             with _mute_stdio():
                 # self.llm.reset_prefix_cache()
                 # self.llm.collective_rpc("delete_kv_cache")
-                model_runner = (
-                    self.llm.llm_engine.model_executor.driver_worker.model_runner
-                )
                 self.llm.collective_rpc(
                     "sync_weights",
                     args=(
@@ -379,11 +377,8 @@ def make(
             vllm_config=vllm_config,
         )
     elif mode == "async_same_process":
-        print("DEBUGPRINT {async gang}:")
-        AsyncSameProcessTPUInferenceClient(
-            model = model,
-            tokenizer = tokenizer,
-            vllm_config = vllm_config
+        return AsyncSameProcessTPUInferenceClient(
+            model=model, tokenizer=tokenizer, vllm_config=vllm_config
         )
     else:
         raise NotImplementedError

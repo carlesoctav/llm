@@ -14,7 +14,7 @@ MaskFn = tp.Any
 
 def and_masks(*mask_fns):
     def mask(b, h, q, kv):
-        result = jnp.ones((), dtype=jnp.bool)
+        result = jnp.ones((), dtype=jnp.bool_)
         for mask_fn in mask_fns:
             result = mask_fn(b, h, q, kv) & result
         return result
@@ -24,7 +24,7 @@ def and_masks(*mask_fns):
 
 def or_masks(*mask_fns):
     def mask(b, h, q, kv):
-        result = jnp.zeros((), dtype=jnp.bool)
+        result = jnp.zeros((), dtype=jnp.bool_)
         for mask_fn in mask_fns:
             result = mask_fn(b, h, q, kv) | result
         return result
@@ -54,11 +54,6 @@ def sliding_window_mask_overlay(window_size: int):
 
 
 def sliding_window_causal_overlay(window_size: int):
-    """Overlay depicting a sliding-window pattern for causal attention.
-
-    Mirrors HF's semantics: kv_idx > q_idx - window_size (exclusive bound).
-    """
-
     def mask(b, h, q, kv):
         return kv > q - window_size
 
@@ -91,6 +86,9 @@ def make_bool_interface(
     batch_size: int | None = None,
     nheads: int | None = None,
 ) -> Bool[Array, "B T S"] | Bool[Array, "B N T S"] | Bool[Array, "T S"]:
+    if batch_size is None:
+        raise ValueError("`batch_size` must be provided when creating bool masks.")
+
     batch_arange = jnp.arange(batch_size, dtype=jnp.int32)
     q_arange = jnp.arange(q_length, dtype=jnp.int32)
     kv_arange = jnp.arange(kv_length, dtype=jnp.int32)
@@ -103,14 +101,15 @@ def make_bool_interface(
 
     mask_ndim = mask_output.ndim
     if padding_mask is not None:
-        if mask_ndim == 3:  # (B, T, S), (B, T) -> (B, 1, T, S)
-            return (mask_output & padding_mask[:, :, None]).astype(jnp.bool)[
+        if mask_ndim == 3:
+            return (mask_output & padding_mask[:, None, :]).astype(jnp.bool_)[
                 :, None, :, :
             ]
-        elif mask_ndim == 4:  # (B, N, T, S), (B, T) -> (B, N, T, S)
-            return (mask_output & padding_mask[:, None, :, None]).astype(jnp.bool)
-    else:
-        return mask_output.astype(jnp.bool)[:, None, :, :]
+        elif mask_ndim == 4:
+            return (mask_output & padding_mask[:, None, None, :]).astype(jnp.bool_)
+    if mask_ndim == 3:
+        return mask_output.astype(jnp.bool_)[:, None, :, :]
+    return mask_output.astype(jnp.bool_)
 
 
 class AttentionMaskInterface(GeneralInterface[str, MaskImpl]):
@@ -150,7 +149,6 @@ def make_causal_mask(
         The computed causal attention mask,
     """
 
-    # Need to think more about maskign for inference but whatever
     B, T, H = input_embeds.shape
 
     mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
@@ -226,7 +224,7 @@ def make_bidirectional_mask(
     return full_mask
 
 
-def slliding_window_full_mask(
+def sliding_window_full_mask(
     mask_impl: str,
     input_embeds: Float[Array, "B T H"],
     window_size: int,
@@ -256,7 +254,8 @@ def slliding_window_full_mask(
 
     mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = and_masks(
-        sliding_window_mask_overlay(window_size), dummy_mask_function
+        causal_mask_function,
+        sliding_window_mask_overlay(window_size),
     )
 
     padding_mask = None
@@ -279,6 +278,22 @@ def slliding_window_full_mask(
     return sliding_mask
 
 
+def make_sliding_window_mask(
+    mask_impl: str,
+    input_embeds: Float[Array, "B T H"],
+    window_size: int,
+    attention_mask: Bool[Array, "..."] | None = None,
+    segment_ids: Int[Array, "..."] | None = None,
+) -> Bool[Array, "B T T"] | BlockMask:
+    return sliding_window_full_mask(
+        mask_impl=mask_impl,
+        input_embeds=input_embeds,
+        window_size=window_size,
+        attention_mask=attention_mask,
+        segment_ids=segment_ids,
+    )
+
+
 def make_sliding_window_causal_mask(
     mask_impl: str,
     input_embeds: Float[Array, "B T H"],
@@ -286,11 +301,6 @@ def make_sliding_window_causal_mask(
     attention_mask: Bool[Array, "B T"] | None = None,
     segment_ids: Int[Array, "B T"] | None = None,
 ) -> Bool[Array, "B T T"] | BlockMask:
-    """Generates a sliding-window causal mask.
-
-    Equivalent to `make_causal_mask` with an additional sliding-window overlay.
-    """
-
     B, T, _H = input_embeds.shape
     mask_interface = ATTENTION_MASK_INTERFACE[mask_impl]
     mask_factory_function = and_masks(

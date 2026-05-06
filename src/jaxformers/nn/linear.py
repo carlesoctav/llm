@@ -60,5 +60,5 @@ class Linear(eqx.Module):
             out_sharding=self.out_sharding,
         )
         if self.bias is not None:
-            y = y + self.bias[None, None, :]
+            y = y + self.bias.astype(x.dtype)[None, None, :]
         return y

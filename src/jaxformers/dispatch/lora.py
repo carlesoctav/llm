@@ -285,7 +285,12 @@ def _lora_array_matmul(
     inner_kwargs = dict(kwargs)
     inner_kwargs.pop("out_sharding", None)
 
-    scaling = jnp.asarray(lhs.alpha / lhs.a.shape[-2], dtype=lhs.w.dtype)
+    if "preferred_element_type" in kwargs and kwargs["preferred_element_type"] is not None:
+        scaling_dtype = kwargs["preferred_element_type"]
+    else:
+        scaling_dtype = lhs.w.dtype
+    scaling = jnp.asarray(lhs.alpha / lhs.a.shape[-2], dtype=scaling_dtype)
+
     # `out2` replaces the lhs uncontracted dimension with `rank`; shard it with
     # replication by default.
     if out_sharding is None:

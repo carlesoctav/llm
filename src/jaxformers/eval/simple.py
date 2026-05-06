@@ -41,9 +41,9 @@ def make(
 ):
     def evaluator(model):
         # make this infinte stream or cacheable so we dont recreate laoder/stream again and again
-        data = make_eval_data(data_config, mesh=mesh)
         list_aux = []
         with jax.set_mesh(model.mesh), with_logical_axis(model.rule):
+            data = make_eval_data(data_config, mesh=model.mesh)
             for batch in tqdm(data, desc=f"{name}_eval"):
                 batch_aux = _eval_step(fn, model, batch)
                 list_aux.append(batch_aux)

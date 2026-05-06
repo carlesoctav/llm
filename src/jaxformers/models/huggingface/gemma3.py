@@ -5,26 +5,17 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from jax.sharding import PartitionSpec as P, reshard
-from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 from transformers import Gemma3TextConfig
 
-from jaxformers.attention_utils import ATTENTION_INTERFACE
+from jaxformers.attention_utils import ATTENTION_INTERFACE, prepare_attention_kwargs
 from jaxformers.dispatch.einsum import einsum
-from jaxformers.masking_utils import (
-    ATTENTION_MASK_INTERFACE,
-    make_causal_mask,
-    make_sliding_window_causal_mask,
-)
 from jaxformers.module_utils import (
     AbstractHuggingFacePreTrainedModel,
     AdditionalConfig,
     ForwardImpl,
     Stackable,
     StackModule,
-    ToVllmMappingAbstract,
-    VllmMapping,
-    VllmWeightLeaf,
-    VllmWeightState,
 )
 from jaxformers.nn import Embedding, Linear
 from jaxformers.sampling_utils import make_kv_from_cache
@@ -46,14 +37,6 @@ def get_layer_metadata(config: Gemma3TextConfig) -> tuple[jax.Array, jax.Array]:
     )
     return rope_theta, is_sliding
 
-
-def gemma_rms_norm(x: jax.Array, weight: jax.Array, eps: float):
-    x_fp32 = x.astype(jnp.float32)
-    rms = jnp.sqrt(jnp.square(x_fp32).mean(-1, keepdims=True) + eps)
-    out = (x_fp32 / rms) * (1.0 + weight.astype(jnp.float32))
-    return out.astype(x.dtype)
-
-
 def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array]:
     if hidden_activation in ("gelu_pytorch_tanh", "gelu_new"):
         return lambda x: jax.nn.gelu(x, approximate=True)
@@ -64,33 +47,6 @@ def get_activation_fn(hidden_activation: str) -> Callable[[jax.Array], jax.Array
     if hidden_activation == "relu":
         return jax.nn.relu
     raise ValueError(f"Unsupported hidden activation {hidden_activation!r}")
-
-
-def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
-    attn_impl = config.additional_config["attn_impl"]
-    if attn_impl not in ATTENTION_MASK_INTERFACE:
-        return {
-            "full_attention": None,
-            "sliding_attention": None,
-        }
-
-    full_mask = make_causal_mask(attn_impl, input_embeds, attention_mask, segment_ids)
-    window_size = config.sliding_window
-    if window_size is None:
-        sliding_mask = full_mask
-    else:
-        sliding_mask = make_sliding_window_causal_mask(
-            attn_impl,
-            input_embeds,
-            window_size,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-        )
-
-    return {
-        "full_attention": full_mask,
-        "sliding_attention": sliding_mask,
-    }
 
 
 class Gemma3RMSNorm(eqx.Module):
@@ -116,7 +72,11 @@ class Gemma3RMSNorm(eqx.Module):
         self.weight = jax.device_put(jnp.zeros((dim,), param_dtype), weight_sharding)
 
     def __call__(self, x):
-        return gemma_rms_norm(x, self.weight, self.eps)
+        x_fp32 = jnp.asarray(x, jnp.float32)
+        mean2 = jnp.mean(jax.lax.square(x_fp32), axis=-1, keepdims=True)
+        y = jnp.asarray(x_fp32 * jax.lax.rsqrt(mean2 + self.eps), x.dtype)
+        scale = jnp.asarray(1.0 + self.weight, dtype = x.dtype)
+        return jnp.einsum("i...k,...k->i...k", y, scale, preferred_element_type= x.dtype)
 
 
 class Gemma3Attention(eqx.Module):
@@ -133,6 +93,7 @@ class Gemma3Attention(eqx.Module):
     num_key_value_heads: int = eqx.field(static=True)
     query_scale: float = eqx.field(static=True)
     attn_impl: str = eqx.field(static=True)
+    window_size: int | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -206,21 +167,24 @@ class Gemma3Attention(eqx.Module):
         self.head_dim = head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.query_scale = config.query_pre_attn_scalar**-0.5
+        self.query_scale = ( 1 / config.query_pre_attn_scalar) ** 0.5
         self.attn_impl = attn_impl
+        self.window_size = config.sliding_window
 
     def __call__(
         self,
         x: Float[Array, "B T D"],
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         *,
-        attention_mask,
+        is_sliding,
         rope_theta: float,
         pos: int = 0,
         decode_state: PyTree | None = None,
     ):
         do_decode = True if decode_state is not None else False
         extra_output = {} if do_decode else None
-        q_sharding = jax.NamedSharding(
+        q_sharding = jax.sharding.NamedSharding(
             jax.sharding.get_abstract_mesh(),
             from_logical_rules(("batch", "context", "model", None)),
         )
@@ -228,9 +192,20 @@ class Gemma3Attention(eqx.Module):
             print(
                 f"Decoding requested (decode_state provided), but attn_impl='{self.attn_impl}' is not 'sdpa'. Falling back to 'sdpa'."
             )
-            attention_interface = ATTENTION_INTERFACE["sdpa"]
+            active_attn_impl = "sdpa"
         else:
-            attention_interface = ATTENTION_INTERFACE[self.attn_impl]
+            active_attn_impl = self.attn_impl
+        attention_interface = ATTENTION_INTERFACE[active_attn_impl]
+        attention_args_kwargs = prepare_attention_kwargs(
+            active_attn_impl,
+            x,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            is_causal=True,
+            is_sliding=is_sliding,
+            is_mqa=self.num_key_value_heads == 1,
+            window_size=self.window_size,
+        )
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
@@ -257,7 +232,7 @@ class Gemma3Attention(eqx.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = q * jnp.asarray(self.query_scale, dtype=q.dtype)
+
         bsz, seqlen, _nheads, head_dim = q.shape
         positions = pos + jnp.broadcast_to(jnp.arange(seqlen)[None, :], [bsz, seqlen])
         freq = 1.0 / (
@@ -278,6 +253,7 @@ class Gemma3Attention(eqx.Module):
         q = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
+
         if do_decode:
             k, v, new_decode_state = make_kv_from_cache(k, v, pos, decode_state)
             extra_output["decode_state"] = new_decode_state
@@ -286,8 +262,9 @@ class Gemma3Attention(eqx.Module):
             q,
             k,
             v,
-            mask=attention_mask,
+            scale=self.query_scale,
             q_sharding=q_sharding,
+            **attention_args_kwargs,
         )
         attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
         return self.o_proj(attn_output), extra_output
@@ -417,25 +394,22 @@ class Gemma3Layer(eqx.Module, Stackable):
     def __call__(
         self,
         x: Float[Array, "B T D"],
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         *,
         rope_theta,
-        attention_mask,
         is_sliding,
         pos: int,
         decode_state: PyTree | None = None,
     ):
-        attention_mask = jax.lax.select(
-            is_sliding,
-            attention_mask["sliding_attention"],
-            attention_mask["full_attention"],
-        )
-
         residual = x
         x_norm = self.input_layernorm(x)
         x_norm = reshard(x_norm, from_logical_rules(("batch", "context", None)))
         attn_output, extra_output = self.self_attn(
             x_norm,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            is_sliding=is_sliding,
             rope_theta=rope_theta,
             pos=pos,
             decode_state=decode_state,
@@ -501,14 +475,14 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         pos: int = 0,
         dtype: jnp.dtype = jnp.float32,
         *,
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
         forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)
-
-        mask_mapping = make_mask(self.config, x, **inputs)
         decode_states = (
             [None] * self.config.num_hidden_layers
             if decode_states is None
@@ -539,10 +513,11 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                 x, extra_output = fwd(
                     layer,
                     x,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
                     rope_theta=self.config.rope_parameters[attention_type][
                         "rope_theta"
                     ],
-                    attention_mask=mask_mapping,
                     is_sliding=attention_type == "sliding_attention",
                     pos=pos,
                     decode_state=decode_state,
@@ -561,8 +536,9 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
                 )
             x, extra_output_list = layers(
                 x,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
                 rope_theta=rope_theta,
-                attention_mask=mask_mapping,
                 is_sliding=is_sliding,
                 pos=pos,
                 decode_state=decode_states,
@@ -585,7 +561,7 @@ class Gemma3TextModel(AbstractHuggingFacePreTrainedModel):
         return self.embed_tokens(input_ids, dtype=dtype)
 
 
-class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract):
+class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel):
     config: Gemma3TextConfig = eqx.field(static=True)
     model: Gemma3TextModel
     lm_head: Linear | None
@@ -626,6 +602,8 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
         pos: int = 0,
         dtype: jnp.dtype = jnp.float32,
         *,
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
         return_hidden_states=False,
@@ -636,6 +614,8 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
             input_ids,
             pos,
             dtype,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
             rngs=rngs,
             decode_states=decode_states,
             forward_impl=forward_impl,
@@ -681,94 +661,6 @@ class Gemma3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstrac
             preferred_element_type=jnp.float32,
         )
 
-    def to_vllm(self) -> VllmMapping:
-        leaves: list[tuple[tuple[str, ...], VllmWeightLeaf]] = []
-        mappings: dict[str, tuple[str, tuple[str, ...] | None]] = {}
-
-        def add(path: str, value: jax.Array):
-            key = tuple(path.split("."))
-            leaves.append((key, VllmWeightLeaf(value=value)))
-            mappings[path] = (path, None)
-
-        add("model.embed_tokens.weight", self.model.embed_tokens.weight)
-
-        layers = (
-            self.model.layers.unstack()
-            if isinstance(self.model.layers, StackModule)
-            else self.model.layers
-        )
-        for layer_idx, layer in enumerate(layers):
-            prefix = f"model.layers.{layer_idx}"
-            qkv_weight = jnp.concatenate(
-                (
-                    layer.self_attn.q_proj.weight,
-                    layer.self_attn.k_proj.weight,
-                    layer.self_attn.v_proj.weight,
-                ),
-                axis=0,
-            )
-            add(f"{prefix}.self_attn.qkv_proj.weight", qkv_weight)
-            if layer.self_attn.q_proj.bias is not None:
-                qkv_bias = jnp.concatenate(
-                    (
-                        layer.self_attn.q_proj.bias,
-                        layer.self_attn.k_proj.bias,
-                        layer.self_attn.v_proj.bias,
-                    ),
-                    axis=0,
-                )
-                add(f"{prefix}.self_attn.qkv_proj.bias", qkv_bias)
-            add(f"{prefix}.self_attn.o_proj.weight", layer.self_attn.o_proj.weight)
-            if layer.self_attn.o_proj.bias is not None:
-                add(f"{prefix}.self_attn.o_proj.bias", layer.self_attn.o_proj.bias)
-            add(f"{prefix}.self_attn.q_norm.weight", layer.self_attn.q_norm.weight)
-            add(f"{prefix}.self_attn.k_norm.weight", layer.self_attn.k_norm.weight)
-            add(f"{prefix}.input_layernorm.weight", layer.input_layernorm.weight)
-            add(
-                f"{prefix}.post_attention_layernorm.weight",
-                layer.post_attention_layernorm.weight,
-            )
-            add(
-                f"{prefix}.pre_feedforward_layernorm.weight",
-                layer.pre_feedforward_layernorm.weight,
-            )
-            add(
-                f"{prefix}.post_feedforward_layernorm.weight",
-                layer.post_feedforward_layernorm.weight,
-            )
-            gate_up_weight = jnp.concatenate(
-                (
-                    layer.mlp.gate_proj.weight,
-                    layer.mlp.up_proj.weight,
-                ),
-                axis=0,
-            )
-            add(f"{prefix}.mlp.gate_up_proj.weight", gate_up_weight)
-            if layer.mlp.gate_proj.bias is not None:
-                gate_up_bias = jnp.concatenate(
-                    (
-                        layer.mlp.gate_proj.bias,
-                        layer.mlp.up_proj.bias,
-                    ),
-                    axis=0,
-                )
-                add(f"{prefix}.mlp.gate_up_proj.bias", gate_up_bias)
-            add(f"{prefix}.mlp.down_proj.weight", layer.mlp.down_proj.weight)
-            if layer.mlp.down_proj.bias is not None:
-                add(f"{prefix}.mlp.down_proj.bias", layer.mlp.down_proj.bias)
-
-        add("model.norm.weight", self.model.norm.weight)
-        if self.lm_head is not None:
-            add("lm_head.weight", self.lm_head.weight)
-        else:
-            add("lm_head.weight", self.model.embed_tokens.weight)
-
-        return VllmMapping(
-            state=VllmWeightState(leaves=leaves),
-            mappings=mappings,
-            transpose_keys={},
-        )
-
 
 class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
     config: Gemma3TextConfig = eqx.field(static=True)
@@ -809,6 +701,8 @@ class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
         pos: int = 0,
         dtype: jnp.dtype = jnp.float32,
         *,
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         rngs: PRNGKeyArray | None = None,
         forward_impl: ForwardImpl | None = None,
         **inputs,
@@ -817,6 +711,8 @@ class Gemma3ForSequenceClassification(AbstractHuggingFacePreTrainedModel):
             input_ids,
             pos,
             dtype,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
             rngs=rngs,
             forward_impl=forward_impl,
             **inputs,

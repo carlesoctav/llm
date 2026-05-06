@@ -210,14 +210,14 @@ def train(
                 for name, evaluator in evaluators.items():
                     eval_process[name] = evaluator(train_state)
 
-            batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
-            if first_step:
-                with (
-                    jax.named_scope("compile train step"),
-                    train_state_context(train_state),
-                ):
-
+            with (
+                jax.named_scope("train_step"),
+                jax.profiler.StepTraceAnnotation("train_step", step_num = step),
+                train_state_context(train_state),
+            ):
+                batch = next(train_iterator)
+                if first_step:
                     @print_timing
                     def compile_train_step():
                         train_step_jit = jax.jit(
@@ -238,12 +238,7 @@ def train(
                     program_wall_t0 = time.monotonic()
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
                     first_step = False
-            else:
-                with (
-                    jax.named_scope("train_step"),
-                    jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
-                    train_state_context(train_state),
-                ):
+                else:
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
 
             host_aux = metric_utils.to_host(aux, flatten=True)
@@ -304,6 +299,7 @@ def train(
 
 
 def main(config: sws.FinalConfig):
+    jax.config.update("jax_softmax_custom_jvp", True)
     _preparse_absl_flags()
     do_callback = getattr(config, "callback", None)
     do_load_state = getattr(config, "load_state", None)

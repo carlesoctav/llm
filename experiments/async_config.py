@@ -6,10 +6,11 @@ import sws
 def get_config():
     config = sws.Config()
 
-    config.project_name = "jaxformers"
+    config.project_name = "test-async"
     config.exp_name = "async-grpo-gsm8k"
+    config.dir = "/mnt/carles/llm/ckptr"
     config.seed = 42
-    config.max_train_step = 100
+    config.max_train_step = 1000
     config.forward_dtype = lambda: jnp.bfloat16
     config.grad_accum = 8
     config.clip_epsilon = 0.2
@@ -18,6 +19,13 @@ def get_config():
     config.logger_name = "wandb"
     config.logger.project = "grpo-test-again"
     config.logger.name = lambda: config.exp_name
+
+    config.checkpoint.path = lambda: (
+        f"{config.dir}/{config.project_name}/{config.exp_name}"
+    )
+    config.checkpoint.save_interval_steps = 100
+    config.checkpoint.max_to_keep = None
+    config.checkpoint.save_only_trainable = False
 
     config.parallel.parallel_dims = {
         "dp_replicate": 1,
@@ -59,7 +67,7 @@ def get_config():
     config.vllm.gpu_memory_utilization = 0.2
     config.vllm.enable_prefix_caching = True
     config.vllm.max_num_seqs = 128
-    config.vllm.max_model_len = 2048
+    config.vllm.max_model_len = 4096
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0
@@ -68,6 +76,16 @@ def get_config():
     config.optimizer.eps = 1e-8
 
     config.learning_rate = 1e-5
-    config.lr_scheduler_name = "constant"
+    config.lr_scheduler_name = "wsds"
+    config.lr_scheduler.min_lr_ratio = 0.1
+    config.lr_scheduler.warmup = 0.01
+    config.lr_scheduler.decay = None
+    config.lr_scheduler.rewarmup = 0.0
+    config.lr_scheduler.cycle_length = 0.2
+    config.lr_scheduler.cycles = None
+    config.lr_scheduler.decay_schedule = "cosine"
+
+    config.callback.log_grad_norm = {}
+    config.callback.log_learning_rate = {}
 
     return config

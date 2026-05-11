@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import copy
+import json
 import threading
 from collections import deque
 from concurrent.futures import Future as ConFuture, wait as con_wait
+from pathlib import Path
 from typing import Any, TypeVar
 
 import datasets as hf_datasets
@@ -12,29 +13,50 @@ import grain
 import numpy as np
 import verifiers as vf
 
+from jaxformers.async_utils import AsyncLoopThread
+
 
 VfArgs = TypeVar("VfArgs")
 
 
-class AsyncLoopThread:
-    def __init__(self):
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="rollout_async_loop"
+def _jsonable(value):
+    if hasattr(value, "model_dump"):
+        return _jsonable(value.model_dump(mode="python"))
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _trajectory_for_log(trajectory):
+    rows = []
+    for step in trajectory or []:
+        if hasattr(step, "model_dump"):
+            step = step.model_dump(mode="python")
+        tokens = step["tokens"] if "tokens" in step else None
+        rows.append(
+            {
+                "prompt": _jsonable(step["prompt"]) if "prompt" in step else None,
+                "completion": _jsonable(step["completion"])
+                if "completion" in step
+                else None,
+                "reward": _jsonable(step["reward"]) if "reward" in step else None,
+                "advantage": _jsonable(step["advantage"])
+                if "advantage" in step
+                else None,
+                "extras": _jsonable(step["extras"]) if "extras" in step else {},
+                "num_input_tokens": len(tokens["prompt_ids"]) if tokens else None,
+                "num_output_tokens": len(tokens["completion_ids"]) if tokens else None,
+            }
         )
-        self._thread.start()
-
-    def _run(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def submit(self, coro) -> ConFuture:
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
-
-    def close(self):
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout = 1)
-        self._loop.close()
+    return rows
 
 
 def _compute_advantages(rewards: list[float]) -> list[float]:
@@ -60,6 +82,7 @@ class VerifiersIterator(grain.DatasetIterator):
         seed: int = 42,
         env_weights: list[float] | None = None,
         max_retries: int = 3,
+        rollout_log_path: str | None = "rollouts/async_verifiers.jsonl",
     ):
         super().__init__()
         self._envs = envs
@@ -73,11 +96,16 @@ class VerifiersIterator(grain.DatasetIterator):
         self._rng = np.random.default_rng(seed)
         self._max_retries = max_retries
         self._buffer = deque()
-        self._max_inflight_requests = 10
+        self._max_inflight_requests = 64
         self._executor = AsyncLoopThread()
         self._futures: set[ConFuture] = set()
 
         self._rollout_counter = 0
+        self._group_counter = 0
+        self._rollout_log_path = Path(rollout_log_path) if rollout_log_path else None
+        self._rollout_log_lock = threading.Lock()
+        if self._rollout_log_path is not None:
+            self._rollout_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def fill_inlfight_queue(self):
         diff = max(self._max_inflight_requests - len(self._futures), 0)
@@ -100,6 +128,8 @@ class VerifiersIterator(grain.DatasetIterator):
 
     async def _fetch_next_group(self) -> list[dict[str, Any]]:
         env, example = self._sample_group_inputs()
+        group_id = self._group_counter
+        self._group_counter += 1
         group_inputs = [
             copy.deepcopy(example) for _ in range(self._rollouts_per_example)
         ]
@@ -113,6 +143,7 @@ class VerifiersIterator(grain.DatasetIterator):
         )
         rewards = [state["reward"] for state in states]
         advantages = _compute_advantages(rewards)
+        self._log_generated(group_id, states, advantages)
         outputs = []
         for state, advantage in zip(states, advantages):
             outputs.append(
@@ -128,6 +159,44 @@ class VerifiersIterator(grain.DatasetIterator):
             )
         return outputs
 
+    def _log_generated(
+        self,
+        group_id: int,
+        states: list[dict[str, Any]],
+        advantages: list[float],
+    ) -> None:
+        if self._rollout_log_path is None:
+            return
+        with self._rollout_log_lock:
+            with self._rollout_log_path.open("a", encoding="utf-8") as f:
+                for sample_id, (state, advantage) in enumerate(zip(states, advantages)):
+                    trajectory = _trajectory_for_log(state["trajectory"])
+                    record = {
+                        "group_id": group_id,
+                        "sample_id": sample_id,
+                        "task": state["task"],
+                        "example_id": state["example_id"],
+                        "reward": state["reward"],
+                        "advantage": advantage,
+                        "is_truncated": state["is_truncated"],
+                        "stop_condition": state.get("stop_condition"),
+                        "prompt": state.get("prompt"),
+                        "completion": state.get("completion"),
+                        "answer": state.get("answer"),
+                        "info": state.get("info"),
+                        "metrics": state.get("metrics"),
+                        "timing": state.get("timing"),
+                        "token_usage": state.get("token_usage"),
+                        "num_input_tokens": sum(
+                            row["num_input_tokens"] or 0 for row in trajectory
+                        ),
+                        "num_output_tokens": sum(
+                            row["num_output_tokens"] or 0 for row in trajectory
+                        ),
+                        "trajectory": trajectory,
+                    }
+                    f.write(json.dumps(_jsonable(record), ensure_ascii=False) + "\n")
+
     def __next__(self):
         self.fill_inlfight_queue()
 
@@ -137,7 +206,7 @@ class VerifiersIterator(grain.DatasetIterator):
             for fut in done:
                 self._buffer.extend(fut.result())
 
-        self._rollout_counter+=1
+        self._rollout_counter += 1
         return self._buffer.popleft()
 
     def get_state(self):
@@ -174,6 +243,7 @@ class VerifiersSourceIterDataset(grain.IterDataset):
         env_weights: list[float] | None = None,
         seed: int = 42,
         max_retries: int = 3,
+        rollout_log_path: str | None = "rollouts/async_verifiers.jsonl",
     ):
         super().__init__()
         self._envs = {}
@@ -189,6 +259,7 @@ class VerifiersSourceIterDataset(grain.IterDataset):
         self._env_weights = env_weights
         self._seed = seed
         self._max_retries = max_retries
+        self._rollout_log_path = rollout_log_path
 
     def __iter__(self):
         return VerifiersIterator(
@@ -200,6 +271,7 @@ class VerifiersSourceIterDataset(grain.IterDataset):
             env_weights=self._env_weights,
             seed=self._seed,
             max_retries=self._max_retries,
+            rollout_log_path=self._rollout_log_path,
         )
 
     def __str__(self) -> str:
@@ -214,6 +286,7 @@ def make(
     env_weights: list[float] | None = None,
     seed: int = 0,
     max_retries: int = 0,
+    rollout_log_path: str | None = "rollouts/async_verifiers.jsonl",
 ):
     if env_weights is not None and len(env_weights) != len(envs):
         raise ValueError("env_weights length must match envs length.")
@@ -228,5 +301,6 @@ def make(
             env_weights=env_weights,
             seed=seed,
             max_retries=max_retries,
+            rollout_log_path=rollout_log_path,
         )
     ]

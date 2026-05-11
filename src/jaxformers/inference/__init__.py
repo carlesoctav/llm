@@ -1,6 +1,6 @@
 """Inference runtime package."""
 
-from .llm_client import SameProcessTPUInferenceClient, make
+from .llm_client import make, SameProcessTPUInferenceClient
 
 
 __all__ = [

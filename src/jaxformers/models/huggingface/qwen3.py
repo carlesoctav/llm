@@ -5,16 +5,11 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from jax.sharding import PartitionSpec as P, reshard
-from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
+from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 from transformers import Qwen3Config
 
-from jaxformers.attention_utils import ATTENTION_INTERFACE
+from jaxformers.attention_utils import ATTENTION_INTERFACE, prepare_attention_kwargs
 from jaxformers.dispatch.einsum import einsum
-from jaxformers.masking_utils import (
-    ATTENTION_MASK_INTERFACE,
-    make_causal_mask,
-    make_sliding_window_causal_mask,
-)
 from jaxformers.module_utils import (
     AbstractHuggingFacePreTrainedModel,
     AdditionalConfig,
@@ -59,36 +54,6 @@ def get_rope_theta(config: Qwen3Config) -> jax.Array:
     return jnp.asarray(rope_parameters["rope_theta"], dtype=jnp.float32)
 
 
-def make_mask(config, input_embeds, attention_mask=None, segment_ids=None, **kwargs):
-    attn_impl = config.additional_config["attn_impl"]
-    if attn_impl not in ATTENTION_MASK_INTERFACE:
-        return {
-            "full_attention": None,
-            "sliding_attention": None,
-        }
-
-    full_mask = make_causal_mask(attn_impl, input_embeds, attention_mask, segment_ids)
-    if config.sliding_window is None:
-        sliding_mask = full_mask
-    else:
-        sliding_mask = make_sliding_window_causal_mask(
-            attn_impl,
-            input_embeds,
-            config.sliding_window,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-        )
-
-    return {
-        "full_attention": reshard(
-            full_mask, from_logical_rules(("batch", None, None, None))
-        ),
-        "sliding_attention": reshard(
-            full_mask, from_logical_rules(("batch", None, None, None))
-        ),
-    }
-
-
 class Qwen3RMSNorm(eqx.Module):
     weight: Array
 
@@ -129,6 +94,7 @@ class Qwen3Attention(eqx.Module):
     num_key_value_heads: int = eqx.field(static=True)
     scaling: float = eqx.field(static=True)
     attn_impl: str = eqx.field(static=True)
+    window_size: int | None = eqx.field(static=True)
 
     def __init__(
         self,
@@ -204,12 +170,15 @@ class Qwen3Attention(eqx.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.scaling = head_dim**-0.5
         self.attn_impl = attn_impl
+        self.window_size = config.sliding_window
 
     def __call__(
         self,
         x: Float[Array, "B T D"],
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         *,
-        attention_mask,
+        is_sliding,
         rope_theta: jax.Array,
         pos: int = 0,
         decode_state: PyTree | None = None,
@@ -224,9 +193,20 @@ class Qwen3Attention(eqx.Module):
             print(
                 f"Decoding requested (decode_state provided), but attn_impl='{self.attn_impl}' is not 'sdpa'. Falling back to 'sdpa'."
             )
-            attention_interface = ATTENTION_INTERFACE["sdpa"]
+            active_attn_impl = "sdpa"
         else:
-            attention_interface = ATTENTION_INTERFACE[self.attn_impl]
+            active_attn_impl = self.attn_impl
+        attention_interface = ATTENTION_INTERFACE[active_attn_impl]
+        attention_args_kwargs = prepare_attention_kwargs(
+            active_attn_impl,
+            x,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            is_causal=True,
+            is_sliding=is_sliding,
+            is_mqa=self.num_key_value_heads == 1,
+            window_size=self.window_size,
+        )
 
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -271,7 +251,6 @@ class Qwen3Attention(eqx.Module):
         k1, k2 = k[:, :, :, : head_dim // 2], k[:, :, :, head_dim // 2 :]
         q = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
-        q = q * jnp.asarray(self.scaling, dtype=q.dtype)
 
         if do_decode:
             k, v, new_decode_state = make_kv_from_cache(k, v, pos, decode_state)
@@ -281,8 +260,9 @@ class Qwen3Attention(eqx.Module):
             q,
             k,
             v,
-            mask=attention_mask,
+            scale=self.scaling,
             q_sharding=q_sharding,
+            **attention_args_kwargs,
         )
         attn_output = rearrange(attn_output, "b t n h -> b t (n h)")
         return self.o_proj(attn_output), extra_output
@@ -394,25 +374,22 @@ class Qwen3DecoderLayer(eqx.Module, Stackable):
     def __call__(
         self,
         x: Float[Array, "B T D"],
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         *,
         rope_theta,
-        attention_mask,
         is_sliding,
         pos: int,
         decode_state: PyTree | None = None,
     ):
-        attention_mask = jax.lax.select(
-            is_sliding,
-            attention_mask["sliding_attention"],
-            attention_mask["full_attention"],
-        )
-
         residual = x
         x_norm = self.input_layernorm(x)
         x_norm = reshard(x_norm, from_logical_rules(("batch", "context", None)))
         attn_output, extra_output = self.self_attn(
             x_norm,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            is_sliding=is_sliding,
             rope_theta=rope_theta,
             pos=pos,
             decode_state=decode_state,
@@ -476,13 +453,14 @@ class Qwen3Model(AbstractHuggingFacePreTrainedModel):
         pos: int = 0,
         dtype: jnp.dtype = jnp.float32,
         *,
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
         forward_impl: ForwardImpl | None = None,
         **inputs,
     ):
         x = self.embed_tokens(input_ids, dtype=dtype)
-        mask_mapping = make_mask(self.config, x, **inputs)
         decode_states = (
             [None] * self.config.num_hidden_layers
             if decode_states is None
@@ -514,8 +492,9 @@ class Qwen3Model(AbstractHuggingFacePreTrainedModel):
                 x, extra_output = fwd(
                     layer,
                     x,
+                    attention_mask=attention_mask,
+                    segment_ids=segment_ids,
                     rope_theta=rope_theta,
-                    attention_mask=mask_mapping,
                     is_sliding=attention_type == "sliding_attention",
                     pos=pos,
                     decode_state=decode_state,
@@ -543,8 +522,9 @@ class Qwen3Model(AbstractHuggingFacePreTrainedModel):
             )
             x, extra_output_list = layers(
                 x,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
                 rope_theta=rope_theta,
-                attention_mask=mask_mapping,
                 is_sliding=is_sliding,
                 pos=pos,
                 decode_state=decode_states,
@@ -608,6 +588,8 @@ class Qwen3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract
         pos: int = 0,
         dtype: jnp.dtype = jnp.float32,
         *,
+        attention_mask: Bool[Array, "B T"] | None = None,
+        segment_ids: Int[Array, "B T"] | None = None,
         rngs: PRNGKeyArray | None = None,
         decode_states: PyTree | None = None,
         return_hidden_states=False,
@@ -618,6 +600,8 @@ class Qwen3ForCausalLM(AbstractHuggingFacePreTrainedModel, ToVllmMappingAbstract
             input_ids,
             pos,
             dtype,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
             rngs=rngs,
             decode_states=decode_states,
             forward_impl=forward_impl,

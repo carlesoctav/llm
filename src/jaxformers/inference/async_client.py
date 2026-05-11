@@ -4,7 +4,6 @@ import contextlib
 import logging
 import os
 import sys
-import threading
 import time
 from collections.abc import Mapping
 from typing import Any, cast, TypeAlias
@@ -15,6 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm import AsyncEngineArgs
 from vllm.v1.executor import Executor
 
+from jaxformers.async_utils import AsyncLoopThread
 from jaxformers.module_utils import ToVllmMappingAbstract, VllmMapping
 
 
@@ -182,14 +182,9 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
 
         self._client = self.llm
         self._config = None
-        self._runtime_lock = threading.RLock()
         self._count = 0
         self._update_w_counter = 0
-
-    @contextlib.contextmanager
-    def runtime_lock(self):
-        with self._runtime_lock:
-            yield
+        self._executor = AsyncLoopThread()
 
     def setup_client(self, config: ClientConfig):  # pragma: no cover
         del config
@@ -199,6 +194,7 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
         )
 
     async def close(self) -> None:
+        self._executor.close()
         self._client = None
         self.llm = None
 
@@ -353,14 +349,18 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
             message=message,
         )
 
-    async def sync_weights(self, model: ToVllmMappingAbstract) -> None:
+    def sync_weights(self, model: ToVllmMappingAbstract) -> None:
         if not isinstance(model, ToVllmMappingAbstract):
             raise TypeError(
-                "update_weights expects a model implementing ToVllmMappingAbstract."
+                "sync_weights expects a model implementing ToVllmMappingAbstract."
             )
-            mapping = model.to_vllm()
-            await self.llm.pause_generation(mode = "wait")
-            await self.llm.collective_rpc(
+
+        mapping = model.to_vllm()
+        self._executor.submit(
+            self.llm.pause_generation(mode="keep", clear_cache=False)
+        ).result()
+        self._executor.submit(
+            self.llm.collective_rpc(
                 "sync_weights",
                 args=(
                     mapping.state,
@@ -369,8 +369,10 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
                     None,
                 ),
             )
-            self._update_w_counter+=1
-            # self.llm.collective_rpc("reinitialize_kv_cache")
+        ).result()
+        self._executor.submit(self.llm.resume_generation()).result()
+        self._update_w_counter += 1
+
 
 def make(
     mode: str,

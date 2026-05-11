@@ -7,7 +7,7 @@ from etils import epath
 
 from jaxformers import tree_util
 from jaxformers.modeling_utils import TrainState
-from jaxformers.print_utils import tree_pformat, tree_pprint
+from jaxformers.print_utils import tree_pformat
 
 
 def _make_save_decision_policy(save_every_steps: int) -> Any:
@@ -95,7 +95,6 @@ class CheckpointerWithInfo:
             checkpointables = {
                 "model": train_state.model,
                 "opt_state": train_state.opt_state,
-                "train_mask": train_state.train_mask,
             }
 
         else:
@@ -106,14 +105,15 @@ class CheckpointerWithInfo:
                 checkpointables = {
                     "model": trainable,
                     "opt_state": train_state.opt_state,
-                    "train_mask": train_state.train_mask,
                 }
             else:
                 checkpointables = {
                     "model": train_state.model,
                     "opt_state": train_state.opt_state,
-                    "train_mask": train_state.train_mask,
                 }
+
+        if train_state.train_mask is not None:
+            checkpointables["train_mask"] = train_state.train_mask
 
         return self.ckptr.save_checkpointables_async(step, checkpointables)
 
@@ -125,9 +125,14 @@ def make_checkpointer(
     max_to_keep: int | None = None,
     save_only_trainable: bool = True,
 ) -> CheckpointerWithInfo | None:
+    if train_state.train_mask is None and save_only_trainable:
+        raise ValueError(
+            "save_only_trainable=True was requested but the model has no train_mask. "
+            "Provide a valid model.train_mask indicating which parameters are trainable, "
+            "or set save_only_trainable=False."
+        )
 
-    # im tsill not really sure about how to make a check for this train_mask
-    things_to_check_pytree = ["train_mask"]
+    things_to_check_pytree = ["train_mask"] if train_state.train_mask is not None else []
     things_to_check_args = ["max_to_keep", "save_only_trainable"]
 
     if is_used_checkpoint(path):
@@ -162,12 +167,6 @@ def make_checkpointer(
                     f"which does not match the requested {item} leaves={tree_pformat(requested)}. "
                     "Please use a matching configuration or remove the existing checkpoint."
                 )
-    if train_state.train_mask is None and save_only_trainable:
-        raise ValueError(
-            "save_only_trainable=True was requested but the model has no train_mask. "
-            "Provide a valid model.train_mask indicating which parameters are trainable, "
-            "or set save_only_trainable=False."
-        )
 
     if train_state.train_mask is not None and save_only_trainable:
         leave = jax.tree.leaves(train_state.train_mask)

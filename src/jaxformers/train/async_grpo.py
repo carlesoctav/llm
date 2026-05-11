@@ -25,6 +25,7 @@ from jaxformers.benchmark_utils import (
     print_train_state_size,
 )
 from jaxformers.callbacks import make_callbacks
+from jaxformers.checkpoint_utils import CheckpointerWithInfo, make_checkpointer
 from jaxformers.inference import make as make_llm_client
 from jaxformers.logger import make_logger
 from jaxformers.modeling_utils import TrainState
@@ -181,6 +182,7 @@ def train(
     train_ds: Iterable,
     logger,
     llm_client,
+    ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
@@ -190,7 +192,7 @@ def train(
     first_step = True
     to_log_later = {}
     program_wall_t0 = None
-    update_weights_step = 5
+    off_policy_step = 5
     pbar = None
     if jax.process_index() == 0:
         pbar = tqdm(
@@ -202,16 +204,19 @@ def train(
         )
 
     try:
+        if ckptr is not None:
+            ckptr.save_checkpoint(step, train_state, train_iterator)
+
         while step < config.max_train_step:
-            if (step % update_weights_step) == 0:
+            if (step % off_policy_step) == 0:
                 llm_client.sync_weights(train_state.model)
+
             batch = next(train_iterator)
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             if first_step:
                 with (
                     jax.named_scope("compile train step"),
                     train_state_context(train_state),
-                    llm_client.runtime_lock(),
                 ):
 
                     @print_timing
@@ -233,17 +238,14 @@ def train(
 
                     program_wall_t0 = time.monotonic()
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
-                    if step % update_weights_step == 0:
                     first_step = False
             else:
                 with (
                     jax.named_scope("train_step"),
                     jax.profiler.StepTraceAnnotation(f"train_step_{step}"),
                     train_state_context(train_state),
-                    llm_client.runtime_lock(),
                 ):
                     train_state, aux = train_step_fn(train_state, batch, rngs=step_rngs)
-                    # sync_inference_weights(train_state, llm_client)
 
             host_aux = metric_utils.to_host(aux, flatten=True)
             global_aux = metric_utils.host_add_aux(
@@ -277,6 +279,8 @@ def train(
                     )
                     pbar.update(1)
             step += 1
+            if ckptr is not None:
+                ckptr.save_checkpoint(step, train_state, train_iterator)
 
     finally:
         if program_wall_t0 is not None:
@@ -291,6 +295,8 @@ def train(
             logger.config.update(to_log_later)
         if pbar is not None:
             pbar.close()
+        if ckptr is not None:
+            ckptr.close()
 
     return train_state, to_log_later
 
@@ -301,10 +307,12 @@ def main(config: sws.FinalConfig):
         raise ValueError("train/grpo.py currently supports only single-process runs.")
 
     do_callback = getattr(config, "callback", None)
+    do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
 
     logger = None
     llm_client = None
+    ckptr = None
     if jax.process_index() == 0:
         logger = make_logger(config.logger_name, config.logger.to_dict())
         logger.config.update(config.to_dict())
@@ -359,6 +367,10 @@ def main(config: sws.FinalConfig):
                     callbacks=callbacks,
                 )
 
+            if do_checkpoint:
+                ckptr = make_checkpointer(train_state, **config.checkpoint.to_dict())
+                train_state = ckptr.load_checkpoint(train_state)
+
         vllm_config = config.vllm.to_dict()
         if "additional_config" in vllm_config:
             additional_config = dict(vllm_config["additional_config"])
@@ -383,7 +395,7 @@ def main(config: sws.FinalConfig):
             tokenizer=config.model.model_id,
             vllm_config=vllm_config,
         )
-        llm_client.sync_weights(train_state.model)
+
         train_ds = make_rl_data(config, llm_client)
         _, metrics = train(
             config,
@@ -391,6 +403,7 @@ def main(config: sws.FinalConfig):
             train_ds,
             logger,
             llm_client,
+            ckptr,
             rngs=train_rngs,
         )
         return metrics
@@ -401,5 +414,4 @@ def main(config: sws.FinalConfig):
             logger.finish()
 
 if __name__ == "__main__":
-
     sws_run(main)

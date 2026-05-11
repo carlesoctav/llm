@@ -1,5 +1,5 @@
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from transformers.tokenization_utils_base import BatchEncoding
 
 from jaxformers.inference.llm_client import _coerce_prompt_ids, _sync_dict_state

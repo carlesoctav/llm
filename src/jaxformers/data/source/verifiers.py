@@ -8,6 +8,8 @@ from typing import Any
 import grain
 import numpy as np
 
+from jaxformers.inference.new_client import NewClient
+
 
 def _get_env_dataset(env):
     if hasattr(env, "build_dataset"):
@@ -59,12 +61,14 @@ class VerifiersIterator(grain.DatasetIterator):
         env_weights: list[float] | None,
         seed: int,
         max_retries: int,
+        model_name: str,
     ):
         super().__init__()
         self._envs = envs
         self._env_names = env_names
         self._datasets = [_get_env_dataset(env) for env in envs]
         self._client = client
+        self._model_name = model_name
         self._rollouts_per_example = rollouts_per_example
         self._sampling_args = sampling_args
         self._env_weights = env_weights
@@ -107,7 +111,7 @@ class VerifiersIterator(grain.DatasetIterator):
             env.run_group(
                 group_inputs,
                 self._client,
-                self._client.model_name,
+                self._model_name,
                 self._sampling_args,
                 max_retries=self._max_retries,
                 state_columns=["trajectory"],
@@ -170,7 +174,15 @@ class VerifiersDataset(grain.IterDataset):
         super().__init__()
         self._envs = envs
         self._env_names = env_names
-        self._client = client
+        if isinstance(client, NewClient):
+            self._client = client.client_config
+            self._model_name = client.model_name
+            sampling_args = dict(sampling_args)
+            if "top_logprobs" not in sampling_args:
+                sampling_args["top_logprobs"] = 1
+        else:
+            self._client = client
+            self._model_name = client.model_name
         self._rollouts_per_example = rollouts_per_example
         self._sampling_args = sampling_args
         self._env_weights = env_weights
@@ -187,6 +199,7 @@ class VerifiersDataset(grain.IterDataset):
             env_weights=self._env_weights,
             seed=self._seed,
             max_retries=self._max_retries,
+            model_name=self._model_name,
         )
 
     def __str__(self) -> str:

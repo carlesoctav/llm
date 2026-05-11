@@ -209,6 +209,7 @@ def train(
 
         while step < config.max_train_step:
             if (step % off_policy_step) == 0:
+                print("sync_weights")
                 llm_client.sync_weights(train_state.model)
 
             batch = next(train_iterator)

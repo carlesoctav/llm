@@ -66,7 +66,7 @@ class AdditionalConfig(TypedDict):
     attn_impl: str = "sdpa"
     sequence_parallelism: bool = True
     weights_impl: str = "stack"
-    forward_impl: str = "loop"
+    forward_impl: str = "scan"
 
 
 DEFAULT_ADDITIONAL_CONFIG = {

@@ -12,8 +12,10 @@ import datasets as hf_datasets
 import grain
 import numpy as np
 import verifiers as vf
+from verifiers.types import ClientConfig
 
 from jaxformers.async_utils import AsyncLoopThread
+from jaxformers.inference.new_client import NewClient
 
 
 VfArgs = TypeVar("VfArgs")
@@ -83,11 +85,13 @@ class VerifiersIterator(grain.DatasetIterator):
         env_weights: list[float] | None = None,
         max_retries: int = 3,
         rollout_log_path: str | None = "rollouts/async_verifiers.jsonl",
+        model_name: str | None = None,
     ):
         super().__init__()
+        self._client = client
+        self._model_name = model_name
         self._envs = envs
         self._datasets = datasets
-        self._client = client
         self._rollouts_per_example = rollouts_per_example
         self._sampling_args = sampling_args
         self._env_weights = env_weights
@@ -136,7 +140,7 @@ class VerifiersIterator(grain.DatasetIterator):
         states = await env.run_group(
             group_inputs,
             self._client,
-            self._client.model_name,
+            self._model_name,
             self._sampling_args,
             max_retries=self._max_retries,
             state_columns=["trajectory"],
@@ -253,7 +257,23 @@ class VerifiersSourceIterDataset(grain.IterDataset):
             self._envs[k] = env
             self._datasets[k] = env.get_dataset()
 
-        self._client = client
+        if client is None:
+            self._client = ClientConfig(
+                client_idx=0,
+                client_type="openai_chat_completions_token",
+                api_key_var="",
+                api_base_url="http://localhost:8000/v1",
+            )
+            self._model_name = None
+        elif isinstance(client, NewClient):
+            self._client = client.client_config
+            self._model_name = client.model_name
+            sampling_args = dict(sampling_args)
+            if "top_logprobs" not in sampling_args:
+                sampling_args["top_logprobs"] = 1
+        else:
+            self._client = client
+            self._model_name = client.model_name
         self._rollouts_per_example = rollouts_per_example
         self._sampling_args = sampling_args
         self._env_weights = env_weights
@@ -272,6 +292,7 @@ class VerifiersSourceIterDataset(grain.IterDataset):
             seed=self._seed,
             max_retries=self._max_retries,
             rollout_log_path=self._rollout_log_path,
+            model_name=self._model_name,
         )
 
     def __str__(self) -> str:

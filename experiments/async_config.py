@@ -14,7 +14,7 @@ def get_config():
     config.forward_dtype = lambda: jnp.bfloat16
     config.grad_accum = 8
     config.clip_epsilon = 0.2
-    config.weights_impl = "free"
+    config.weights_impl = "stack"
 
     config.logger_name = "wandb"
     config.logger.project = "grpo-test-again"
@@ -41,7 +41,7 @@ def get_config():
     config.model.model_id = "Qwen/Qwen3-0.6B"
     config.model.additional_config.remat_layer = True
     config.model.additional_config.attn_impl = "eager"
-    config.model.additional_config.forward_impl = "loop"
+    config.model.additional_config.forward_impl = "scan"
     config.model.additional_config.sequence_parallelism = True
     config.model.param_dtype = lambda: jnp.bfloat16
 
@@ -68,6 +68,8 @@ def get_config():
     config.vllm.enable_prefix_caching = True
     config.vllm.max_num_seqs = 128
     config.vllm.max_model_len = 4096
+    config.vllm.reasoning_parser = "qwen3"
+    config.vllm.default_chat_template_kwargs = {"enable_thinking": False}
 
     config.optimizer_name = "adam"
     config.optimizer.max_grad_norm = 1.0

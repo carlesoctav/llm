@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from jaxformers.inference.async_client import AsyncSameProcessTPUInferenceClient
+from jaxformers.inference.new_client import NewClient
 from jaxformers.module_utils import ToVllmMappingAbstract, VllmMapping
 
 
@@ -380,5 +381,6 @@ def make(
         return AsyncSameProcessTPUInferenceClient(
             model=model, tokenizer=tokenizer, vllm_config=vllm_config
         )
-    else:
-        raise NotImplementedError
+    elif mode == "new":
+        return NewClient(model=model, tokenizer=tokenizer, vllm_config=vllm_config)
+    raise NotImplementedError

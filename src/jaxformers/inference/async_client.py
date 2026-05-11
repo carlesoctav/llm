@@ -372,19 +372,3 @@ class AsyncSameProcessTPUInferenceClient(VerifiersClient):
         ).result()
         self._executor.submit(self.llm.resume_generation()).result()
         self._update_w_counter += 1
-
-
-def make(
-    mode: str,
-    *,
-    model: str,
-    tokenizer: PreTrainedTokenizerBase | str | None = None,
-    vllm_config: dict[str, Any],
-):
-    if mode != "same_process":
-        raise ValueError(f"Unsupported inference.mode {mode!r}")
-    return AsyncSameProcessTPUInferenceClient(
-        model=model,
-        tokenizer=tokenizer,
-        vllm_config=vllm_config,
-    )

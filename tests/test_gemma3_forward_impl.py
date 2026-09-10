@@ -117,7 +117,9 @@ def test_init_accepts_model_id_without_explicit_config(monkeypatch):
         called_with.append(model_source)
         return config
 
-    monkeypatch.setattr(modeling_utils.AutoConfig, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(
+        modeling_utils.AutoConfig, "from_pretrained", fake_from_pretrained
+    )
 
     with model_context(jax.devices("cpu")):
         model = Gemma3ForCausalLM.init(

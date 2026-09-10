@@ -5,28 +5,48 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "datasets>=4.5.0",
-    "einops>=0.8.2",
-    "grain>=0.2.15",
-    "jax[tpu]==0.9.0",
-    "jaxtyping>=0.3.5",
-    "optax>=0.2.6",
-    "orbax>=0.1.9",
-    "orbax-checkpoint>=0.11.32",
-    "quax>=0.2.1",
-    "sws-config>=0.6.3",
-    "tabulate>=0.10.0",
-    "tokamax>=0.0.10",
-    "tpu-info>=0.8.1",
-    "tqdm>=4.67.1",
-    "transformers>=5.0.0",
-    "wandb>=0.25.0",
-    "xprof>=2.22.0",
+    "datasets==4.6.1",
+    "einops==0.8.2",
+    "grain==0.2.16",
+    "jax[tpu]==0.9.2",
+    "jaxtyping==0.3.9",
+    "optax==0.2.8",
+    "orbax==0.1.9",
+    "orbax-checkpoint==0.11.33",
+    "quax==0.3.0",
+    "sws-config==0.7.1",
+    "tabulate==0.10.0",
+    "tokamax==0.0.10",
+    "tpu-inference[tpu]",
+    "tpu-info==0.12",
+    "tqdm==4.67.3",
+    "transformers==5.3.0",
+    "vllm[tpu]",
+    "wandb==0.25.0",
+    "xprof==2.22.0",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "torchvision==0.25.0",
+    "verifiers>=0.1.11",
 ]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv]
+find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
+override-dependencies = [
+  "transformers",
+  "tpu-inference",
+  "tpu-info",
+  "jax",
+  "optax",
+  "libtpu==0.0.39.dev20260403"
+]
+
 
 [tool.ruff.lint]
 fixable = ["I001", "F401", "UP"]
@@ -45,11 +65,13 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
-optax = { git = "https://github.com/google-deepmind/optax" }
+torchvision = { index = "pytorch-cpu" }
+vllm = { git = "https://github.com/carlesoctav/vllm", branch = "match-verison" }
+tpu-inference = { git = "https://github.com/vllm-project/tpu-inference" }
+
 
 [dependency-groups]
 dev = [
-    "flax>=0.12.2",
     "pytest>=9.0.2",
     "torch>=2.10.0",
     "torchax>=0.0.11",

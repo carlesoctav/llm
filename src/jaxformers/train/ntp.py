@@ -110,7 +110,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
             **batch["inputs"],
             rngs=rngs,
             dtype=config.forward_dtype,
-            return_hidden_states = True,
+            return_hidden_states=True,
         )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)

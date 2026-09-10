@@ -102,6 +102,7 @@ def maybe_unstack(trees: list | dict):
         for i in range(N)
     ]
 
+
 def flatten(tree, separator=".", is_leaf=None):
     res = {}
 
@@ -265,6 +266,7 @@ def to_abstract(tree):
             return leaf
 
     return jax.tree.map(_f, tree)
+
 
 def get_by_path(obj, path):
     for key in path:

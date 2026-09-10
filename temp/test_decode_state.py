@@ -33,7 +33,9 @@ rules = make_logical_axis_rules(mesh_size)
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
 with jax.set_mesh(mesh), with_logical_axis(rules):
-    model = Gemma3ForCausalLM.from_pretrained(model_id, rngs=jax.random.key(0), param_dtype = jnp.bfloat16)
+    model = Gemma3ForCausalLM.from_pretrained(
+        model_id, rngs=jax.random.key(0), param_dtype=jnp.bfloat16
+    )
 
     model = Gemma3ForCausalLM.from_pretrained(
         model_id, rngs=jax.random.key(0), param_dtype=jnp.bfloat16
@@ -55,5 +57,6 @@ with jax.set_mesh(mesh), with_logical_axis(rules):
     @jax.jit
     def fwd(model, inputs, decode_states):
         output, extra_outputs = model(**inputs, dtype=jnp.bfloat16)
+
     outputs, extra_outputs = fwd(model, inputs, decode_states)
     tree_pprint(extra_outputs)

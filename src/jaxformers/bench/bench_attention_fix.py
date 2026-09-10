@@ -39,7 +39,7 @@ def get_config():
     config.parallel.parallel_dims = {"dp_replicate": 1, "dp_shard": 4, "cp": 1, "tp": 1}
     config.num_devices = 4
     config.impls = list(ATTENTION_INTERFACE.keys())
-    config.devices = lambda: jax.devices()[:config.num_devices]
+    config.devices = lambda: jax.devices()[: config.num_devices]
     config.b = 4
     config.t = 8192
     config.n = 4
@@ -80,7 +80,9 @@ def make_compiled_bwd(impl, b, t, mask_mode, cotangent, use_q_sharding):
 
     def bwd_fn(q, k, v):
         out, pullback = jax.vjp(
-            lambda q_in, k_in, v_in: optimization_barrier(attention_fn(q_in, k_in, v_in)),
+            lambda q_in, k_in, v_in: optimization_barrier(
+                attention_fn(q_in, k_in, v_in)
+            ),
             q,
             k,
             v,

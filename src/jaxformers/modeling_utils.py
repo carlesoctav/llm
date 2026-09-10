@@ -8,7 +8,6 @@ from jax.sharding import Mesh
 from jaxtyping import Bool, PyTree
 
 from jaxformers import tree_util
-from jaxformers.dispatch.lora import lora_get_w
 from jaxformers.module_utils import AbstractModel
 from jaxformers.print_utils import tree_pformat
 
@@ -62,6 +61,8 @@ class TrainState:
     @property
     def base_params(self):
         if self.is_lora:
+            from jaxformers.dispatch.lora import lora_get_w
+
             return lora_get_w(self.model)
         else:
             return self.model

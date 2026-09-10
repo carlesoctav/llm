@@ -81,7 +81,7 @@ def print_train_state_size(train_state):
         print(f"tree {name} use {p / 1e9} GB")
         return p
 
-    train_model, freeze_model= jaxformers.tree_util.partition(
+    train_model, freeze_model = jaxformers.tree_util.partition(
         train_state.model, train_state.train_mask
     )
 

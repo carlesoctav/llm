@@ -27,6 +27,29 @@ default_init = jax.nn.initializers.variance_scaling(
 M = TypeVar("M", bound=eqx.Module)
 
 
+@dataclasses.dataclass
+class VllmWeightLeaf:
+    value: jax.Array
+
+
+@dataclasses.dataclass
+class VllmWeightState:
+    leaves: list[tuple[tuple[str, ...], VllmWeightLeaf]]
+
+    def flat_state(self):
+        return self.leaves
+
+    def from_flat_path(self, _flat_state):
+        return self
+
+
+@dataclasses.dataclass
+class VllmMapping:
+    state: VllmWeightState
+    mappings: dict[str, tuple[str, tuple[str, ...] | None]]
+    transpose_keys: dict[str, tuple[int, ...]]
+
+
 class ForwardImpl(StrEnum):
     LOOP = auto()
     SCAN = auto()
@@ -43,7 +66,7 @@ class AdditionalConfig(TypedDict):
     attn_impl: str = "sdpa"
     sequence_parallelism: bool = True
     weights_impl: str = "stack"
-    forward_impl: str = "loop"
+    forward_impl: str = "scan"
 
 
 DEFAULT_ADDITIONAL_CONFIG = {
@@ -184,6 +207,11 @@ class AbstractModel(eqx.Module):
                 return leaf
 
         return jax.tree.map_with_path(f, self, is_leaf=_is_leaf)
+
+
+class ToVllmMappingAbstract(abc.ABC):
+    @abc.abstractmethod
+    def to_vllm(self) -> VllmMapping: ...
 
 
 class AbstractHuggingFacePreTrainedModel(AbstractModel):

@@ -148,9 +148,7 @@ def from_logical_rules(
         context_rules = get_logical_axis_rules()
         rules = sharding_rules or context_rules
         spec = P(
-            *tuple(
-                rules[str(s)] if (s and str(s) in rules) else s for s in sharding
-            )
+            *tuple(rules[str(s)] if (s and str(s) in rules) else s for s in sharding)
         )
     else:
         spec = P(*sharding)

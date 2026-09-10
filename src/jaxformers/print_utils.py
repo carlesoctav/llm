@@ -148,7 +148,8 @@ def tree_pprint(
     Nothing. (The result is printed to stdout instead.)
     """
     print(
-        tree_pformat( pytree,
+        tree_pformat(
+            pytree,
             width=width,
             indent=indent,
             short_arrays=short_arrays,

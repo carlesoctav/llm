@@ -13,9 +13,7 @@ def make_callbacks(
     callbacks = []
     for name, callback_kwargs in callback_configs.items():
         if callback_kwargs:
-            callback_module = importlib.import_module(
-                f"jaxformers.callbacks.{name}"
-            )
+            callback_module = importlib.import_module(f"jaxformers.callbacks.{name}")
             callbacks.append(callback_module.make(**callback_kwargs))
         else:
             print(

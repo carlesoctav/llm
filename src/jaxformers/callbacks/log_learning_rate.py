@@ -38,7 +38,9 @@ def log_learning_rate() -> Callback:
 
     def update(model, callback_state, grad, updates, aux):
         del callback_state, grad, updates, aux
-        return model, LogLearningRateState(learning_rate=find_learning_rate(model.opt_state))
+        return model, LogLearningRateState(
+            learning_rate=find_learning_rate(model.opt_state)
+        )
 
     def process(output, model, callback_state, aux):
         del aux

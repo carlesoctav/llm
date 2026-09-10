@@ -6,7 +6,9 @@ import torch
 from transformers.models.gemma3 import Gemma3ForCausalLM as HFGemma3ForCausalLM
 
 from jaxformers.distributed import make_logical_axis_rules, make_mesh, with_logical_axis
-from jaxformers.models.huggingface.gemma3 import Gemma3ForCausalLM as JaxGemma3ForCausalLM
+from jaxformers.models.huggingface.gemma3 import (
+    Gemma3ForCausalLM as JaxGemma3ForCausalLM,
+)
 
 
 PARALLEL_DIMS = {"dp_replicate": 1, "dp_shard": 1, "cp": 1, "tp": 1}

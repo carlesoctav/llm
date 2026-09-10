@@ -75,7 +75,11 @@ def prepare_group(
                     seed=group_seed,
                 )
 
-        ds = ds.repeat(num_epochs = num_epochs) if hasattr(ds, "repeat") else RepeatIterDataset(ds, num_epochs=num_epochs)
+        ds = (
+            ds.repeat(num_epochs=num_epochs)
+            if hasattr(ds, "repeat")
+            else RepeatIterDataset(ds, num_epochs=num_epochs)
+        )
         prepared.append(ds)
 
     mixed = (

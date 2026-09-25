@@ -91,29 +91,20 @@ class CheckpointerWithInfo:
             )
             return
 
-        if step == 0:
-            checkpointables = {
-                "model": train_state.model,
-                "opt_state": train_state.opt_state,
-                "train_mask": train_state.train_mask,
-            }
-
+        if step == 0 or not self.save_only_trainable:
+            model = train_state.model
         else:
-            if self.save_only_trainable:
-                trainable, _ = tree_util.partition(
-                    train_state.model, train_state.train_mask
-                )
-                checkpointables = {
-                    "model": trainable,
-                    "opt_state": train_state.opt_state,
-                    "train_mask": train_state.train_mask,
-                }
-            else:
-                checkpointables = {
-                    "model": train_state.model,
-                    "opt_state": train_state.opt_state,
-                    "train_mask": train_state.train_mask,
-                }
+            model, _ = tree_util.partition(train_state.model, train_state.train_mask)
+
+        checkpointables = {
+            "model": model,
+            "opt_state": train_state.opt_state,
+            **(
+                {"train_mask": train_state.train_mask}
+                if train_state.train_mask is not None
+                else {}
+            ),
+        }
 
         return self.ckptr.save_checkpointables_async(step, checkpointables)
 

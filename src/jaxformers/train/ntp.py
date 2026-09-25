@@ -5,7 +5,7 @@ import sys
 import time
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -110,7 +110,7 @@ def train_step(config: sws.FinalConfig, train_state: TrainState, batch, *, rngs)
             **batch["inputs"],
             rngs=rngs,
             dtype=config.forward_dtype,
-            return_hidden_states = True,
+            return_hidden_states=True,
         )
         hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
         labels = batch["labels"].reshape(-1)
@@ -175,14 +175,13 @@ def pbar_display(metrics: dict[str, Any]) -> dict[str, Any]:
 def train(
     config,
     train_state: TrainState,
-    train_ds: Iterable,
+    train_iterator: Iterator,
     evaluators: list[Callable[[TrainState]]] | None = None,
     logger: None = None,
     ckptr: CheckpointerWithInfo | None = None,
     *,
     rngs: PRNGKeyArray | None = None,
 ):
-    train_iterator = iter(train_ds)
     step = train_state.step or 0
     global_aux = dict(DEFAULT_AUX)
     skip_eval = config.eval_every is None or evaluators is None
@@ -213,11 +212,12 @@ def train(
             step_rngs = jax.random.fold_in(rngs, step) if rngs is not None else None
             with (
                 jax.named_scope("train_step"),
-                jax.profiler.StepTraceAnnotation("train_step", step_num = step),
+                jax.profiler.StepTraceAnnotation("train_step", step_num=step),
                 train_state_context(train_state),
             ):
                 batch = next(train_iterator)
                 if first_step:
+
                     @print_timing
                     def compile_train_step():
                         train_step_jit = jax.jit(
@@ -306,6 +306,7 @@ def main(config: sws.FinalConfig):
     do_checkpoint = getattr(config, "checkpoint", None)
     do_lora = getattr(config, "lora", None)
     do_eval = getattr(config, "eval", None)
+    train_iterator = None
 
     logger = None
     if jax.process_index() == 0:
@@ -401,10 +402,11 @@ def main(config: sws.FinalConfig):
                     },
                 )
 
+        train_iterator = iter(train_ds)
         _, metrics = train(
             config,
             train_state,
-            train_ds,
+            train_iterator,
             evaluators,
             logger,
             ckptr,
@@ -412,6 +414,8 @@ def main(config: sws.FinalConfig):
         )
         return metrics
     finally:
+        if train_iterator is not None:
+            train_iterator.close()
         if logger is not None:
             logger.finish()
 

@@ -102,11 +102,15 @@ def make_bool_interface(
     mask_ndim = mask_output.ndim
     if padding_mask is not None:
         if mask_ndim == 3:  # (B, T, S), (B, T) -> (B, 1, T, S)
-            return (mask_output & padding_mask[:, :, None]).astype(jnp.bool)[
-                :, None, :, :
-            ]
+            return (
+                mask_output & padding_mask[:, :, None] & padding_mask[:, None, :]
+            ).astype(jnp.bool)[:, None, :, :]
         elif mask_ndim == 4:  # (B, N, T, S), (B, T) -> (B, N, T, S)
-            return (mask_output & padding_mask[:, None, :, None]).astype(jnp.bool)
+            return (
+                mask_output
+                & padding_mask[:, None, :, None]
+                & padding_mask[:, None, None, :]
+            ).astype(jnp.bool)
     else:
         return mask_output.astype(jnp.bool)[:, None, :, :]
 

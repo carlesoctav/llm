@@ -272,7 +272,11 @@ class AbstractHuggingFacePreTrainedModel(AbstractModel):
                 key = jax.tree_util.keystr(path, simple=True, separator=".")
                 if key not in state_dict:
                     return leaf
-                tensor = state_dict[key][:].astype(param_dtype)
+                tensor = state_dict[key][:]
+                if jnp.issubdtype(leaf.dtype, jnp.floating):
+                    tensor = tensor.astype(param_dtype)
+                else:
+                    tensor = tensor.astype(leaf.dtype)
                 used_key.add(key)
                 return jax.device_put(tensor, leaf.sharding.spec)
 
@@ -306,6 +310,12 @@ def init_missing_module(model, missing_key, *, rngs: PRNGKeyArray):
     def f(path, leaf):
         nonlocal counter
         if isinstance(leaf, jax.ShapeDtypeStruct):
+            if len(leaf.shape) < 2:
+                key = jax.tree_util.keystr(path, simple=True, separator=".")
+                fill = 0.0 if key.endswith("bias") else 1.0
+                return jax.device_put(
+                    jnp.full(leaf.shape, fill, leaf.dtype), leaf.sharding.spec
+                )
             array = default_init(
                 jax.random.fold_in(rngs, counter),
                 leaf.shape,

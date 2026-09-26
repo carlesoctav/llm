@@ -18,7 +18,7 @@ def make_optimizer(optimizer_name: str, train_state, scheduler, optimizer_config
             f"{optimizer_module!r} does not have a 'make' method; please ensure you're using the correct optimizer_name."
         )
 
-    train_mask = None
+    train_mask = train_state.train_mask
     if train_state.is_lora:
         train_mask = mask_trainable_lora(train_state.model)
         train_state = dataclasses.replace(train_state, train_mask=train_mask)
